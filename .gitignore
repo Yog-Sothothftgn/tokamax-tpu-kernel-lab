@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Code-only publish: no docs/notes get committed to this repo.
+*.md
+
+# Official Kimi K3 source (Moonshot AI, custom "Kimi K3" license -- not ours
+# to redistribute). Fetched by validate_official_config.py /
+# generate_pytorch_golden.py; re-download locally if needed, don't publish.
+06_kimi_k3_golden_validation/official_kimi_k3/

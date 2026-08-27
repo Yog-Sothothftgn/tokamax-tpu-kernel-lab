@@ -1,0 +1,19 @@
+{
+  "hidden_size": 64,
+  "routed_expert_hidden_size": 32,
+  "moe_intermediate_size": 48,
+  "intermediate_size": 48,
+  "num_experts": 8,
+  "num_experts_per_token": 2,
+  "num_shared_experts": 1,
+  "moe_renormalize": true,
+  "moe_router_activation_func": "sigmoid",
+  "routed_scaling_factor": 1.0,
+  "rms_norm_eps": 1e-05,
+  "latent_moe_use_norm": true,
+  "activation_situ_beta": 4.0,
+  "activation_situ_linear_beta": 25.0,
+  "hidden_act": "situ",
+  "num_expert_group": 1,
+  "topk_group": 1
+}

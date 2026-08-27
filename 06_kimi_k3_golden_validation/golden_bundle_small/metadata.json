@@ -1,0 +1,56 @@
+{
+  "seed": 0,
+  "dtype": "torch.float32",
+  "torch_version": "2.13.0+cpu",
+  "transformers_version": "5.15.1",
+  "num_tokens": 20,
+  "small_config": {
+    "hidden_size": 64,
+    "routed_expert_hidden_size": 32,
+    "moe_intermediate_size": 48,
+    "intermediate_size": 48,
+    "num_experts": 8,
+    "num_experts_per_token": 2,
+    "num_shared_experts": 1,
+    "moe_renormalize": true,
+    "moe_router_activation_func": "sigmoid",
+    "routed_scaling_factor": 1.0,
+    "rms_norm_eps": 1e-05,
+    "latent_moe_use_norm": true,
+    "activation_situ_beta": 4.0,
+    "activation_situ_linear_beta": 25.0,
+    "hidden_act": "situ",
+    "num_expert_group": 1,
+    "topk_group": 1
+  },
+  "instrumented_vs_direct_max_err": 0.0,
+  "intermediate_keys": [
+    "expert_down_output",
+    "expert_gate_output",
+    "expert_up_output",
+    "final_output",
+    "group_sizes",
+    "latent_projection",
+    "normalized_output",
+    "routed_output_after_combine",
+    "routed_output_before_combine",
+    "router_logits",
+    "router_scores_before_bias",
+    "router_scores_for_choice",
+    "shared_expert_output",
+    "situ_output",
+    "sorted_token_indices",
+    "topk_indices",
+    "topk_weights",
+    "up_projection_output"
+  ],
+  "source_provenance": {
+    "pinned_commit": "a590ce090cb049c93a33dfe8c208ec652aa20503",
+    "repo": "moonshotai/Kimi-K3",
+    "file_sha256": {
+      "config.json": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
+      "modeling_kimi_linear.py": "9e3564c70ac21854ce5a090cc946c5dc76b70d1050ef50840449181a20fff44a"
+    }
+  },
+  "note": "Random weight init -- NOT the real (MXFP4-quantized) Kimi K3 checkpoint. See WP-KV6 for real-checkpoint validation."
+}
