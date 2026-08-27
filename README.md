@@ -2,8 +2,33 @@
 
 Pallas/Mosaic TPU kernel exercises built around close reading of
 [openxla/tokamax](https://github.com/openxla/tokamax), leading up to a
-hardware-validated implementation of Kimi K3's LatentMoE layer on TPU v6e via
-`tokamax.ragged_dot`.
+hardware-validated, reduced-scale prototype of Kimi K3's LatentMoE layer on
+TPU v6e using `tokamax.ragged_dot`.
+
+## Current status
+
+**Completed:**
+- Official Kimi K3 source/config snapshot pinned and hash-verified.
+- Golden bundles generated from the real official PyTorch model (fp32 + bf16,
+  random weight init, reduced-scale configs -- see caveats below).
+- Naive JAX-reference implementation validated against those bundles,
+  fp32 and bf16, all 18 staged intermediates.
+- `xla` and `mosaic_tpu_v2` (`tokamax.ragged_dot`) validated against the
+  same bundles on real TPU v6e hardware, fp32.
+
+**In progress / open:**
+- bf16 on `xla`/`mosaic_tpu_v2` shows a tolerance-exceeding residual on 4 of
+  18 intermediates (see Results below) -- assessed as likely bf16 precision
+  noise, not yet confirmed via direct tensor-level comparison.
+- `mosaic` (v1) has not actually executed a kernel yet -- every bundle so far
+  has dispatch rows `M < 128`, below its tiling floor.
+- Full-dimension (`num_experts=896`, `top_k=16`) validation.
+
+**Not yet covered:**
+- The real, MXFP4-quantized Kimi K3 checkpoint weights (bundles so far use
+  random weight init).
+- Multi-device/sharded expert dispatch.
+- Any form of full-model deployment.
 
 ## Layout
 
@@ -18,7 +43,8 @@ hardware-validated implementation of Kimi K3's LatentMoE layer on TPU v6e via
 
 `06_kimi_k3_golden_validation/` locks the official PyTorch source to a pinned
 commit (hash-verified), generates golden intermediate/output bundles from it
-(fp32 and bf16, at two scales), and cross-checks:
+(fp32 and bf16, at two reduced scales -- both use random weight init, not the
+real checkpoint), and cross-checks:
 
 1. The naive JAX reference implementation against the golden bundles --
    matches on all 18 staged intermediates (router, dispatch, per-expert
@@ -27,39 +53,90 @@ commit (hash-verified), generates golden intermediate/output bundles from it
    implementations against the same golden bundles, run on real TPU v6e
    hardware.
 
+Both reduced-scale configs use `num_experts=8`, `top_k=2`, `num_shared_experts=1`
+(the real model is `num_experts=896`, `top_k=16`) -- see `SMALL_CONFIG_KWARGS`
+and `MOSAIC_CONFIG_KWARGS` in `generate_pytorch_golden.py`. The "mosaic"-named
+bundle (256/128/128 hidden/latent/intermediate dims) was sized so K and N meet
+Mosaic v1's 128-element tiling floor, but its actual dispatch row count
+(`M = num_tokens x top_k = 20 x 2 = 40`) still falls below that floor -- the
+name reflects intent, not confirmed v1 compatibility (see the SKIPPED rows
+below).
+
 ### Result on real v6e hardware (`test_ragged_dot_against_pytorch_golden.py`)
 
-All 8 (bundle x dtype x implementation) combinations tested against golden
-bundles generated from the official model (`--bundle-set both --variant both
---implementation all`):
+Eight validation combinations (2 bundles x 2 dtypes x up to 3 implementations,
+`mosaic` only attempted where dims allow) were run against golden bundles
+generated from the official model. Of these: **4 passed** (fp32, `xla` and
+`mosaic_tpu_v2`), **2 exceeded the current bf16 tolerance**, and **2 `mosaic`
+(v1) cases did not execute a kernel** (`M=40` below its 128-row floor --
+correctly counted as not-passed, not skipped-as-pass):
 
 | Bundle | dtype | Implementation | Result |
 |---|---|---|---|
 | small (64/32/48) | fp32 | xla | ALL STAGES MATCH |
 | small (64/32/48) | bf16 | xla | ALL STAGES MATCH (bit-exact) |
-| mosaic (256/128/128) | fp32 | xla | ALL STAGES MATCH |
-| mosaic (256/128/128) | fp32 | mosaic (v1) | SKIPPED -- dispatch rows `M=40 < 128` tiling floor |
-| mosaic (256/128/128) | fp32 | mosaic_tpu_v2 | ALL STAGES MATCH |
-| mosaic (256/128/128) | bf16 | xla | `expert_up_output` 1.95e-3 vs. 1e-3 tolerance (all other 12 stages OK) |
-| mosaic (256/128/128) | bf16 | mosaic (v1) | SKIPPED -- same tiling floor reason |
-| mosaic (256/128/128) | bf16 | mosaic_tpu_v2 | Same 1.95e-3 residual as xla above |
+| "mosaic" (256/128/128) | fp32 | xla | ALL STAGES MATCH |
+| "mosaic" (256/128/128) | fp32 | mosaic (v1) | NOT RUN -- dispatch rows `M=40 < 128` tiling floor |
+| "mosaic" (256/128/128) | fp32 | mosaic_tpu_v2 | ALL STAGES MATCH |
+| "mosaic" (256/128/128) | bf16 | xla | 4 of 18 stages exceed tolerance (below) |
+| "mosaic" (256/128/128) | bf16 | mosaic (v1) | NOT RUN -- same tiling floor reason |
+| "mosaic" (256/128/128) | bf16 | mosaic_tpu_v2 | Same 4 stages, same magnitudes as xla above |
 
 fp32 max abs diffs against the official model ranged from bit-exact to
 ~2.15e-6 across all 18 staged intermediates -- reaching this required
 wrapping the whole computation in `jax.default_matmul_precision("highest")`,
 since TPU's default matmul precision (`precision=None`) silently uses a
 reduced-precision path for float32 inputs on the MXU (invisible on CPU,
-confirmed via the compiled HLO). The bf16 `expert_up_output` residual is
-assessed as ordinary bf16 rounding noise, not a logic bug: `xla` and
-`mosaic_tpu_v2` -- two independent kernel implementations -- produce the
-*identical* residual, and the mathematically equivalent fp32 run is exact.
-`mosaic` (v1) is correctly skipped below its 128-row tiling floor rather than
-silently miscomputing; `NotImplementedError`/skip is never counted as a pass.
+confirmed via the compiled HLO).
 
-Not yet done: WP-KV5 (full-dimension smoke test) and WP-KV6 (real,
-MXFP4-quantized checkpoint validation); a bundle with `num_tokens >= 64` to
-actually exercise Mosaic v1 end-to-end; digging the bf16 residual into the
-operator level.
+For bf16 on the "mosaic" bundle, 4 of 18 intermediates exceed the 1e-3
+tolerance, both on `xla` and on `mosaic_tpu_v2`:
+
+| Intermediate | max abs diff | tolerance |
+|---|---|---|
+| `expert_up_output` | 1.95e-3 | 1e-3 |
+| `up_projection_output` | 7.81e-3 | 1e-3 |
+| `final_output` | 7.81e-3 | 1e-3 |
+| `normalized_output` | 1.56e-2 | 1e-3 |
+
+The other 8 quantitative stages (plus 2 exact-match stages) are within
+tolerance; the failing stages are downstream of `expert_up_output`, consistent
+with one bf16 rounding difference propagating forward rather than 4
+independent errors. `xla` and `mosaic_tpu_v2` report the *same* max abs diff
+at each of these stages, which suggests a shared bf16/backend precision
+effect rather than a `mosaic_tpu_v2`-specific bug -- but this is only an
+inference from matching summary statistics; a direct same-device,
+element-wise comparison of the two implementations' raw output tensors has
+not been done yet.
+
+`mosaic` (v1) has not been exercised end-to-end on any bundle generated so
+far -- both bundles' dispatch row count is below its 128-row tiling floor, and
+the harness correctly counts this as not-run rather than as a pass;
+`NotImplementedError`/skip is never counted as a pass.
+
+## Reproducing
+
+```bash
+cd 06_kimi_k3_golden_validation
+
+# 1. Verify the official Kimi K3 source snapshot (downloads + hashes it).
+python validate_official_config.py
+python verify_official_snapshot.py
+
+# 2. Generate golden bundles from the official PyTorch model (no TPU needed).
+python generate_pytorch_golden.py --dtype fp32 --config small
+python generate_pytorch_golden.py --dtype bf16 --config small
+python generate_pytorch_golden.py --dtype fp32 --config mosaic
+python generate_pytorch_golden.py --dtype bf16 --config mosaic
+
+# 3. Validate the naive JAX reference against the bundles (no TPU needed).
+python test_jax_reference_against_pytorch_golden.py --variant both
+
+# 4. Validate tokamax.ragged_dot's xla/mosaic/mosaic_tpu_v2 against the same
+#    bundles (requires a real TPU VM, generation >= 5).
+python test_ragged_dot_against_pytorch_golden.py \
+  --bundle-set both --variant both --implementation all
+```
 
 ## Requirements
 
@@ -70,8 +147,12 @@ operator level.
 - **`ragged_dot` benchmarking and validation** (`05_ragged_dot_on_tpu/`, and
   the `xla`/`mosaic`/`mosaic_tpu_v2` checks in
   `06_kimi_k3_golden_validation/`): `jax` (>= 0.11.0) +
-  [`tokamax`](https://github.com/openxla/tokamax) (built from source, no
-  pinned release) on a real TPU VM.
+  [`tokamax`](https://github.com/openxla/tokamax) on a real TPU VM. tokamax
+  was installed by cloning `main` and building from source
+  (`pip install -e ".[tpu,test]"`); the exact commit used for the hardware
+  run recorded above was not pinned/recorded at the time, so it isn't stated
+  here -- re-running against current `main` is the best available
+  reproduction path until that's tracked down.
 - **Golden bundle generation** (`generate_pytorch_golden.py`, no TPU needed):
   `torch` + `transformers` + `einops`. The bundles checked into this repo
   were generated with `torch==2.13.0+cpu` and `transformers==5.15.1` (see
