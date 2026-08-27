@@ -27,26 +27,59 @@ commit (hash-verified), generates golden intermediate/output bundles from it
    implementations against the same golden bundles, run on real TPU v6e
    hardware.
 
-**Result on real v6e hardware**: `xla` and `mosaic_tpu_v2` match the official
-PyTorch model exactly at fp32 (after correcting for TPU's reduced-precision
-default matmul behavior), and match closely at bf16 (residual error
-consistent with ordinary bf16 rounding, identical between the two
-independent kernel implementations). `mosaic` (v1) is correctly skipped
-below its 128-row tiling floor rather than silently miscomputing.
+### Result on real v6e hardware (`test_ragged_dot_against_pytorch_golden.py`)
 
-## Running
+All 8 (bundle x dtype x implementation) combinations tested against golden
+bundles generated from the official model (`--bundle-set both --variant both
+--implementation all`):
 
-- `01_pallas_basics/` and `04_own_kernel/` run locally under `interpret=True`
-  (no TPU needed) to check kernel semantics; real Mosaic/TPU-backend
-  correctness and performance require a TPU VM (generation >= 5 for
-  `mosaic_tpu`).
-- `05_ragged_dot_on_tpu/` and the `xla`/`mosaic`/`mosaic_tpu_v2` checks in
-  `06_kimi_k3_golden_validation/` require `jax` + `tokamax` on a real TPU VM.
-- Generating golden bundles (`generate_pytorch_golden.py`) requires
-  `torch` + `transformers` + `einops` (no TPU needed); it downloads the
-  official Kimi K3 source at a pinned commit into
+| Bundle | dtype | Implementation | Result |
+|---|---|---|---|
+| small (64/32/48) | fp32 | xla | ALL STAGES MATCH |
+| small (64/32/48) | bf16 | xla | ALL STAGES MATCH (bit-exact) |
+| mosaic (256/128/128) | fp32 | xla | ALL STAGES MATCH |
+| mosaic (256/128/128) | fp32 | mosaic (v1) | SKIPPED -- dispatch rows `M=40 < 128` tiling floor |
+| mosaic (256/128/128) | fp32 | mosaic_tpu_v2 | ALL STAGES MATCH |
+| mosaic (256/128/128) | bf16 | xla | `expert_up_output` 1.95e-3 vs. 1e-3 tolerance (all other 12 stages OK) |
+| mosaic (256/128/128) | bf16 | mosaic (v1) | SKIPPED -- same tiling floor reason |
+| mosaic (256/128/128) | bf16 | mosaic_tpu_v2 | Same 1.95e-3 residual as xla above |
+
+fp32 max abs diffs against the official model ranged from bit-exact to
+~2.15e-6 across all 18 staged intermediates -- reaching this required
+wrapping the whole computation in `jax.default_matmul_precision("highest")`,
+since TPU's default matmul precision (`precision=None`) silently uses a
+reduced-precision path for float32 inputs on the MXU (invisible on CPU,
+confirmed via the compiled HLO). The bf16 `expert_up_output` residual is
+assessed as ordinary bf16 rounding noise, not a logic bug: `xla` and
+`mosaic_tpu_v2` -- two independent kernel implementations -- produce the
+*identical* residual, and the mathematically equivalent fp32 run is exact.
+`mosaic` (v1) is correctly skipped below its 128-row tiling floor rather than
+silently miscomputing; `NotImplementedError`/skip is never counted as a pass.
+
+Not yet done: WP-KV5 (full-dimension smoke test) and WP-KV6 (real,
+MXFP4-quantized checkpoint validation); a bundle with `num_tokens >= 64` to
+actually exercise Mosaic v1 end-to-end; digging the bf16 residual into the
+operator level.
+
+## Requirements
+
+- **Pallas exercises** (`01_pallas_basics/`, `04_own_kernel/`): `jax` only.
+  Run locally under `interpret=True` (no TPU needed) to check kernel
+  semantics; real Mosaic/TPU-backend correctness and performance require a
+  TPU VM (generation >= 5 for the `mosaic_tpu` backend).
+- **`ragged_dot` benchmarking and validation** (`05_ragged_dot_on_tpu/`, and
+  the `xla`/`mosaic`/`mosaic_tpu_v2` checks in
+  `06_kimi_k3_golden_validation/`): `jax` (>= 0.11.0) +
+  [`tokamax`](https://github.com/openxla/tokamax) (built from source, no
+  pinned release) on a real TPU VM.
+- **Golden bundle generation** (`generate_pytorch_golden.py`, no TPU needed):
+  `torch` + `transformers` + `einops`. The bundles checked into this repo
+  were generated with `torch==2.13.0+cpu` and `transformers==5.15.1` (see
+  each bundle's `metadata.json` for the exact versions and the official
+  source's pinned commit + SHA256). Generating a bundle downloads the
+  official Kimi K3 source at that pinned commit into
   `06_kimi_k3_golden_validation/official_kimi_k3/` (not redistributed here,
-  since the license is not ours to redistribute -- see
+  since its license is not ours to redistribute -- see
   `validate_official_config.py`).
 
 ## References
