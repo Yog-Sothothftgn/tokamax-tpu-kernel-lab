@@ -2,8 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Code-only publish: no docs/notes get committed to this repo.
+# No working notes/diary docs get committed to this repo -- only a minimal
+# top-level README for orientation.
 *.md
+!README.md
 
 # Official Kimi K3 source (Moonshot AI, custom "Kimi K3" license -- not ours
 # to redistribute). Fetched by validate_official_config.py /
