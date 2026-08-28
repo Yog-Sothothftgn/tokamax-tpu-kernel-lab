@@ -270,6 +270,7 @@ def main(
     dtype: torch.dtype = torch.float32,
     bundle_dir: pathlib.Path | None = None,
     config_kwargs: dict | None = None,
+    num_tokens: int = 20,
 ) -> None:
   """dtype=bfloat16 exercises the router/RMSNorm/combine "compute in
   float32, cast back to compute dtype" logic for real -- with the default
@@ -281,6 +282,14 @@ def main(
   `config_kwargs` defaults to SMALL_CONFIG_KWARGS (dims below Mosaic's
   128-tiling floor, xla-only); pass MOSAIC_CONFIG_KWARGS for a bundle whose
   dims satisfy that floor, needed to validate mosaic/mosaic_tpu_v2 (WP-KV4).
+
+  `num_tokens` defaults to 20 (the original WP-KV2/KV3/KV4 bundles' value,
+  kept for backward compatibility). With `top_k=2` (both existing configs),
+  dispatch rows `M = num_tokens * top_k = 40` -- below Mosaic v1's confirmed
+  128-row tiling floor, which is why `mosaic` (v1) has never actually
+  executed a kernel against either existing bundle (only been correctly
+  skipped). Pass `num_tokens=64` (M=128, exactly at the floor) to generate a
+  bundle that can actually exercise Mosaic v1 end-to-end.
   """
   bundle_dir = bundle_dir or BUNDLE_DIR
   config_kwargs = config_kwargs or SMALL_CONFIG_KWARGS
@@ -291,7 +300,6 @@ def main(
   block.eval()
   block = block.to(dtype)
 
-  num_tokens = 20
   hidden_states = torch.randn(1, num_tokens, config.hidden_size).to(dtype)
 
   with torch.no_grad():
@@ -363,11 +371,27 @@ if __name__ == "__main__":
       help="'small' (64/32/48, xla-only -- below Mosaic's 128-tiling floor) or "
       "'mosaic' (256/128/128, satisfies the floor -- needed to validate mosaic/mosaic_tpu_v2)",
   )
+  parser.add_argument(
+      "--num-tokens",
+      type=int,
+      default=20,
+      help="dispatch rows M = num_tokens * top_k. Default 20 (M=40, matches the original "
+      "WP-KV2/KV3/KV4 bundles). Pass 64 (M=128, exactly at Mosaic v1's tiling floor) to "
+      "generate a bundle that can actually exercise mosaic (v1), not just xla/mosaic_tpu_v2.",
+  )
   args = parser.parse_args()
 
   torch_dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
   cfg_kwargs = SMALL_CONFIG_KWARGS if args.config == "small" else MOSAIC_CONFIG_KWARGS
-  dir_name = f"golden_bundle_{args.config}_{args.dtype}" if args.config == "mosaic" else (
-      "golden_bundle_small" if args.dtype == "fp32" else "golden_bundle_small_bf16"
+  if args.num_tokens == 20:
+    dir_name = f"golden_bundle_{args.config}_{args.dtype}" if args.config == "mosaic" else (
+        "golden_bundle_small" if args.dtype == "fp32" else "golden_bundle_small_bf16"
+    )
+  else:
+    dir_name = f"golden_bundle_{args.config}_{args.dtype}_n{args.num_tokens}"
+  main(
+      dtype=torch_dtype,
+      bundle_dir=_HERE / dir_name,
+      config_kwargs=cfg_kwargs,
+      num_tokens=args.num_tokens,
   )
-  main(dtype=torch_dtype, bundle_dir=_HERE / dir_name, config_kwargs=cfg_kwargs)

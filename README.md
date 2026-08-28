@@ -20,8 +20,14 @@ TPU v6e using `tokamax.ragged_dot`.
 - bf16 on `xla`/`mosaic_tpu_v2` shows a tolerance-exceeding residual on 4 of
   18 intermediates (see Results below) -- assessed as likely bf16 precision
   noise, not yet confirmed via direct tensor-level comparison.
-- `mosaic` (v1) has not actually executed a kernel yet -- every bundle so far
-  has dispatch rows `M < 128`, below its tiling floor.
+- `mosaic` (v1) has not actually executed a kernel yet on the results below --
+  every bundle used so far has dispatch rows `M < 128`, below its tiling
+  floor. A `num_tokens=64` ("mosaic_wide", `M=128`) bundle that can exercise
+  it was added 2026-08-28 but not yet run on hardware.
+- A latency benchmark across multiple batch sizes/sequence lengths
+  (`run_latency_sweep`, added 2026-08-28) exists but hasn't been run on
+  hardware yet -- the only latency numbers on record predate the
+  SiTU-GLU/precision/routing fixes and are stale (see project history).
 - Full-dimension (`num_experts=896`, `top_k=16`) validation.
 
 **Not yet covered:**
@@ -57,10 +63,14 @@ Both reduced-scale configs use `num_experts=8`, `top_k=2`, `num_shared_experts=1
 (the real model is `num_experts=896`, `top_k=16`) -- see `SMALL_CONFIG_KWARGS`
 and `MOSAIC_CONFIG_KWARGS` in `generate_pytorch_golden.py`. The "mosaic"-named
 bundle (256/128/128 hidden/latent/intermediate dims) was sized so K and N meet
-Mosaic v1's 128-element tiling floor, but its actual dispatch row count
-(`M = num_tokens x top_k = 20 x 2 = 40`) still falls below that floor -- the
-name reflects intent, not confirmed v1 compatibility (see the SKIPPED rows
-below).
+Mosaic v1's 128-element tiling floor, but at its original `num_tokens=20`,
+dispatch rows (`M = num_tokens x top_k = 20 x 2 = 40`) still fall below that
+floor -- the name reflected intent, not confirmed v1 compatibility (see the
+SKIPPED rows below). A third, "mosaic_wide" bundle (same dims, `num_tokens=64`
+-> `M=128`, generated via `generate_pytorch_golden.py --config mosaic
+--num-tokens 64`) was added 2026-08-28 to actually satisfy the floor -- not
+yet run on hardware, so mosaic (v1)'s output has still never been checked
+against real official-model ground truth as of this note.
 
 ### Result on real v6e hardware (`test_ragged_dot_against_pytorch_golden.py`)
 
@@ -128,6 +138,8 @@ python generate_pytorch_golden.py --dtype fp32 --config small
 python generate_pytorch_golden.py --dtype bf16 --config small
 python generate_pytorch_golden.py --dtype fp32 --config mosaic
 python generate_pytorch_golden.py --dtype bf16 --config mosaic
+python generate_pytorch_golden.py --dtype fp32 --config mosaic --num-tokens 64  # "mosaic_wide" -- M=128, needed for mosaic (v1)
+python generate_pytorch_golden.py --dtype bf16 --config mosaic --num-tokens 64
 
 # 3. Validate the naive JAX reference against the bundles (no TPU needed).
 python test_jax_reference_against_pytorch_golden.py --variant both
@@ -136,6 +148,10 @@ python test_jax_reference_against_pytorch_golden.py --variant both
 #    bundles (requires a real TPU VM, generation >= 5).
 python test_ragged_dot_against_pytorch_golden.py \
   --bundle-set both --variant both --implementation all
+
+# 5. Latency across multiple batch sizes/sequence lengths (also needs a TPU VM).
+cd ../05_ragged_dot_on_tpu
+python kimi_k3_latent_moe_ragged_dot.py --latency-sweep
 ```
 
 ## Requirements

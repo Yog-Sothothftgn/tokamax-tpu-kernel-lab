@@ -60,6 +60,7 @@ which is pure JAX and needs neither tokamax nor a TPU):
   python kimi_k3_latent_moe_ragged_dot.py --fair-baseline           # same scale, + mosaic v2 + autotune-tuned comparison
   python kimi_k3_latent_moe_ragged_dot.py --shard-workload          # correctness check (valid-rows-only) + isolated expert-kernel benchmark on a realistic, fixed-total-padded 16-of-896-filtered workload (WP-Kimi step 2b part 1)
   python kimi_k3_latent_moe_ragged_dot.py --route-filter-correctness  # standalone (no tokamax/TPU) correctness + overflow test for REAL 896-expert routing filtered to a local shard (WP-Kimi step 2b part 2)
+  python kimi_k3_latent_moe_ragged_dot.py --latency-sweep           # latency across multiple batch_size/seq_len pairs, one table (Zifan's 2026-08-28 standing request, see run_latency_sweep)
 
 **2026-08-26, WP-Kimi step 2b (review's P1-C item, two-step plan per user
 direction):** `single_chip_kimi_k3_config`'s num_experts=64/top_k=16 setup
@@ -1090,11 +1091,103 @@ def run_fair_baseline(
       print(f"  {impl_name}{shape_hint}: FAILED to autotune ({e})")
 
 
+_DEFAULT_LATENCY_SWEEP_SHAPES: tuple[tuple[int, int], ...] = (
+    # (batch_size, seq_len). hidden_states is (num_tokens, hidden_size) --
+    # batch_size and seq_len only ever enter this forward pass through their
+    # product, num_tokens = batch_size * seq_len (there is no separate
+    # batch/sequence axis anywhere in latent_moe_forward_ragged_dot). Several
+    # pairs below deliberately share the same num_tokens (e.g. (1,2048) and
+    # (2,1024)) as a sanity check: matching latency at matching num_tokens is
+    # expected, not a coincidence, and a divergence there would flag a bug.
+    (1, 128),
+    (1, 512),
+    (1, 2048),
+    (2, 1024),
+    (1, 4096),
+    (4, 1024),
+)
+
+
+def run_latency_sweep(
+    seed: int = 0,
+    num_experts: int = 64,
+    shapes: tuple[tuple[int, int], ...] = _DEFAULT_LATENCY_SWEEP_SHAPES,
+) -> None:
+  """Latency across multiple batch sizes/sequence lengths, per Zifan's
+  explicit standing request (2026-08-28, after reviewing the published
+  kernel-lab repo): "include the latency for different batch size/sequence
+  length whenever you make an optimization to the kernel for comparison."
+
+  Same single-chip-shard scale and heuristic-only (skip_autotune) approach
+  as run_benchmark/run_fair_baseline -- autotuning this shape was confirmed
+  impractically slow on real hardware (~2400 microbenchmarks, still not
+  done after >12 minutes on op-call 1/6, see run_fair_baseline's docstring).
+  This function differs only in sweeping several (batch_size, seq_len)
+  pairs in one run and reporting them as a single comparison table, instead
+  of one hardcoded num_tokens value.
+
+  A NotImplementedError from a given implementation at a given shape (e.g.
+  mosaic (v1) below its 128-row tiling floor at small num_tokens) is
+  reported as SKIPPED in the table, not a failure or a missing row.
+  """
+  config = single_chip_kimi_k3_config(num_experts)
+  rows: list[tuple[int, int, int, str, float | None, float | None, str | None]] = []
+
+  for batch_size, seq_len in shapes:
+    num_tokens = batch_size * seq_len
+    key = jax.random.key(hash((seed, batch_size, seq_len)) % (2**31))
+    key_w, key_x = jax.random.split(key)
+    weights = init_weights(config, key_w, dtype=jnp.bfloat16)
+    hidden_states = jax.random.normal(
+        key_x, (num_tokens, config.hidden_size), dtype=jnp.bfloat16
+    )
+
+    for impl in ("xla", "mosaic", "mosaic_tpu_v2"):
+      try:
+        f_impl = jax.jit(
+            lambda h, w, impl=impl: latent_moe_forward_ragged_dot(
+                h, w, config, implementation=impl
+            )
+        )
+        std_f, args = tokamax.standardize_function(f_impl, hidden_states, weights)
+        bench = tokamax.benchmark(jax.jit(std_f), args, method="hermetic_xprof")
+        rows.append(
+            (batch_size, seq_len, num_tokens, impl,
+             bench.median_evaluation_time_ms, bench.peak_memory_mb, None)
+        )
+      except NotImplementedError as e:
+        rows.append((batch_size, seq_len, num_tokens, impl, None, None, str(e)))
+
+  print(
+      f"\n[latency-sweep] single-chip Kimi K3 (G={num_experts}) -- "
+      "heuristic (untuned) latency across batch_size/seq_len:"
+  )
+  header = f"{'batch':>6} {'seq_len':>8} {'num_tokens':>11} {'impl':>14} {'median_exec_ms':>15} {'peak_mem_mb':>12}"
+  print(header)
+  for batch_size, seq_len, num_tokens, impl, exec_ms, mem_mb, err in rows:
+    if err is not None:
+      print(
+          f"{batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
+          f"{'SKIPPED':>15} {'':>12}  ({err})"
+      )
+    else:
+      print(
+          f"{batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
+          f"{exec_ms:>15.4f} {mem_mb:>12.2f}"
+      )
+
+
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--correctness", action="store_true")
   parser.add_argument("--benchmark", action="store_true")
   parser.add_argument("--fair-baseline", action="store_true")
+  parser.add_argument(
+      "--latency-sweep",
+      action="store_true",
+      help="latency across multiple batch_size/seq_len pairs in one table -- see "
+      "run_latency_sweep's docstring (Zifan's 2026-08-28 standing request)",
+  )
   parser.add_argument(
       "--shard-workload",
       action="store_true",
@@ -1123,6 +1216,7 @@ if __name__ == "__main__":
       and not args.fair_baseline
       and not args.shard_workload
       and not args.route_filter_correctness
+      and not args.latency_sweep
   ):
     args.correctness = True  # default to the cheap check
 
@@ -1153,3 +1247,6 @@ if __name__ == "__main__":
   if args.route_filter_correctness:
     ok_route = check_route_and_filter_correctness()
     assert ok_route, "route_and_filter_to_local_shard failed its standalone correctness/overflow check"
+
+  if args.latency_sweep:
+    run_latency_sweep()

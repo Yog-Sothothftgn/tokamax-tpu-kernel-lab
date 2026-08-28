@@ -23,26 +23,30 @@ per-expert -- so `gate`/`up`/`activated`/`outs` are ALREADY the full
 dispatch-order arrays WP-KV3's `expert_gate_output` etc. correspond to, no
 per-expert loop/concatenation needed to capture them.
 
-**Two bundle sets, per the user's explicit 2026-08-26 direction** (the
-64/32/48 "small" bundle is below Mosaic's confirmed hard 128-tiling floor,
-so it can only ever validate xla -- a separate "mosaic" bundle at
-256/128/128, generated via `generate_pytorch_golden.py --config mosaic`,
-is needed to actually validate mosaic/mosaic_tpu_v2 against real
-official-model ground truth, not just against this project's own JAX
-reference):
+**Three bundle sets** (the 64/32/48 "small" bundle is below Mosaic's
+confirmed hard 128-tiling floor, so it can only ever validate xla; the
+256/128/128 "mosaic" bundle satisfies the K/N part of that floor but at its
+original num_tokens=20, dispatch rows M=40 are still below the 128-row
+floor, so mosaic (v1) has only ever been confirmed to SKIP there, never to
+actually execute a kernel -- see "mosaic_wide" below, added 2026-08-28):
   - `--bundle-set small` -- the original 64/32/48 bundles (toy_config()),
     xla only by default.
-  - `--bundle-set mosaic` -- the 256/128/128 bundles
-    (mosaic_correctness_config()), xla + mosaic + mosaic_tpu_v2 by default.
-  - `--bundle-set both` (default) -- both, with each set's own default
-    implementations.
+  - `--bundle-set mosaic` -- the 256/128/128 bundles at num_tokens=20
+    (mosaic_correctness_config()), xla + mosaic + mosaic_tpu_v2 by default
+    -- mosaic (v1) is expected to SKIP here (M=40<128), not a bug.
+  - `--bundle-set mosaic_wide` -- same 256/128/128 dims, num_tokens=64 ->
+    M=128 (generated via `generate_pytorch_golden.py --config mosaic
+    --num-tokens 64`), the first bundle where mosaic (v1) can actually run
+    and get diffed against real official-model ground truth.
+  - `--bundle-set both` (default) -- small + mosaic + mosaic_wide, with each
+    set's own default implementations.
 
 A `NotImplementedError` from any implementation counts as FAIL, never a
 silent pass -- see run_one()'s try/except.
 
 Usage (on the TPU VM, tokamax installed):
   python test_ragged_dot_against_pytorch_golden.py --bundle-set small --variant fp32 --implementation xla
-  python test_ragged_dot_against_pytorch_golden.py --bundle-set mosaic --variant bf16 --implementation mosaic
+  python test_ragged_dot_against_pytorch_golden.py --bundle-set mosaic_wide --variant bf16 --implementation mosaic
   python test_ragged_dot_against_pytorch_golden.py --bundle-set both --variant both  # full sweep, this project's recommended default
 """
 
@@ -289,6 +293,8 @@ def run_one(bundle_dir: pathlib.Path, config, variant: str, implementation: str)
 
 BUNDLE_DIR_MOSAIC_FP32 = _HERE / "golden_bundle_mosaic_fp32"
 BUNDLE_DIR_MOSAIC_BF16 = _HERE / "golden_bundle_mosaic_bf16"
+BUNDLE_DIR_MOSAIC_WIDE_FP32 = _HERE / "golden_bundle_mosaic_fp32_n64"
+BUNDLE_DIR_MOSAIC_WIDE_BF16 = _HERE / "golden_bundle_mosaic_bf16_n64"
 
 # (bundle_dir, config, default implementations) per bundle-set. "small"
 # (64/32/48) is below Mosaic's hard 128-tiling floor -- confirmed on
@@ -297,8 +303,13 @@ BUNDLE_DIR_MOSAIC_BF16 = _HERE / "golden_bundle_mosaic_bf16"
 # NotImplementedError from mosaic there is expected, not a bug, but still
 # only run xla by default to avoid a confusing default-FAIL. "mosaic"
 # (256/128/128, generated via generate_pytorch_golden.py --config mosaic)
-# satisfies the floor and is where mosaic/mosaic_tpu_v2 actually get
-# validated against real official-model ground truth.
+# satisfies the K/N tiling floor, but at the original num_tokens=20,
+# dispatch rows M = num_tokens*top_k = 40 -- still below the 128-row floor,
+# so mosaic (v1) has only ever been confirmed to SKIP there, never to
+# actually run. "mosaic_wide" (same 256/128/128 dims, num_tokens=64 ->
+# M=128, generated via `generate_pytorch_golden.py --config mosaic
+# --num-tokens 64`) is the first bundle where mosaic (v1) can actually
+# execute a kernel and get diffed against real official-model ground truth.
 BUNDLE_SETS = {
     "small": {
         "fp32": (BUNDLE_DIR_FP32, toy_config()),
@@ -310,6 +321,11 @@ BUNDLE_SETS = {
         "bf16": (BUNDLE_DIR_MOSAIC_BF16, mosaic_correctness_config()),
         "default_implementations": ("xla", "mosaic", "mosaic_tpu_v2"),
     },
+    "mosaic_wide": {
+        "fp32": (BUNDLE_DIR_MOSAIC_WIDE_FP32, mosaic_correctness_config()),
+        "bf16": (BUNDLE_DIR_MOSAIC_WIDE_BF16, mosaic_correctness_config()),
+        "default_implementations": ("xla", "mosaic", "mosaic_tpu_v2"),
+    },
 }
 
 
@@ -317,7 +333,9 @@ if __name__ == "__main__":
   import argparse
 
   parser = argparse.ArgumentParser()
-  parser.add_argument("--bundle-set", choices=["small", "mosaic", "both"], default="both")
+  parser.add_argument(
+      "--bundle-set", choices=["small", "mosaic", "mosaic_wide", "both"], default="both"
+  )
   parser.add_argument("--variant", choices=["fp32", "bf16", "both"], default="both")
   parser.add_argument(
       "--implementation",
@@ -329,7 +347,7 @@ if __name__ == "__main__":
   )
   args = parser.parse_args()
 
-  bundle_sets = ["small", "mosaic"] if args.bundle_set == "both" else [args.bundle_set]
+  bundle_sets = ["small", "mosaic", "mosaic_wide"] if args.bundle_set == "both" else [args.bundle_set]
   variants = ["fp32", "bf16"] if args.variant == "both" else [args.variant]
 
   all_ok = True
