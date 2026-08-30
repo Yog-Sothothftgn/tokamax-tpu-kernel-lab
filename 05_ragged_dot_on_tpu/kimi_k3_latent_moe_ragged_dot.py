@@ -1144,10 +1144,19 @@ def run_latency_sweep(
 
     for impl in ("xla", "mosaic", "mosaic_tpu_v2"):
       try:
+        # NOTE: no `impl=impl` default parameter here (unlike a naive
+        # closure-in-loop fix) -- tokamax.standardize_function introspects
+        # the wrapped function's signature and threads every parameter
+        # (defaults included) through as a jax.jit-traced argument. Adding
+        # `impl` as a real parameter made it try to abstractify the string
+        # 'xla' as a JAX array (confirmed on hardware: "TypeError: Argument
+        # 'xla' ... is not a valid JAX type"). Closing over the loop
+        # variable via a two-parameter lambda instead (matching
+        # run_benchmark/run_fair_baseline's proven pattern) is safe here --
+        # the lambda is built AND used within the same loop iteration, so
+        # there's no deferred-call late-binding hazard.
         f_impl = jax.jit(
-            lambda h, w, impl=impl: latent_moe_forward_ragged_dot(
-                h, w, config, implementation=impl
-            )
+            lambda h, w: latent_moe_forward_ragged_dot(h, w, config, implementation=impl)
         )
         std_f, args = tokamax.standardize_function(f_impl, hidden_states, weights)
         bench = tokamax.benchmark(jax.jit(std_f), args, method="hermetic_xprof")
