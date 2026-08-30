@@ -17,16 +17,16 @@ TPU v6e using `tokamax.ragged_dot`.
   validated against the same bundles on real TPU v6e hardware, fp32 --
   `mosaic` (v1) actually executed a kernel and matched for the first time
   2026-08-28, via the new "mosaic_wide" bundle (`M=128`, see below).
+- Latency across multiple batch sizes/sequence lengths, real v6e hardware,
+  2026-08-28 -- the first latency numbers measured against the corrected
+  (post SiTU-GLU/precision-fix) architecture. `mosaic_tpu_v2` is the
+  fastest implementation at every scale tested (see Latency below).
 
 **In progress / open:**
 - bf16 on `xla`/`mosaic` (v1)/`mosaic_tpu_v2` shows a tolerance-exceeding
   residual on 4 of 18 intermediates (see Results below) -- assessed as
   likely bf16 precision noise, not yet confirmed via direct tensor-level
   comparison.
-- A latency benchmark across multiple batch sizes/sequence lengths
-  (`run_latency_sweep`, added 2026-08-28) exists but hasn't been run on
-  hardware yet -- the only latency numbers on record predate the
-  SiTU-GLU/precision/routing fixes and are stale (see project history).
 - Full-dimension (`num_experts=896`, `top_k=16`) validation.
 
 **Not yet covered:**
@@ -126,6 +126,53 @@ a shared bf16/backend precision effect rather than a bug in any one of them,
 but it is still an inference from matching summary statistics across runs,
 not a direct same-device, element-wise comparison of the three
 implementations' raw output tensors, which hasn't been done.
+
+## Latency across batch size / sequence length (`run_latency_sweep`)
+
+Real v6e hardware, 2026-08-28 -- single-chip-shard scale (`num_experts=64`,
+`latent_size=3584`, `intermediate_size=3072`, bf16), heuristic config (no
+autotuning -- see caveat below), full `latent_moe_forward_ragged_dot` forward
+pass (not just the isolated expert FFN). `hidden_states` is
+`(num_tokens, hidden_size)`, so `batch_size` and `seq_len` only ever enter
+through their product; two pairs per `num_tokens` value are included
+deliberately as a sanity check:
+
+| batch | seq_len | num_tokens | xla (ms) | mosaic v1 (ms) | mosaic_tpu_v2 (ms) | peak_mem (MB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 128 | 5.584 | 67.809 | 3.281 | 4694.35 |
+| 1 | 512 | 512 | 5.868 | 111.052 | 4.142 | 4770.15 |
+| 1 | 2048 | 2048 | 12.064 | 280.699 | 8.045 | 5293.22 |
+| 2 | 1024 | 2048 | 12.047 | 280.806 | 8.042 | 5293.22 |
+| 1 | 4096 | 4096 | 21.775 | 508.369 | 14.916 | 5990.66 |
+| 4 | 1024 | 4096 | 21.768 | 508.581 | 14.834 | 5990.66 |
+
+Observations:
+- **The `(batch_size, seq_len)` sanity check passes**: `(1,2048)` vs.
+  `(2,1024)` and `(1,4096)` vs. `(4,1024)` match within measurement noise on
+  both latency and memory at every implementation -- confirms latency here
+  really is a function of `num_tokens` alone, as the architecture implies,
+  not something that would vary if the same total were split into more/fewer
+  batches.
+- **`mosaic_tpu_v2` is the fastest implementation at every scale tested**,
+  30-41% faster than `xla` (e.g. 14.9ms vs. 21.8ms at `num_tokens=4096`).
+  This is the first latency measurement against the corrected (post
+  SiTU-GLU/float32-precision-fix) architecture -- the only prior number
+  (`~34% faster than xla` at `num_tokens=2048`, from 2026-08-24) predated
+  those fixes and was explicitly marked not reportable; this table
+  supersedes it with a consistent finding across 4 scales, not just one.
+- **`mosaic` (v1) is dramatically slower** -- 12-23x slower than `xla`,
+  20-34x slower than `mosaic_tpu_v2`, consistent with the heuristic-config
+  gap seen elsewhere in this project (WP1's DeepSeek-scale benchmark, WP-Kimi
+  step 2's earlier single-shape run).
+- Peak memory is dominated by the fixed per-expert weight footprint (~4.2GB
+  at `num_experts=64`) rather than activations -- it grows only modestly
+  (4.69GB -> 5.99GB) across a 32x increase in `num_tokens`.
+- **Caveat**: heuristic config only, no autotuning -- autotuning this shape
+  was confirmed impractically slow elsewhere in this project (~2400
+  microbenchmarks, still not complete after 12+ minutes). `mosaic` (v1)'s
+  gap in particular might narrow under a tuned config; this table should be
+  read as "heuristic-config latency," not a ceiling on Mosaic's achievable
+  performance.
 
 ## Reproducing
 
