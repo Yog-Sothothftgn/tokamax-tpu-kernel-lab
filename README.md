@@ -13,17 +13,16 @@ TPU v6e using `tokamax.ragged_dot`.
   random weight init, reduced-scale configs -- see caveats below).
 - Naive JAX-reference implementation validated against those bundles,
   fp32 and bf16, all 18 staged intermediates.
-- `xla` and `mosaic_tpu_v2` (`tokamax.ragged_dot`) validated against the
-  same bundles on real TPU v6e hardware, fp32.
+- `xla`, `mosaic` (v1), and `mosaic_tpu_v2` (`tokamax.ragged_dot`) all
+  validated against the same bundles on real TPU v6e hardware, fp32 --
+  `mosaic` (v1) actually executed a kernel and matched for the first time
+  2026-08-28, via the new "mosaic_wide" bundle (`M=128`, see below).
 
 **In progress / open:**
-- bf16 on `xla`/`mosaic_tpu_v2` shows a tolerance-exceeding residual on 4 of
-  18 intermediates (see Results below) -- assessed as likely bf16 precision
-  noise, not yet confirmed via direct tensor-level comparison.
-- `mosaic` (v1) has not actually executed a kernel yet on the results below --
-  every bundle used so far has dispatch rows `M < 128`, below its tiling
-  floor. A `num_tokens=64` ("mosaic_wide", `M=128`) bundle that can exercise
-  it was added 2026-08-28 but not yet run on hardware.
+- bf16 on `xla`/`mosaic` (v1)/`mosaic_tpu_v2` shows a tolerance-exceeding
+  residual on 4 of 18 intermediates (see Results below) -- assessed as
+  likely bf16 precision noise, not yet confirmed via direct tensor-level
+  comparison.
 - A latency benchmark across multiple batch sizes/sequence lengths
   (`run_latency_sweep`, added 2026-08-28) exists but hasn't been run on
   hardware yet -- the only latency numbers on record predate the
@@ -64,43 +63,51 @@ Both reduced-scale configs use `num_experts=8`, `top_k=2`, `num_shared_experts=1
 and `MOSAIC_CONFIG_KWARGS` in `generate_pytorch_golden.py`. The "mosaic"-named
 bundle (256/128/128 hidden/latent/intermediate dims) was sized so K and N meet
 Mosaic v1's 128-element tiling floor, but at its original `num_tokens=20`,
-dispatch rows (`M = num_tokens x top_k = 20 x 2 = 40`) still fall below that
-floor -- the name reflected intent, not confirmed v1 compatibility (see the
-SKIPPED rows below). A third, "mosaic_wide" bundle (same dims, `num_tokens=64`
--> `M=128`, generated via `generate_pytorch_golden.py --config mosaic
---num-tokens 64`) was added 2026-08-28 to actually satisfy the floor -- not
-yet run on hardware, so mosaic (v1)'s output has still never been checked
-against real official-model ground truth as of this note.
+dispatch rows (`M = num_tokens x top_k = 20 x 2 = 40`) still fell below that
+floor -- the name reflected intent, not confirmed v1 compatibility. A third,
+"mosaic_wide" bundle (same dims, `num_tokens=64` -> `M=128`, generated via
+`generate_pytorch_golden.py --config mosaic --num-tokens 64`) was added
+2026-08-28 to actually satisfy the floor, and run on real v6e hardware the
+same day -- see Results below.
 
 ### Result on real v6e hardware (`test_ragged_dot_against_pytorch_golden.py`)
 
-Eight validation combinations (2 bundles x 2 dtypes x up to 3 implementations,
-`mosaic` only attempted where dims allow) were run against golden bundles
-generated from the official model. Of these: **4 passed** (fp32, `xla` and
-`mosaic_tpu_v2`), **2 exceeded the current bf16 tolerance**, and **2 `mosaic`
-(v1) cases did not execute a kernel** (`M=40` below its 128-row floor --
-correctly counted as not-passed, not skipped-as-pass):
+**"mosaic_wide" bundle (`num_tokens=64`, `M=128`), 2026-08-28 -- `mosaic` (v1)
+executed a kernel and matched for the first time in this project:**
+
+| dtype | Implementation | Result |
+|---|---|---|
+| fp32 | xla | ALL STAGES MATCH |
+| fp32 | mosaic (v1) | **ALL STAGES MATCH** (first real v1 execution, not a skip) |
+| fp32 | mosaic_tpu_v2 | ALL STAGES MATCH |
+| bf16 | xla | 4 of 18 stages exceed tolerance (below) |
+| bf16 | mosaic (v1) | Same 4 stages, same magnitudes as xla |
+| bf16 | mosaic_tpu_v2 | Same 4 stages, same magnitudes as xla and mosaic (v1) |
+
+**Earlier bundles** ("small" 64/32/48, and "mosaic" 256/128/128 at its
+original `num_tokens=20`, `M=40`):
 
 | Bundle | dtype | Implementation | Result |
 |---|---|---|---|
 | small (64/32/48) | fp32 | xla | ALL STAGES MATCH |
 | small (64/32/48) | bf16 | xla | ALL STAGES MATCH (bit-exact) |
-| "mosaic" (256/128/128) | fp32 | xla | ALL STAGES MATCH |
-| "mosaic" (256/128/128) | fp32 | mosaic (v1) | NOT RUN -- dispatch rows `M=40 < 128` tiling floor |
-| "mosaic" (256/128/128) | fp32 | mosaic_tpu_v2 | ALL STAGES MATCH |
-| "mosaic" (256/128/128) | bf16 | xla | 4 of 18 stages exceed tolerance (below) |
-| "mosaic" (256/128/128) | bf16 | mosaic (v1) | NOT RUN -- same tiling floor reason |
-| "mosaic" (256/128/128) | bf16 | mosaic_tpu_v2 | Same 4 stages, same magnitudes as xla above |
+| "mosaic" (256/128/128, n=20) | fp32 | xla | ALL STAGES MATCH |
+| "mosaic" (256/128/128, n=20) | fp32 | mosaic (v1) | NOT RUN -- dispatch rows `M=40 < 128` tiling floor |
+| "mosaic" (256/128/128, n=20) | fp32 | mosaic_tpu_v2 | ALL STAGES MATCH |
+| "mosaic" (256/128/128, n=20) | bf16 | xla | Same 4-stage residual as the mosaic_wide bf16 row above |
+| "mosaic" (256/128/128, n=20) | bf16 | mosaic (v1) | NOT RUN -- same tiling floor reason |
+| "mosaic" (256/128/128, n=20) | bf16 | mosaic_tpu_v2 | Same 4-stage residual |
 
 fp32 max abs diffs against the official model ranged from bit-exact to
-~2.15e-6 across all 18 staged intermediates -- reaching this required
-wrapping the whole computation in `jax.default_matmul_precision("highest")`,
-since TPU's default matmul precision (`precision=None`) silently uses a
-reduced-precision path for float32 inputs on the MXU (invisible on CPU,
-confirmed via the compiled HLO).
+~3.0e-6 across all 18 staged intermediates (across both the n=20 and n=64
+mosaic bundles) -- reaching this required wrapping the whole computation in
+`jax.default_matmul_precision("highest")`, since TPU's default matmul
+precision (`precision=None`) silently uses a reduced-precision path for
+float32 inputs on the MXU (invisible on CPU, confirmed via the compiled HLO).
 
-For bf16 on the "mosaic" bundle, 4 of 18 intermediates exceed the 1e-3
-tolerance, both on `xla` and on `mosaic_tpu_v2`:
+For bf16, the same 4 of 18 intermediates exceed the 1e-3 tolerance on every
+run so far (n=20 and n=64 bundles alike), with the same max abs diffs across
+**all three** implementations -- xla, mosaic (v1), and mosaic_tpu_v2:
 
 | Intermediate | max abs diff | tolerance |
 |---|---|---|
@@ -112,17 +119,13 @@ tolerance, both on `xla` and on `mosaic_tpu_v2`:
 The other 8 quantitative stages (plus 2 exact-match stages) are within
 tolerance; the failing stages are downstream of `expert_up_output`, consistent
 with one bf16 rounding difference propagating forward rather than 4
-independent errors. `xla` and `mosaic_tpu_v2` report the *same* max abs diff
-at each of these stages, which suggests a shared bf16/backend precision
-effect rather than a `mosaic_tpu_v2`-specific bug -- but this is only an
-inference from matching summary statistics; a direct same-device,
-element-wise comparison of the two implementations' raw output tensors has
-not been done yet.
-
-`mosaic` (v1) has not been exercised end-to-end on any bundle generated so
-far -- both bundles' dispatch row count is below its 128-row tiling floor, and
-the harness correctly counts this as not-run rather than as a pass;
-`NotImplementedError`/skip is never counted as a pass.
+independent errors. That three separate kernel implementations -- including
+mosaic (v1), a completely different codebase from mosaic_tpu_v2 -- report the
+*identical* residual at every failing stage is fairly strong evidence this is
+a shared bf16/backend precision effect rather than a bug in any one of them,
+but it is still an inference from matching summary statistics across runs,
+not a direct same-device, element-wise comparison of the three
+implementations' raw output tensors, which hasn't been done.
 
 ## Reproducing
 
