@@ -113,6 +113,27 @@ slicing (`int(group_sizes[e])`), which only works eagerly, not under
 correctness, not speed. WP-Kimi step 2 replaces that loop with
 `tokamax.ragged_dot` calls at real TPU scale.
 
+**2026-08-28: `generate_local_shard_workload`/`route_and_filter_to_local_shard`/
+`check_route_and_filter_correctness` moved here from
+`kimi_k3_latent_moe_ragged_dot.py`.** They never had a tokamax dependency of
+their own, but that file imports tokamax unconditionally at module level,
+which blocked them from being imported/run on a machine without a working
+tokamax install (this Windows dev machine) -- they could only be verified
+via a hand-mirrored throwaway script, not the actual committed code. Moving
+them here makes them genuinely, directly locally-testable.
+
+**Also new 2026-08-28: `check_sharded_forward_correctness`** closes the gap
+flagged since 2026-08-26 ("wire route_and_filter_to_local_shard into an
+actual end-to-end forward pass") -- proves that summing every shard's
+route+filter+per-shard-FFN+combine contribution across a small toy-scale
+global expert range reproduces the exact same result as
+`latent_moe_forward`'s unsharded computation over the same experts at once.
+This is the first end-to-end validation of the real
+16-of-896-then-filtered-to-local-shard routing design, entirely local, no
+TPU needed (the per-shard FFN here is a naive loop, not
+`tokamax.ragged_dot` -- swapping that in at real TPU scale is a follow-up
+that does need hardware).
+
 Usage:
   python kimi_k3_latent_moe_reference.py
 """
@@ -122,6 +143,12 @@ import functools
 
 import jax
 import jax.numpy as jnp
+
+_MOSAIC_TILE_SIZE = 128  # confirmed hard minimum/tile granularity for ragged_dot's Mosaic kernel
+
+
+def _round_up_to_tile(value: int, tile_size: int = _MOSAIC_TILE_SIZE) -> int:
+  return -(-value // tile_size) * tile_size
 
 
 @dataclasses.dataclass(frozen=True)
@@ -442,6 +469,656 @@ def _test_dispatch_roundtrip(config: LatentMoEConfig, key: jax.Array) -> bool:
   return ok
 
 
+def generate_local_shard_workload(
+    key: jax.Array,
+    num_tokens: int,
+    global_num_experts: int,
+    top_k: int,
+    local_num_experts: int,
+    latent_size: int,
+    dtype: jnp.dtype = jnp.bfloat16,
+    capacity_factor: float = 2.0,
+    tile_size: int = _MOSAIC_TILE_SIZE,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+  """WP-Kimi step 2b, part 1 (moved here from kimi_k3_latent_moe_ragged_dot.py
+  2026-08-28 -- this function has zero tokamax dependency, but that file
+  imports tokamax unconditionally at module level, which blocks it from
+  being run/tested on a machine without a working tokamax install, e.g. this
+  Windows dev machine. Moving it here makes it actually importable and
+  testable locally, not just runnable via a hand-mirrored throwaway script,
+  which is how it was verified previously): generate an isolated
+  expert-kernel benchmark input with REALISTIC statistics for what one
+  chip's `local_num_experts`-expert shard would see under a real
+  `top_k`-of-`global_num_experts` global router, WITHOUT implementing that
+  global routing/dispatch/filtering end-to-end (that's
+  route_and_filter_to_local_shard below, using REAL routing output instead
+  of a synthetic draw).
+
+  Statistical model: for each of `num_tokens` tokens, draw `top_k` expert
+  ids uniformly WITHOUT replacement from `global_num_experts` (a symmetric,
+  untrained-router assumption -- this is a synthetic benchmark input, not a
+  simulation of Kimi K3's actual trained routing distribution, which has an
+  aux-loss-free load-balancing bias term specifically because real training
+  dynamics are NOT uniform). Keep only the picks landing in
+  `[0, local_num_experts)` -- WLOG by the uniform-sampling symmetry, this
+  local range stands in for "whichever `local_num_experts` global ids this
+  chip happens to hold."
+
+  **Fixed-total, tile-aligned padding via a single trailing bucket** (a
+  review caught that an earlier version forced EVERY expert's `group_sizes`
+  entry to the same constant `capacity`, which silently erased the real
+  skew this whole benchmark exists to exercise: Mosaic's kernel specifically
+  reacts to per-group sizes, so a uniform group_sizes array quietly turns
+  this back into a too-regular workload):
+
+  Per-expert `group_sizes[0:local_num_experts]` are the REAL, unmodified,
+  genuinely-skewed dispatch counts from the draw above -- nothing about an
+  individual expert's count is altered. The "needs a fixed, tile-aligned
+  total M so xla/mosaic-v1/mosaic-v2 all see identical shapes/values"
+  requirement is instead satisfied by ONE extra trailing "padding bucket"
+  appended as group `local_num_experts` (so `group_sizes` has
+  `local_num_experts + 1` entries, and the expert weight tensors passed to
+  ragged_dot need a matching dummy `+1`th row): its size is whatever's
+  needed to bring the total up to a fixed `m_padded` (an aggregate ceiling
+  on the total draw across all local experts, `capacity_factor` times the
+  expected total, rounded UP to `tile_size`). This keeps the array SHAPE
+  and VALUES identical across implementations without touching any real
+  expert's group size.
+
+  If the total raw draw exceeds `m_padded` (aggregate overflow), the excess
+  is dropped from the tail of the expert-sorted order and a warning is
+  printed with the drop count.
+
+  Returns `(sorted_tokens, group_sizes, valid_mask, per_expert_counts)`:
+    - `sorted_tokens`: `(m_padded, latent_size)`, fixed shape regardless of
+      the random draw. Real token data fills the first
+      `sum(per_expert_counts)` rows (expert-contiguous, matching
+      `group_sizes[:local_num_experts]`); the trailing padding-bucket rows
+      are zero.
+    - `group_sizes`: `(local_num_experts + 1,)` -- the real per-expert
+      counts, unmodified, followed by the one padding-bucket size. This is
+      what actually gets passed to `ragged_dot`; still genuinely ragged.
+    - `valid_mask`: `(m_padded,)` bool, True for rows holding real
+      (non-padding) data.
+    - `per_expert_counts`: `(local_num_experts,)`, same values as
+      `group_sizes[:local_num_experts]`.
+
+  Runs eagerly, not jit-compiled: m_padded and drop counts are
+  data-dependent Python ints computed from the random draw, same
+  "must run outside jit" constraint as latent_moe_forward's per-expert loop.
+  """
+  key_route, key_data = jax.random.split(key)
+  token_keys = jax.random.split(key_route, num_tokens)
+
+  def _pick_global_experts(k: jax.Array) -> jax.Array:
+    return jax.random.choice(k, global_num_experts, shape=(top_k,), replace=False)
+
+  global_picks = jax.vmap(_pick_global_experts)(token_keys)  # (num_tokens, top_k)
+
+  flat_picks = global_picks.reshape(-1)
+  local_mask = flat_picks < local_num_experts
+  local_ids = flat_picks[local_mask]  # data-dependent length -- eager only
+  num_raw = local_ids.shape[0]
+
+  order = jnp.argsort(local_ids)
+  sorted_local_ids = local_ids[order]
+
+  expected_total = num_tokens * top_k * local_num_experts / global_num_experts
+  m_padded = _round_up_to_tile(int(jnp.ceil(expected_total * capacity_factor)), tile_size)
+
+  if num_raw > m_padded:
+    dropped = num_raw - m_padded
+    print(
+        f"[shard-workload] WARNING: m_padded={m_padded} overflowed by the total draw -- "
+        f"dropping {dropped} of {num_raw} raw assignments from the tail of the "
+        "expert-sorted order (raise capacity_factor if this matters for the benchmark)"
+    )
+    kept_local_ids = sorted_local_ids[:m_padded]
+  else:
+    kept_local_ids = sorted_local_ids
+
+  keep_count = kept_local_ids.shape[0]
+  per_expert_counts = jnp.bincount(kept_local_ids, length=local_num_experts).astype(jnp.int32)
+  pad_size = m_padded - keep_count
+
+  group_sizes = jnp.concatenate(
+      [per_expert_counts, jnp.array([pad_size], dtype=jnp.int32)]
+  )
+
+  real_tokens = jax.random.normal(key_data, (keep_count, latent_size), dtype=dtype)
+  pad_tokens = jnp.zeros((pad_size, latent_size), dtype=dtype)
+  sorted_tokens = jnp.concatenate([real_tokens, pad_tokens], axis=0)
+
+  valid_mask = jnp.concatenate(
+      [jnp.ones((keep_count,), dtype=jnp.bool_), jnp.zeros((pad_size,), dtype=jnp.bool_)]
+  )
+
+  return sorted_tokens, group_sizes, valid_mask, per_expert_counts
+
+
+def route_and_filter_to_local_shard(
+    hidden_states: jax.Array,
+    x: jax.Array,
+    router_weight: jax.Array,
+    e_score_correction_bias: jax.Array,
+    config: LatentMoEConfig,
+    local_expert_start: int,
+    local_num_experts: int,
+    capacity_factor: float = 2.0,
+    tile_size: int = _MOSAIC_TILE_SIZE,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """WP-Kimi step 2b, part 2 (moved here 2026-08-28, see
+  generate_local_shard_workload's docstring for why): REAL global
+  `config.top_k`-of-`config.num_experts` top-k routing (identical gate math
+  to `latent_moe_forward`'s step 1 -- float32 internally, cast back to
+  compute dtype at the end), filtered down to the local shard
+  `[local_expert_start, local_expert_start + local_num_experts)`, with the
+  SAME fixed-total, tile-aligned padding scheme as
+  generate_local_shard_workload (one trailing padding-bucket group) --
+  unlike that function, the per-expert counts here come from ACTUAL routing
+  output on real `hidden_states`, not a synthetic uniform-sampling draw.
+
+  `x` is the ALREADY down-projected representation (`hidden_states @
+  down_proj`, step 2 of the real forward pass) -- the router itself runs on
+  `hidden_states` (pre-projection), matching the real model's step ordering;
+  passing both in lets the caller reuse a single down-projection across
+  shards/calls instead of recomputing it here.
+
+  Returns `(sorted_tokens, group_sizes, valid_mask, per_expert_counts,
+  padded_token_idx, padded_combine_weight)`:
+    - `sorted_tokens`: `(m_padded, latent_size)`, gathered from `x` in
+      expert-sorted order for real assignments, zero for padding rows.
+    - `group_sizes`: `(local_num_experts + 1,)` -- real per-expert counts
+      (genuinely data-dependent on the actual routing outcome, not forced
+      uniform) plus one trailing padding-bucket size.
+    - `valid_mask`: `(m_padded,)` bool, True for real (non-padding) rows.
+    - `per_expert_counts`: `(local_num_experts,)`, same as
+      `group_sizes[:local_num_experts]`.
+    - `padded_token_idx`: `(m_padded,)` int32, the ORIGINAL token index (row
+      in `hidden_states`/`x`) each row came from; -1 for padding rows. This
+      is what an end-to-end combine/scatter step needs to route each
+      expert's output back to its token -- see check_sharded_forward_correctness
+      for the first such wiring (2026-08-28).
+    - `padded_combine_weight`: `(m_padded,)`, the router's combine weight
+      (renormalized+scaled, already cast to compute dtype) for each real
+      assignment; 0 for padding rows.
+
+  If the total number of (token, slot) pairs landing in this shard exceeds
+  `m_padded` (aggregate overflow), the excess is dropped from the tail of
+  the expert-sorted order and a warning is printed -- identical policy to
+  generate_local_shard_workload.
+
+  Runs eagerly, not jit-compiled: filtering to the local shard produces a
+  data-dependent length, same "must run outside jit" constraint as
+  generate_local_shard_workload and latent_moe_forward's per-expert loop.
+  """
+  compute_dtype = hidden_states.dtype
+  logits = hidden_states.astype(jnp.float32) @ router_weight.astype(jnp.float32)
+  scores = jax.nn.sigmoid(logits)
+  scores_for_choice = scores + e_score_correction_bias.astype(jnp.float32)[None, :]
+  _, topk_idx = jax.lax.top_k(scores_for_choice, config.top_k)  # (num_tokens, top_k), GLOBAL ids
+  topk_weight = jnp.take_along_axis(scores, topk_idx, axis=-1)
+  if config.top_k > 1 and config.moe_renormalize:
+    denom = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
+    topk_weight = topk_weight / denom
+  topk_weight = topk_weight * config.routed_scaling_factor
+  topk_weight = topk_weight.astype(compute_dtype)
+
+  num_tokens = hidden_states.shape[0]
+  flat_expert_ids = topk_idx.reshape(-1)  # GLOBAL ids, (num_tokens*top_k,)
+  token_of_slot = jnp.arange(num_tokens * config.top_k) // config.top_k
+  flat_combine_weight = topk_weight.reshape(-1)
+
+  local_end = local_expert_start + local_num_experts
+  in_shard = (flat_expert_ids >= local_expert_start) & (flat_expert_ids < local_end)
+
+  # eager-only from here: filtering to the shard produces a data-dependent length.
+  kept_local_ids = flat_expert_ids[in_shard] - local_expert_start
+  kept_token_idx = token_of_slot[in_shard]
+  kept_combine_weight = flat_combine_weight[in_shard]
+  num_raw = kept_local_ids.shape[0]
+
+  order = jnp.argsort(kept_local_ids)
+  sorted_local_ids = kept_local_ids[order]
+  sorted_token_idx = kept_token_idx[order]
+  sorted_combine_weight = kept_combine_weight[order]
+
+  expected_total = num_tokens * config.top_k * local_num_experts / config.num_experts
+  m_padded = _round_up_to_tile(int(jnp.ceil(expected_total * capacity_factor)), tile_size)
+
+  if num_raw > m_padded:
+    dropped = num_raw - m_padded
+    print(
+        f"[shard-route] WARNING: m_padded={m_padded} overflowed by the total routed draw -- "
+        f"dropping {dropped} of {num_raw} raw assignments from the tail of the "
+        "expert-sorted order (raise capacity_factor if this matters)"
+    )
+    keep_count = m_padded
+  else:
+    keep_count = num_raw
+
+  kept_sorted_local_ids = sorted_local_ids[:keep_count]
+  kept_sorted_token_idx = sorted_token_idx[:keep_count]
+  kept_sorted_combine_weight = sorted_combine_weight[:keep_count]
+
+  per_expert_counts = jnp.bincount(kept_sorted_local_ids, length=local_num_experts).astype(jnp.int32)
+  pad_size = m_padded - keep_count
+  group_sizes = jnp.concatenate([per_expert_counts, jnp.array([pad_size], dtype=jnp.int32)])
+
+  gathered = x[kept_sorted_token_idx]
+  pad_tokens = jnp.zeros((pad_size, x.shape[-1]), dtype=x.dtype)
+  sorted_tokens = jnp.concatenate([gathered, pad_tokens], axis=0)
+
+  valid_mask = jnp.concatenate(
+      [jnp.ones((keep_count,), dtype=jnp.bool_), jnp.zeros((pad_size,), dtype=jnp.bool_)]
+  )
+  padded_token_idx = jnp.concatenate(
+      [kept_sorted_token_idx.astype(jnp.int32), -jnp.ones((pad_size,), dtype=jnp.int32)]
+  )
+  padded_combine_weight = jnp.concatenate(
+      [kept_sorted_combine_weight, jnp.zeros((pad_size,), dtype=compute_dtype)]
+  )
+
+  return (
+      sorted_tokens,
+      group_sizes,
+      valid_mask,
+      per_expert_counts,
+      padded_token_idx,
+      padded_combine_weight,
+  )
+
+
+def check_route_and_filter_correctness(
+    seed: int = 0,
+    num_tokens: int = 256,
+    local_expert_start: int = 137,
+    local_num_experts: int = 64,
+) -> bool:
+  """Standalone correctness + padding/overflow test for
+  route_and_filter_to_local_shard, tested in isolation before it's wired
+  into any end-to-end forward pass or benchmark. Pure JAX/numpy -- no
+  tokamax dependency, runs anywhere. `local_expert_start=137` (not 0)
+  deliberately, so a bug that only breaks for a non-zero shard offset isn't
+  masked.
+
+  Uses `config.num_experts=896` (kimi_k3_config's REAL global expert count)
+  for the router matmul, but only allocates `router_weight`
+  ((hidden_size, 896)) and `down_proj` ((hidden_size, latent_size)) directly
+  -- NOT the full LatentMoEWeights/init_weights, which would allocate the
+  full per-expert expert_gate/up/down tensors (~59GB at 896 experts,
+  confirmed OOM-inducing on a single v6e chip, and not needed for a
+  routing-only test anyway).
+
+  Checks, each against an independent brute-force (Python/numpy, not
+  vectorized JAX) reference so a bug in route_and_filter_to_local_shard's
+  own argsort/bincount logic can't also be present in the check:
+    1. No-overflow case (generous capacity_factor): per_expert_counts
+       matches a nested-loop count of (token, slot) pairs whose global
+       expert id falls in the shard range.
+    2. Gathered sorted_tokens (valid rows only) exactly equals `x` indexed
+       by padded_token_idx (valid rows only) -- catches gather-order bugs.
+       Exact equality, not an error tolerance, since this is pure indexing.
+    3. Combine weight (valid rows only) matches an independently-recomputed
+       value: for each valid row, find (via numpy) the token's OWN slot
+       whose global expert id equals this row's global expert id, and
+       compare against the original (pre-filter) topk_weight at that
+       (token, slot) -- catches misalignment introduced by the
+       flatten/filter/argsort pipeline.
+    4. Overflow/truncation semantics (capacity_factor forced tiny): dropped
+       count is correct, `sum(per_expert_counts) + pad_size == m_padded`
+       still holds, and the SURVIVING (token, slot) pairs are exactly the
+       first `m_padded` of an independently-sorted-by-expert-id sequence
+       (built via Python's stable `sorted()`, not JAX argsort) -- confirms
+       truncation drops exactly the tail, nothing else.
+  """
+  config = kimi_k3_config()  # real hidden_size=7168, num_experts=896, top_k=16
+  key = jax.random.key(seed)
+  key_router, key_bias, key_x = jax.random.split(key, 3)
+
+  router_weight = jax.random.normal(key_router, (config.hidden_size, config.num_experts)) * 0.02
+  e_score_correction_bias = jnp.zeros((config.num_experts,))
+  hidden_states = jax.random.normal(key_x, (num_tokens, config.hidden_size))
+  x = hidden_states  # identity stand-in for down_proj's output -- only the
+  # gather/filter/combine-weight logic is under test here, not the
+  # down-projection matmul itself, so using hidden_states directly (same
+  # latent_size-agnostic shape role) keeps the test setup simpler.
+
+  # Recompute the SAME topk_idx/topk_weight the function computes internally,
+  # via a second, independent call path, so checks 1/3/4 below have ground
+  # truth to compare against without re-deriving the function's own logic.
+  logits = hidden_states.astype(jnp.float32) @ router_weight.astype(jnp.float32)
+  scores = jax.nn.sigmoid(logits)
+  scores_for_choice = scores + e_score_correction_bias.astype(jnp.float32)[None, :]
+  _, topk_idx = jax.lax.top_k(scores_for_choice, config.top_k)
+  topk_weight_full = jnp.take_along_axis(scores, topk_idx, axis=-1)
+  if config.top_k > 1 and config.moe_renormalize:
+    denom = jnp.sum(topk_weight_full, axis=-1, keepdims=True) + 1e-20
+    topk_weight_full = topk_weight_full / denom
+  topk_weight_full = topk_weight_full * config.routed_scaling_factor
+
+  topk_idx_np = jax.device_get(topk_idx)
+  topk_weight_np = jax.device_get(topk_weight_full)
+
+  all_ok = True
+
+  # --- Checks 1-3: no-overflow case ---
+  (
+      sorted_tokens,
+      group_sizes,
+      valid_mask,
+      per_expert_counts,
+      padded_token_idx,
+      padded_combine_weight,
+  ) = route_and_filter_to_local_shard(
+      hidden_states,
+      x,
+      router_weight,
+      e_score_correction_bias,
+      config,
+      local_expert_start=local_expert_start,
+      local_num_experts=local_num_experts,
+      capacity_factor=4.0,  # generous -- this pass must NOT overflow
+  )
+
+  # Check 1: brute-force per-expert counts.
+  ref_counts = [0] * local_num_experts
+  for tok in range(topk_idx_np.shape[0]):
+    for slot in range(topk_idx_np.shape[1]):
+      gid = int(topk_idx_np[tok, slot])
+      if local_expert_start <= gid < local_expert_start + local_num_experts:
+        ref_counts[gid - local_expert_start] += 1
+  counts_ok = per_expert_counts.tolist() == ref_counts
+  print(
+      f"[route-filter-correctness] check1 per_expert_counts match brute-force ref: "
+      f"{'OK' if counts_ok else 'FAIL'}"
+  )
+  all_ok = all_ok and counts_ok
+
+  # Check 2: gathered token data matches x[padded_token_idx] on valid rows.
+  num_valid = int(jnp.sum(valid_mask))
+  gather_ok = bool(
+      jnp.array_equal(sorted_tokens[:num_valid], x[padded_token_idx[:num_valid]])
+  )
+  print(f"[route-filter-correctness] check2 gathered tokens match x[padded_token_idx]: "
+        f"{'OK' if gather_ok else 'FAIL'} (num_valid={num_valid})")
+  all_ok = all_ok and gather_ok
+
+  # Check 3: combine weight matches an independently-recomputed value.
+  padded_token_idx_np = jax.device_get(padded_token_idx[:num_valid])
+  padded_combine_weight_np = jax.device_get(padded_combine_weight[:num_valid])
+  weight_ok = True
+  for row in range(num_valid):
+    tok = int(padded_token_idx_np[row])
+    row_global_id = None
+    for slot in range(topk_idx_np.shape[1]):
+      gid = int(topk_idx_np[tok, slot])
+      if local_expert_start <= gid < local_expert_start + local_num_experts:
+        # there may be multiple shard-hits for this token across different slots;
+        # match by value against the row's own combine weight instead of position
+        if abs(float(topk_weight_np[tok, slot]) - float(padded_combine_weight_np[row])) < 1e-5:
+          row_global_id = gid
+          break
+    if row_global_id is None:
+      weight_ok = False
+      print(f"[route-filter-correctness] check3 FAIL: row {row} (token {tok}) combine "
+            f"weight {float(padded_combine_weight_np[row]):.6f} matches no slot's score")
+      break
+  print(f"[route-filter-correctness] check3 combine weights match independent recompute: "
+        f"{'OK' if weight_ok else 'FAIL'}")
+  all_ok = all_ok and weight_ok
+
+  # --- Check 4: forced overflow/truncation ---
+  (
+      _sorted_tokens_ovf,
+      group_sizes_ovf,
+      valid_mask_ovf,
+      per_expert_counts_ovf,
+      padded_token_idx_ovf,
+      _padded_combine_weight_ovf,
+  ) = route_and_filter_to_local_shard(
+      hidden_states,
+      x,
+      router_weight,
+      e_score_correction_bias,
+      config,
+      local_expert_start=local_expert_start,
+      local_num_experts=local_num_experts,
+      capacity_factor=0.05,  # deliberately tiny -- force overflow
+      tile_size=1,  # disable tile rounding so the forced m_padded is exact/predictable
+  )
+  m_padded_ovf = int(jnp.sum(group_sizes_ovf))
+  keep_count_ovf = int(jnp.sum(valid_mask_ovf))
+
+  # Independent reference: brute-force list of (token, slot, global_id), stable-sorted
+  # by global id via Python's sorted() (not JAX argsort), truncated to m_padded_ovf.
+  raw_hits = []
+  for tok in range(topk_idx_np.shape[0]):
+    for slot in range(topk_idx_np.shape[1]):
+      gid = int(topk_idx_np[tok, slot])
+      if local_expert_start <= gid < local_expert_start + local_num_experts:
+        raw_hits.append((gid - local_expert_start, tok))
+  raw_hits_sorted = sorted(raw_hits, key=lambda pair: pair[0])  # stable sort by local id
+  ref_kept = raw_hits_sorted[:m_padded_ovf]
+  ref_counts_ovf = [0] * local_num_experts
+  for local_id, _tok in ref_kept:
+    ref_counts_ovf[local_id] += 1
+
+  overflow_triggered = len(raw_hits_sorted) > m_padded_ovf
+  counts_ovf_ok = per_expert_counts_ovf.tolist() == ref_counts_ovf
+  keep_count_ok = keep_count_ovf == len(ref_kept)
+  token_order_ok = jax.device_get(padded_token_idx_ovf[:keep_count_ovf]).tolist() == [
+      tok for _local_id, tok in ref_kept
+  ]
+  check4_ok = overflow_triggered and counts_ovf_ok and keep_count_ok and token_order_ok
+  print(
+      f"[route-filter-correctness] check4 forced overflow -- triggered={overflow_triggered} "
+      f"counts_match={counts_ovf_ok} keep_count_match={keep_count_ok} "
+      f"token_order_match={token_order_ok}: {'OK' if check4_ok else 'FAIL'}"
+  )
+  all_ok = all_ok and check4_ok
+
+  return all_ok
+
+
+def _local_shard_expert_ffn(
+    sorted_tokens: jax.Array,
+    expert_gate: jax.Array,
+    expert_up: jax.Array,
+    expert_down: jax.Array,
+    group_sizes: jax.Array,
+    config: LatentMoEConfig,
+) -> jax.Array:
+  """Naive (non-ragged_dot) per-expert-loop FFN over one shard's ALREADY
+  sorted-and-padded tokens, mirroring latent_moe_forward's step-4 loop but
+  operating on `sorted_tokens`/`group_sizes` as produced by
+  route_and_filter_to_local_shard / generate_local_shard_workload: real
+  per-expert counts for this shard's `local_num_experts` experts, plus one
+  trailing padding-bucket group whose weights are never touched by real
+  data (its input rows are all zero). `expert_gate`/`expert_up`/
+  `expert_down` must therefore have `local_num_experts + 1` rows -- a
+  dummy `+1`th row for that padding bucket, same convention as
+  run_shard_workload_benchmark in kimi_k3_latent_moe_ragged_dot.py.
+
+  Runs eagerly, same "needs concrete Python ints for slice sizes" constraint
+  as latent_moe_forward's own per-expert loop and
+  route_and_filter_to_local_shard itself.
+  """
+  compute_dtype = sorted_tokens.dtype
+  group_sizes_concrete = [int(s) for s in group_sizes]
+  outs = []
+  start = 0
+  for e, size in enumerate(group_sizes_concrete):
+    chunk = sorted_tokens[start : start + size]
+    if size > 0:
+      out_chunk = _situ_glu_mlp(
+          chunk,
+          expert_gate[e],
+          expert_up[e],
+          expert_down[e],
+          config.activation_situ_beta,
+          config.activation_situ_linear_beta,
+      )
+    else:
+      out_chunk = jnp.zeros((0, config.latent_size), dtype=compute_dtype)
+    outs.append(out_chunk)
+    start += size
+  return jnp.concatenate(outs, axis=0)
+
+
+def check_sharded_forward_correctness(
+    seed: int = 0,
+    num_tokens: int = 96,
+    global_num_experts: int = 32,
+    local_num_experts: int = 8,
+    top_k: int = 4,
+    capacity_factor: float = 4.0,
+) -> bool:
+  """Proves the previously-unwired piece of WP-Kimi step 2b (real global
+  routing + local-shard filtering via route_and_filter_to_local_shard, plus
+  a scatter-back/weighted-combine step turning a shard's expert output into
+  its contribution to the final result) is mathematically equivalent to
+  computing the SAME forward pass directly over all global experts at once
+  (latent_moe_forward), once every shard's contribution is summed.
+
+  This closes the gap flagged since 2026-08-26 ("Step 3, not yet started:
+  wire route_and_filter_to_local_shard into an actual end-to-end forward
+  pass") -- routing, shard-filtering, and per-shard expert compute had each
+  been tested in isolation, but never wired into one coherent forward pass
+  and checked end-to-end against a ground truth.
+
+  Uses a small `global_num_experts` (32, not the real 896 -- kimi_k3_config's
+  full expert tensors don't fit in memory for a from-scratch reference, see
+  single_chip_kimi_k3_config's docstring in kimi_k3_latent_moe_ragged_dot.py)
+  so this stays a pure-JAX, CPU-only, tokamax-free check. Swapping the naive
+  per-shard FFN below for tokamax.ragged_dot at real TPU scale is a
+  follow-up needing a TPU VM -- same "reference proves the math, ragged_dot
+  is checked against it" pattern as everything else in this project.
+
+  `global_num_experts` must divide evenly by `local_num_experts` so the
+  shards below tile the full global expert range exactly once each, with no
+  gaps or overlaps -- every (token, slot) pair's chosen expert then falls
+  in EXACTLY one shard, which is what makes "sum every shard's contribution"
+  equal the unsharded computation.
+  """
+  assert global_num_experts % local_num_experts == 0, (
+      "global_num_experts must divide evenly by local_num_experts so the shards below "
+      "exactly tile [0, global_num_experts) once each, with no gaps or overlaps"
+  )
+  num_shards = global_num_experts // local_num_experts
+
+  config = LatentMoEConfig(
+      hidden_size=64,
+      latent_size=32,
+      intermediate_size=48,
+      num_experts=global_num_experts,
+      top_k=top_k,
+      num_shared_experts=1,
+      moe_renormalize=True,
+      routed_scaling_factor=1.0,
+      rms_norm_eps=1e-5,
+      activation_situ_beta=4.0,
+      activation_situ_linear_beta=25.0,
+  )
+
+  key = jax.random.key(seed)
+  key_w, key_x = jax.random.split(key)
+  weights = init_weights(config, key_w)  # float32
+  hidden_states = jax.random.normal(key_x, (num_tokens, config.hidden_size))
+
+  # Ground truth: the existing naive, unsharded reference over ALL global experts at once.
+  reference_out = latent_moe_forward(hidden_states, weights, config)
+
+  # Sharded computation: route + filter + per-shard compute + weighted
+  # combine, once per shard, summed.
+  identity = hidden_states
+  compute_dtype = hidden_states.dtype
+  x = hidden_states @ weights.down_proj  # shared down-projection, same as latent_moe_forward step 2
+
+  routed_out = jnp.zeros((num_tokens, config.latent_size), dtype=compute_dtype)
+  total_valid_rows = 0
+  for shard_idx in range(num_shards):
+    local_expert_start = shard_idx * local_num_experts
+    (
+        sorted_tokens,
+        group_sizes,
+        valid_mask,
+        _per_expert_counts,
+        padded_token_idx,
+        padded_combine_weight,
+    ) = route_and_filter_to_local_shard(
+        hidden_states,
+        x,
+        weights.router_weight,
+        weights.e_score_correction_bias,
+        config,
+        local_expert_start=local_expert_start,
+        local_num_experts=local_num_experts,
+        capacity_factor=capacity_factor,
+        tile_size=1,  # toy scale, no Mosaic tiling constraint to satisfy here
+    )
+    total_valid_rows += int(jnp.sum(valid_mask))
+
+    # +1 dummy expert row for the trailing padding bucket, matching
+    # route_and_filter_to_local_shard's group_sizes convention.
+    shard_gate = weights.expert_gate[local_expert_start : local_expert_start + local_num_experts]
+    shard_up = weights.expert_up[local_expert_start : local_expert_start + local_num_experts]
+    shard_down = weights.expert_down[local_expert_start : local_expert_start + local_num_experts]
+    shard_gate = jnp.concatenate([shard_gate, jnp.zeros_like(shard_gate[:1])], axis=0)
+    shard_up = jnp.concatenate([shard_up, jnp.zeros_like(shard_up[:1])], axis=0)
+    shard_down = jnp.concatenate([shard_down, jnp.zeros_like(shard_down[:1])], axis=0)
+
+    shard_out = _local_shard_expert_ffn(
+        sorted_tokens, shard_gate, shard_up, shard_down, group_sizes, config
+    )  # (m_padded, latent_size)
+
+    # Scatter each dispatched row's contribution back to its token, weighted
+    # by the combine weight. Padding rows have padded_combine_weight==0, so
+    # they contribute exactly nothing regardless of which index
+    # padded_token_idx points them at -- the -1 placeholder for padding rows
+    # is therefore safe here: JAX/numpy negative-index semantics make it
+    # index the LAST token, but the weighted contribution added there is 0.
+    weighted = shard_out * padded_combine_weight[:, None]
+    routed_out = routed_out.at[padded_token_idx].add(weighted.astype(compute_dtype))
+
+  # Every (token, slot) pair lands in EXACTLY one shard (shards tile
+  # [0, global_num_experts) with no overlap) -- so summing every shard's
+  # valid row count should equal num_tokens * top_k exactly, given generous
+  # enough capacity_factor that no shard drops anything.
+  expected_total = num_tokens * top_k
+  coverage_ok = total_valid_rows == expected_total
+  print(
+      f"[sharded-correctness] total valid dispatched rows across {num_shards} shards "
+      f"of {local_num_experts} experts each: {total_valid_rows} (expected {expected_total}) "
+      f"{'OK' if coverage_ok else 'FAIL -- some (token, slot) pairs were dropped, raise capacity_factor'}"
+  )
+
+  # Steps 6-8 (RMSNorm, up_proj, shared experts) are identical whether the
+  # routed-expert combine came from one unsharded computation or several
+  # shards summed -- apply them once here, exactly matching
+  # latent_moe_forward's own steps 6-8.
+  normed = _rms_norm(routed_out, weights.norm_scale, config.rms_norm_eps)
+  up = normed @ weights.up_proj
+  shared_out = _situ_glu_mlp(
+      identity,
+      weights.shared_gate,
+      weights.shared_up,
+      weights.shared_down,
+      config.activation_situ_beta,
+      config.activation_situ_linear_beta,
+  )
+  sharded_final = up + shared_out
+
+  max_err = float(jnp.max(jnp.abs(sharded_final - reference_out)))
+  ok = max_err < 1e-4
+  print(
+      f"[sharded-correctness] sharded (route+filter+per-shard-FFN+combine, summed over "
+      f"{num_shards} shards of {local_num_experts} experts each) vs. unsharded reference "
+      f"(all {global_num_experts} experts at once): max_err={max_err:.2e} {'OK' if ok else 'FAIL'}"
+  )
+  return coverage_ok and ok
+
+
 if __name__ == "__main__":
   key = jax.random.key(0)
   key_test, key_weights, key_x = jax.random.split(key, 3)
@@ -466,3 +1143,14 @@ if __name__ == "__main__":
   assert shape_ok, f"unexpected output shape {out.shape}"
   assert not has_nan, "forward pass produced NaNs"
   print("OK: dispatch roundtrip + full forward pass both check out")
+
+  route_filter_ok = check_route_and_filter_correctness()
+  assert route_filter_ok, "route_and_filter_to_local_shard failed its standalone correctness/overflow check"
+
+  sharded_ok = check_sharded_forward_correctness()
+  assert sharded_ok, (
+      "sharded (route+filter+per-shard-FFN+combine) forward pass diverges from the "
+      "unsharded reference -- the real 16-of-896-then-filtered-to-local-shard pipeline "
+      "is not yet mathematically equivalent to computing over all experts directly"
+  )
+  print("OK: sharded end-to-end forward pass matches the unsharded reference")

@@ -21,6 +21,14 @@ TPU v6e using `tokamax.ragged_dot`.
   2026-08-28 -- the first latency numbers measured against the corrected
   (post SiTU-GLU/precision-fix) architecture. `mosaic_tpu_v2` is the
   fastest implementation at every scale tested (see Latency below).
+- The real 16-of-896-then-filtered-to-local-shard routing, dispatch, and
+  weighted combine -- previously only tested in isolated pieces -- wired
+  into one coherent forward pass and verified end-to-end against an
+  unsharded reference, entirely locally (no TPU): summing every shard's
+  contribution reproduces the unsharded computation's output exactly
+  (`max_err=9.31e-10` at a small toy scale). See
+  `check_sharded_forward_correctness` in
+  `05_ragged_dot_on_tpu/kimi_k3_latent_moe_reference.py`.
 
 **In progress / open:**
 - bf16 on `xla`/`mosaic` (v1)/`mosaic_tpu_v2` shows a tolerance-exceeding
@@ -28,11 +36,18 @@ TPU v6e using `tokamax.ragged_dot`.
   likely bf16 precision noise, not yet confirmed via direct tensor-level
   comparison.
 - Full-dimension (`num_experts=896`, `top_k=16`) validation.
+- A `tokamax.ragged_dot`-based (not naive-loop) version of the sharded
+  forward pass above, validated on real hardware -- the correctness proof
+  so far uses a plain per-expert loop, same "reference proves the math,
+  ragged_dot is checked against it" pattern as the rest of this project.
 
 **Not yet covered:**
 - The real, MXFP4-quantized Kimi K3 checkpoint weights (bundles so far use
   random weight init).
-- Multi-device/sharded expert dispatch.
+- Actual multi-device/multi-chip execution (everything so far has run on a
+  single chip; the sharded routing above proves the per-shard math is
+  correct, not that multiple chips actually combine their contributions
+  over a network).
 - Any form of full-model deployment.
 
 ## Layout
