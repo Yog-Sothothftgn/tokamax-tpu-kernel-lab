@@ -37,9 +37,11 @@ TPU v6e using `tokamax.ragged_dot`.
   comparison.
 - Full-dimension (`num_experts=896`, `top_k=16`) validation.
 - A `tokamax.ragged_dot`-based (not naive-loop) version of the sharded
-  forward pass above, validated on real hardware -- the correctness proof
-  so far uses a plain per-expert loop, same "reference proves the math,
-  ragged_dot is checked against it" pattern as the rest of this project.
+  forward pass above (`check_sharded_ragged_dot_correctness`), plus a
+  latency sweep under the REAL routing distribution instead of the dense
+  `single_chip_kimi_k3_config` simplification
+  (`run_realistic_shard_latency_sweep`) -- both written 2026-08-28 but not
+  yet run on hardware.
 
 **Not yet covered:**
 - The real, MXFP4-quantized Kimi K3 checkpoint weights (bundles so far use

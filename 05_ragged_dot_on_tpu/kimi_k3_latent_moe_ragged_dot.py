@@ -61,6 +61,8 @@ which is pure JAX and needs neither tokamax nor a TPU):
   python kimi_k3_latent_moe_ragged_dot.py --shard-workload          # correctness check (valid-rows-only) + isolated expert-kernel benchmark on a realistic, fixed-total-padded 16-of-896-filtered workload (WP-Kimi step 2b part 1)
   python kimi_k3_latent_moe_ragged_dot.py --route-filter-correctness  # standalone (no tokamax/TPU) correctness + overflow test for REAL 896-expert routing filtered to a local shard (WP-Kimi step 2b part 2)
   python kimi_k3_latent_moe_ragged_dot.py --latency-sweep           # latency across multiple batch_size/seq_len pairs, one table (Zifan's 2026-08-28 standing request, see run_latency_sweep)
+  python kimi_k3_latent_moe_ragged_dot.py --sharded-ragged-dot-correctness  # ragged_dot version of the sharded end-to-end correctness proof (WP-Kimi step 3 follow-up, see check_sharded_ragged_dot_correctness)
+  python kimi_k3_latent_moe_ragged_dot.py --realistic-shard-latency-sweep  # latency under the REAL 16-of-896 routing distribution, not the dense/uniform simplification (see run_realistic_shard_latency_sweep)
 
 **2026-08-26, WP-Kimi step 2b (review's P1-C item, two-step plan per user
 direction):** `single_chip_kimi_k3_config`'s num_experts=64/top_k=16 setup
@@ -94,7 +96,15 @@ instead of a synthetic draw), tested standalone via
 
 **Step 3 (done, 2026-08-28): wired into an actual end-to-end forward pass
 and checked against a ground truth for the first time --
-`check_sharded_forward_correctness` in `kimi_k3_latent_moe_reference.py`.**
+`check_sharded_forward_correctness` in `kimi_k3_latent_moe_reference.py`
+(naive per-shard loop, no tokamax needed).** `check_sharded_ragged_dot_correctness`
+and `run_realistic_shard_latency_sweep` below are the `tokamax.ragged_dot`
+follow-up -- same design, but the per-shard FFN goes through real
+`ragged_dot` calls, and the latency sweep uses the REAL routing
+distribution instead of `single_chip_kimi_k3_config`'s dense/uniform
+simplification. **Written but NOT yet run on hardware as of this note** --
+do not trust their output until they've actually executed on a v6e TPU VM.
+
 Also on 2026-08-28, `generate_local_shard_workload`,
 `route_and_filter_to_local_shard`, and `check_route_and_filter_correctness`
 were MOVED to `kimi_k3_latent_moe_reference.py` and are imported back here
@@ -356,6 +366,298 @@ def single_chip_kimi_k3_config(num_experts: int = 64) -> LatentMoEConfig:
   routing distribution does to ragged_dot."
   """
   return dataclasses.replace(kimi_k3_config(), num_experts=num_experts)
+
+
+_DEFAULT_LATENCY_SWEEP_SHAPES: tuple[tuple[int, int], ...] = (
+    # (batch_size, seq_len). hidden_states is (num_tokens, hidden_size) --
+    # batch_size and seq_len only ever enter this forward pass through their
+    # product, num_tokens = batch_size * seq_len (there is no separate
+    # batch/sequence axis anywhere in latent_moe_forward_ragged_dot). Several
+    # pairs below deliberately share the same num_tokens (e.g. (1,2048) and
+    # (2,1024)) as a sanity check: matching latency at matching num_tokens is
+    # expected, not a coincidence, and a divergence there would flag a bug.
+    (1, 128),
+    (1, 512),
+    (1, 2048),
+    (2, 1024),
+    (1, 4096),
+    (4, 1024),
+)
+
+
+def _local_shard_expert_ffn_ragged_dot(
+    sorted_tokens: jax.Array,
+    expert_gate: jax.Array,
+    expert_up: jax.Array,
+    expert_down: jax.Array,
+    group_sizes: jax.Array,
+    config: LatentMoEConfig,
+    implementation: str | None = None,
+) -> jax.Array:
+  """tokamax.ragged_dot version of kimi_k3_latent_moe_reference.py's
+  `_local_shard_expert_ffn` (the naive per-expert-loop version, proven
+  2026-08-28 to be mathematically equivalent to the unsharded reference via
+  `check_sharded_forward_correctness`). Same inputs/shapes/conventions --
+  `expert_gate`/`expert_up`/`expert_down` need `local_num_experts + 1` rows
+  (the `+1` trailing padding-bucket expert, whose weights are never touched
+  by real data), `group_sizes` likewise -- but the three per-expert matmuls
+  go through `tokamax.ragged_dot` instead of a Python loop, matching
+  `latent_moe_forward_ragged_dot`'s step-4 pattern exactly.
+
+  This has a real tokamax dependency and CANNOT be verified locally (same
+  constraint as everything else `tokamax.ragged_dot`-based in this file) --
+  must run on the v6e TPU VM. Do not trust its output until it has actually
+  executed on hardware.
+  """
+  gate = tokamax.ragged_dot(sorted_tokens, expert_gate, group_sizes, implementation=implementation)
+  up = tokamax.ragged_dot(sorted_tokens, expert_up, group_sizes, implementation=implementation)
+  activated = _situ_and_mul(gate, up, config.activation_situ_beta, config.activation_situ_linear_beta)
+  return tokamax.ragged_dot(activated, expert_down, group_sizes, implementation=implementation)
+
+
+def check_sharded_ragged_dot_correctness(
+    seed: int = 0,
+    num_tokens: int = 96,
+    global_num_experts: int = 32,
+    local_num_experts: int = 8,
+    top_k: int = 4,
+    capacity_factor: float = 4.0,
+    implementations: tuple[str, ...] = ("xla",),
+) -> bool:
+  """ragged_dot version of kimi_k3_latent_moe_reference.py's
+  `check_sharded_forward_correctness` -- same toy-scale multi-shard setup
+  (default `implementations=("xla",)` only, since this toy scale's
+  latent_size=32/intermediate_size=48 are below Mosaic's confirmed 128
+  tiling floor, same reason `check_correctness()` above is xla-only; pass
+  `implementations=("xla","mosaic","mosaic_tpu_v2")` against a
+  Mosaic-compatible-dims variant if that's ever needed), but each shard's
+  per-expert FFN goes through `_local_shard_expert_ffn_ragged_dot` instead
+  of the naive per-expert loop. Ground truth is the same unsharded
+  `latent_moe_forward` reference used by `check_sharded_forward_correctness`
+  -- proves the REAL tokamax.ragged_dot-based sharded pipeline (not just the
+  naive-loop proof-of-concept) is correct, the same "reference proves the
+  math, ragged_dot is checked against it" pattern as everywhere else in this
+  project.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  assert global_num_experts % local_num_experts == 0, (
+      "global_num_experts must divide evenly by local_num_experts so the shards below "
+      "exactly tile [0, global_num_experts) once each, with no gaps or overlaps"
+  )
+  num_shards = global_num_experts // local_num_experts
+
+  config = LatentMoEConfig(
+      hidden_size=64,
+      latent_size=32,
+      intermediate_size=48,
+      num_experts=global_num_experts,
+      top_k=top_k,
+      num_shared_experts=1,
+      moe_renormalize=True,
+      routed_scaling_factor=1.0,
+      rms_norm_eps=1e-5,
+      activation_situ_beta=4.0,
+      activation_situ_linear_beta=25.0,
+  )
+
+  key = jax.random.key(seed)
+  key_w, key_x = jax.random.split(key)
+  weights = init_weights(config, key_w)
+  hidden_states = jax.random.normal(key_x, (num_tokens, config.hidden_size))
+
+  reference_out = latent_moe_forward(hidden_states, weights, config)
+
+  identity = hidden_states
+  compute_dtype = hidden_states.dtype
+  x = hidden_states @ weights.down_proj
+
+  all_ok = True
+  for impl in implementations:
+    routed_out = jnp.zeros((num_tokens, config.latent_size), dtype=compute_dtype)
+    total_valid_rows = 0
+    try:
+      for shard_idx in range(num_shards):
+        local_expert_start = shard_idx * local_num_experts
+        (
+            sorted_tokens,
+            group_sizes,
+            valid_mask,
+            _per_expert_counts,
+            padded_token_idx,
+            padded_combine_weight,
+        ) = route_and_filter_to_local_shard(
+            hidden_states,
+            x,
+            weights.router_weight,
+            weights.e_score_correction_bias,
+            config,
+            local_expert_start=local_expert_start,
+            local_num_experts=local_num_experts,
+            capacity_factor=capacity_factor,
+            tile_size=1,
+        )
+        total_valid_rows += int(jnp.sum(valid_mask))
+
+        shard_gate = weights.expert_gate[local_expert_start : local_expert_start + local_num_experts]
+        shard_up = weights.expert_up[local_expert_start : local_expert_start + local_num_experts]
+        shard_down = weights.expert_down[local_expert_start : local_expert_start + local_num_experts]
+        shard_gate = jnp.concatenate([shard_gate, jnp.zeros_like(shard_gate[:1])], axis=0)
+        shard_up = jnp.concatenate([shard_up, jnp.zeros_like(shard_up[:1])], axis=0)
+        shard_down = jnp.concatenate([shard_down, jnp.zeros_like(shard_down[:1])], axis=0)
+
+        shard_out = _local_shard_expert_ffn_ragged_dot(
+            sorted_tokens, shard_gate, shard_up, shard_down, group_sizes, config,
+            implementation=impl,
+        )
+        weighted = shard_out * padded_combine_weight[:, None]
+        routed_out = routed_out.at[padded_token_idx].add(weighted.astype(compute_dtype))
+    except NotImplementedError as e:
+      print(f"[sharded-ragged-dot-correctness] implementation={impl!r}: SKIPPED ({e}) -- counted as FAIL")
+      all_ok = False
+      continue
+
+    expected_total = num_tokens * top_k
+    coverage_ok = total_valid_rows == expected_total
+    print(
+        f"[sharded-ragged-dot-correctness] implementation={impl!r}: total valid dispatched "
+        f"rows across {num_shards} shards: {total_valid_rows} (expected {expected_total}) "
+        f"{'OK' if coverage_ok else 'FAIL'}"
+    )
+
+    normed = _rms_norm(routed_out, weights.norm_scale, config.rms_norm_eps)
+    up = normed @ weights.up_proj
+    shared_out = _situ_glu_mlp(
+        identity, weights.shared_gate, weights.shared_up, weights.shared_down,
+        config.activation_situ_beta, config.activation_situ_linear_beta,
+    )
+    sharded_final = up + shared_out
+
+    max_err = float(jnp.max(jnp.abs(sharded_final - reference_out)))
+    ok = max_err < 1e-3  # ragged_dot's own tiling can introduce small reduction-order differences
+    print(
+        f"[sharded-ragged-dot-correctness] implementation={impl!r} vs. unsharded reference: "
+        f"max_err={max_err:.2e} {'OK' if ok else 'FAIL'}"
+    )
+    all_ok = all_ok and coverage_ok and ok
+
+  return all_ok
+
+
+def run_realistic_shard_latency_sweep(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    shapes: tuple[tuple[int, int], ...] = _DEFAULT_LATENCY_SWEEP_SHAPES,
+    capacity_factor: float = 2.0,
+) -> None:
+  """Latency for one chip's shard under the REAL 16-of-896 routing
+  distribution (via route_and_filter_to_local_shard), not the artificially
+  dense/uniform "16-of-64" simplification single_chip_kimi_k3_config's
+  run_benchmark/run_fair_baseline/run_latency_sweep have used so far. Same
+  Zifan-requested batch_size/seq_len sweep format as run_latency_sweep, but
+  the per-shard dispatched row count and skew here reflect real routing
+  statistics (see route_and_filter_to_local_shard's docstring: ~14x lower
+  average count than the dense 64-expert simplification, and genuinely
+  uneven across experts) -- this is the first latency data for this project
+  that's realistic in BOTH matmul shape AND routing distribution, not just
+  the former.
+
+  Heuristic config only (skip_autotune -- same reasoning as
+  run_fair_baseline/run_latency_sweep: autotuning this shape was confirmed
+  impractically slow on real hardware). Has a real tokamax dependency and
+  CANNOT be verified locally -- must run on the v6e TPU VM.
+
+  Deliberately does NOT call `init_weights(kimi_k3_config(), ...)` -- that
+  would allocate the FULL 896-expert `expert_gate`/`expert_up`/`expert_down`
+  tensors (~59GB, the same OOM confirmed on hardware and documented in
+  `single_chip_kimi_k3_config`'s and `check_route_and_filter_correctness`'s
+  docstrings). Instead, only the router (`router_weight`,
+  `e_score_correction_bias`) and `down_proj` are allocated at real
+  `kimi_k3_config()` scale (hidden_size-sized, trivially small), and the
+  routed-expert weights are allocated for ONLY this shard's
+  `local_num_experts` (+1 padding-bucket row) -- never all 896.
+  """
+  global_config = kimi_k3_config()  # real hidden=7168/latent=3584/intermediate=3072/experts=896/top_k=16
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 5)
+  scale = 0.02
+
+  def _normal(k, shape):
+    return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+  router_weight = _normal(keys[0], (global_config.hidden_size, global_config.num_experts))
+  e_score_correction_bias = jnp.zeros((global_config.num_experts,), dtype=jnp.bfloat16)
+  down_proj = _normal(keys[1], (global_config.hidden_size, global_config.latent_size))
+  # +1 dummy expert row for the trailing padding bucket, matching
+  # route_and_filter_to_local_shard's group_sizes convention.
+  shard_gate = _normal(
+      keys[2], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_up = _normal(
+      keys[3], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_down = _normal(
+      keys[4], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+  )
+
+  rows: list[tuple[int, int, int, str, float | None, float | None, str | None]] = []
+
+  for batch_size, seq_len in shapes:
+    num_tokens = batch_size * seq_len
+    key_x = jax.random.fold_in(key, hash((batch_size, seq_len)) % (2**31))
+    hidden_states = jax.random.normal(
+        key_x, (num_tokens, global_config.hidden_size), dtype=jnp.bfloat16
+    )
+    x = hidden_states @ down_proj
+
+    (
+        sorted_tokens, group_sizes, valid_mask, per_expert_counts, _padded_token_idx, _padded_combine_weight,
+    ) = route_and_filter_to_local_shard(
+        hidden_states, x, router_weight, e_score_correction_bias,
+        global_config, local_expert_start=0, local_num_experts=local_num_experts,
+        capacity_factor=capacity_factor,
+    )
+    print(
+        f"[realistic-shard-latency] num_tokens={num_tokens} local_num_experts={local_num_experts} "
+        f"M_padded={sorted_tokens.shape[0]} valid_rows={int(jnp.sum(valid_mask))} "
+        f"mean_per_expert={float(jnp.mean(per_expert_counts)):.2f} "
+        f"min={int(jnp.min(per_expert_counts))} max={int(jnp.max(per_expert_counts))}"
+    )
+
+    for impl in ("xla", "mosaic", "mosaic_tpu_v2"):
+      try:
+        f_impl = jax.jit(
+            lambda st, gw, uw, dw: _local_shard_expert_ffn_ragged_dot(
+                st, gw, uw, dw, group_sizes, global_config, implementation=impl
+            )
+        )
+        std_f, args = tokamax.standardize_function(f_impl, sorted_tokens, shard_gate, shard_up, shard_down)
+        bench = tokamax.benchmark(jax.jit(std_f), args, method="hermetic_xprof")
+        rows.append(
+            (batch_size, seq_len, num_tokens, impl,
+             bench.median_evaluation_time_ms, bench.peak_memory_mb, None)
+        )
+      except NotImplementedError as e:
+        rows.append((batch_size, seq_len, num_tokens, impl, None, None, str(e)))
+
+  print(
+      f"\n[realistic-shard-latency] single-chip shard (local_num_experts={local_num_experts}, "
+      "REAL 16-of-896 routing distribution) -- heuristic (untuned) latency across batch_size/seq_len:"
+  )
+  header = f"{'batch':>6} {'seq_len':>8} {'num_tokens':>11} {'impl':>14} {'median_exec_ms':>15} {'peak_mem_mb':>12}"
+  print(header)
+  for batch_size, seq_len, num_tokens, impl, exec_ms, mem_mb, err in rows:
+    if err is not None:
+      print(
+          f"{batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
+          f"{'SKIPPED':>15} {'':>12}  ({err})"
+      )
+    else:
+      print(
+          f"{batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
+          f"{exec_ms:>15.4f} {mem_mb:>12.2f}"
+      )
 
 
 def run_shard_workload_benchmark(
@@ -633,23 +935,6 @@ def run_fair_baseline(
       print(f"  {impl_name}{shape_hint}: FAILED to autotune ({e})")
 
 
-_DEFAULT_LATENCY_SWEEP_SHAPES: tuple[tuple[int, int], ...] = (
-    # (batch_size, seq_len). hidden_states is (num_tokens, hidden_size) --
-    # batch_size and seq_len only ever enter this forward pass through their
-    # product, num_tokens = batch_size * seq_len (there is no separate
-    # batch/sequence axis anywhere in latent_moe_forward_ragged_dot). Several
-    # pairs below deliberately share the same num_tokens (e.g. (1,2048) and
-    # (2,1024)) as a sanity check: matching latency at matching num_tokens is
-    # expected, not a coincidence, and a divergence there would flag a bug.
-    (1, 128),
-    (1, 512),
-    (1, 2048),
-    (2, 1024),
-    (1, 4096),
-    (4, 1024),
-)
-
-
 def run_latency_sweep(
     seed: int = 0,
     num_experts: int = 64,
@@ -759,6 +1044,21 @@ if __name__ == "__main__":
       help="also run the exhaustive autotune search in --fair-baseline (confirmed VERY slow "
       "at Kimi's real per-expert shape -- see run_fair_baseline's docstring; off by default)",
   )
+  parser.add_argument(
+      "--sharded-ragged-dot-correctness",
+      action="store_true",
+      help="ragged_dot version of the sharded (real 16-of-896-then-filtered-to-shard routing) "
+      "end-to-end correctness proof -- see check_sharded_ragged_dot_correctness's docstring "
+      "(WP-Kimi step 3, ragged_dot follow-up to the naive-loop proof in "
+      "kimi_k3_latent_moe_reference.py)",
+  )
+  parser.add_argument(
+      "--realistic-shard-latency-sweep",
+      action="store_true",
+      help="latency across multiple batch_size/seq_len pairs under the REAL 16-of-896 routing "
+      "distribution (not the dense/uniform 16-of-64 simplification the other benchmarks use) "
+      "-- see run_realistic_shard_latency_sweep's docstring",
+  )
   args = parser.parse_args()
 
   if (
@@ -768,6 +1068,8 @@ if __name__ == "__main__":
       and not args.shard_workload
       and not args.route_filter_correctness
       and not args.latency_sweep
+      and not args.sharded_ragged_dot_correctness
+      and not args.realistic_shard_latency_sweep
   ):
     args.correctness = True  # default to the cheap check
 
@@ -801,3 +1103,13 @@ if __name__ == "__main__":
 
   if args.latency_sweep:
     run_latency_sweep()
+
+  if args.sharded_ragged_dot_correctness:
+    ok_sharded_ragged_dot = check_sharded_ragged_dot_correctness()
+    assert ok_sharded_ragged_dot, (
+        "ragged_dot-based sharded (route+filter+per-shard-ragged_dot+combine) forward pass "
+        "diverges from the unsharded reference"
+    )
+
+  if args.realistic_shard_latency_sweep:
+    run_realistic_shard_latency_sweep()
