@@ -54,6 +54,24 @@ TPU v6e using `tokamax.ragged_dot`.
   CPU to reflect real TPU behavior). `kimi_k3_latent_moe_ragged_dot.py`'s
   `profile_four_stages_wp4` is the same A/B/D functions plus the REAL
   `tokamax.ragged_dot` for Stage C -- written, not yet run on hardware.
+- A direct, same-device, element-wise comparison of `xla`/`mosaic`/
+  `mosaic_tpu_v2`'s bf16 outputs against EACH OTHER
+  (`compare_bf16_implementations_direct.py`) -- every prior "shared bf16
+  precision effect" conclusion was only ever inferred from matching
+  max-abs-diff *summary statistics* computed in separate runs against the
+  golden reference, never a direct tensor diff between the implementations'
+  own outputs in one run. Written 2026-08-28, not yet run on hardware.
+- **`run_v6e_experiment_suite.py`**: a one-shot entry point running the
+  full battery above (env check, snapshot verification, sharded
+  correctness, realistic-distribution latency, direct bf16 comparison, the
+  full golden-validation battery, WP4 profiling) in a fixed order, each
+  step as its own subprocess so one step's OOM/compile error/crash never
+  blocks the rest. Writes `environment.json`, `summary.json`/`summary.csv`
+  (status per step: `PASS`/`FAIL`/`UNSUPPORTED`/`OOM`/`COMPILE_ERROR`), and
+  a full log per step. Verified locally that the harness mechanics work
+  (every step correctly attempted and logged; the real steps all FAIL here
+  since this machine has neither a TPU nor tokamax installed) -- the
+  actual PASS/FAIL results are only meaningful once run on a v6e VM.
 
 **Not yet covered:**
 - The real, MXFP4-quantized Kimi K3 checkpoint weights (bundles so far use
@@ -205,6 +223,18 @@ Observations:
 
 ## Reproducing
 
+**One-shot TPU VM entry point**: once golden bundles exist (step 2 below,
+no TPU needed), everything that needs a v6e VM can run in one command:
+
+```bash
+python run_v6e_experiment_suite.py --output-dir results/YYYY-MM-DD-v6e
+```
+
+See `run_v6e_experiment_suite.py`'s module docstring for exactly what it
+runs and how results are structured. The step-by-step commands below are
+what it runs internally, useful for running one piece in isolation or for
+regenerating golden bundles (which it doesn't do itself).
+
 ```bash
 cd 06_kimi_k3_golden_validation
 
@@ -228,11 +258,15 @@ python test_jax_reference_against_pytorch_golden.py --variant both
 python test_ragged_dot_against_pytorch_golden.py \
   --bundle-set both --variant both --implementation all
 
-# 5. Latency across multiple batch sizes/sequence lengths (also needs a TPU VM).
+# 5. Direct, same-device, element-wise comparison of the three
+#    implementations' bf16 outputs against each other (needs a TPU VM).
+python compare_bf16_implementations_direct.py --bundle-set mosaic_wide
+
+# 6. Latency across multiple batch sizes/sequence lengths (also needs a TPU VM).
 cd ../05_ragged_dot_on_tpu
 python kimi_k3_latent_moe_ragged_dot.py --latency-sweep
 
-# 6. WP4 profiling: 4-stage dispatch-vs-compute breakdown.
+# 7. WP4 profiling: 4-stage dispatch-vs-compute breakdown.
 python profile_dispatch_vs_compute.py            # A/B/D for real, C is a dense-matmul stand-in (no TPU needed)
 python kimi_k3_latent_moe_ragged_dot.py --wp4-profile  # same A/B/D, C is the REAL tokamax.ragged_dot (needs a TPU VM)
 ```
