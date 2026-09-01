@@ -596,61 +596,24 @@ def generate_local_shard_workload(
   return sorted_tokens, group_sizes, valid_mask, per_expert_counts
 
 
-def route_and_filter_to_local_shard(
+def _router_gate(
     hidden_states: jax.Array,
-    x: jax.Array,
     router_weight: jax.Array,
     e_score_correction_bias: jax.Array,
     config: LatentMoEConfig,
-    local_expert_start: int,
-    local_num_experts: int,
-    capacity_factor: float = 2.0,
-    tile_size: int = _MOSAIC_TILE_SIZE,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-  """WP-Kimi step 2b, part 2 (moved here 2026-08-28, see
-  generate_local_shard_workload's docstring for why): REAL global
-  `config.top_k`-of-`config.num_experts` top-k routing (identical gate math
-  to `latent_moe_forward`'s step 1 -- float32 internally, cast back to
-  compute dtype at the end), filtered down to the local shard
-  `[local_expert_start, local_expert_start + local_num_experts)`, with the
-  SAME fixed-total, tile-aligned padding scheme as
-  generate_local_shard_workload (one trailing padding-bucket group) --
-  unlike that function, the per-expert counts here come from ACTUAL routing
-  output on real `hidden_states`, not a synthetic uniform-sampling draw.
+) -> tuple[jax.Array, jax.Array]:
+  """WP4 profiling Stage A (router half): router matmul + sigmoid + top-k
+  selection + renormalize/scale -- identical gate math to
+  `latent_moe_forward`'s step 1 (float32 internally, cast back to compute
+  dtype at the end). Split out of `route_and_filter_to_local_shard`
+  2026-08-28 so this REGULAR, matmul-heavy piece can be timed separately
+  from the IRREGULAR indexing in `filter_and_pad_to_shard` below -- lumping
+  them into one "dispatch" bucket (the original `profile_dispatch_vs_compute.py`
+  did this) dilutes the irregular-share metric WP4 actually needs with
+  regular compute that has nothing to do with the SparseCore question.
 
-  `x` is the ALREADY down-projected representation (`hidden_states @
-  down_proj`, step 2 of the real forward pass) -- the router itself runs on
-  `hidden_states` (pre-projection), matching the real model's step ordering;
-  passing both in lets the caller reuse a single down-projection across
-  shards/calls instead of recomputing it here.
-
-  Returns `(sorted_tokens, group_sizes, valid_mask, per_expert_counts,
-  padded_token_idx, padded_combine_weight)`:
-    - `sorted_tokens`: `(m_padded, latent_size)`, gathered from `x` in
-      expert-sorted order for real assignments, zero for padding rows.
-    - `group_sizes`: `(local_num_experts + 1,)` -- real per-expert counts
-      (genuinely data-dependent on the actual routing outcome, not forced
-      uniform) plus one trailing padding-bucket size.
-    - `valid_mask`: `(m_padded,)` bool, True for real (non-padding) rows.
-    - `per_expert_counts`: `(local_num_experts,)`, same as
-      `group_sizes[:local_num_experts]`.
-    - `padded_token_idx`: `(m_padded,)` int32, the ORIGINAL token index (row
-      in `hidden_states`/`x`) each row came from; -1 for padding rows. This
-      is what an end-to-end combine/scatter step needs to route each
-      expert's output back to its token -- see check_sharded_forward_correctness
-      for the first such wiring (2026-08-28).
-    - `padded_combine_weight`: `(m_padded,)`, the router's combine weight
-      (renormalized+scaled, already cast to compute dtype) for each real
-      assignment; 0 for padding rows.
-
-  If the total number of (token, slot) pairs landing in this shard exceeds
-  `m_padded` (aggregate overflow), the excess is dropped from the tail of
-  the expert-sorted order and a warning is printed -- identical policy to
-  generate_local_shard_workload.
-
-  Runs eagerly, not jit-compiled: filtering to the local shard produces a
-  data-dependent length, same "must run outside jit" constraint as
-  generate_local_shard_workload and latent_moe_forward's per-expert loop.
+  Jit-compatible: fixed shapes throughout, `config.top_k` is a static
+  (non-traced) value baked in at trace time.
   """
   compute_dtype = hidden_states.dtype
   logits = hidden_states.astype(jnp.float32) @ router_weight.astype(jnp.float32)
@@ -663,8 +626,65 @@ def route_and_filter_to_local_shard(
     topk_weight = topk_weight / denom
   topk_weight = topk_weight * config.routed_scaling_factor
   topk_weight = topk_weight.astype(compute_dtype)
+  return topk_idx, topk_weight
 
-  num_tokens = hidden_states.shape[0]
+
+def router_and_projection(
+    hidden_states: jax.Array,
+    router_weight: jax.Array,
+    e_score_correction_bias: jax.Array,
+    down_proj: jax.Array,
+    config: LatentMoEConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """WP4 profiling Stage A (full): `_router_gate` above plus the shared
+  down-projection (`x = hidden_states @ down_proj`, step 2 of the real
+  forward pass) -- together, everything regular/matmul-heavy that happens
+  before the irregular indexing in `filter_and_pad_to_shard` (Stage B).
+  Shared by the CPU-only profiling harness (`profile_dispatch_vs_compute.py`,
+  using a dense-matmul stand-in for Stage C) and the TPU-only one
+  (`kimi_k3_latent_moe_ragged_dot.py`'s `profile_four_stages_wp4`, using the
+  REAL `tokamax.ragged_dot` for Stage C) so Stage A/B/D are measured
+  identically in both, and only Stage C differs.
+
+  Jit-compatible: fixed shapes throughout.
+  """
+  topk_idx, topk_weight = _router_gate(hidden_states, router_weight, e_score_correction_bias, config)
+  x = hidden_states @ down_proj
+  return topk_idx, topk_weight, x
+
+
+def filter_and_pad_to_shard(
+    topk_idx: jax.Array,
+    topk_weight: jax.Array,
+    x: jax.Array,
+    config: LatentMoEConfig,
+    local_expert_start: int,
+    local_num_experts: int,
+    capacity_factor: float = 2.0,
+    tile_size: int = _MOSAIC_TILE_SIZE,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """WP4 profiling Stage B: the IRREGULAR indexing part of
+  `route_and_filter_to_local_shard`, given ALREADY-computed router output
+  (`topk_idx`/`topk_weight`, see `_router_gate` above) and the already
+  down-projected `x` -- reshape to flat (token, slot) ids, filter to the
+  local shard `[local_expert_start, local_expert_start + local_num_experts)`,
+  argsort, gather, bincount into `group_sizes`, and pad to a fixed
+  tile-aligned `m_padded` via one trailing padding-bucket group. Split out
+  of `route_and_filter_to_local_shard` 2026-08-28 specifically so WP4's
+  profiling harness can time this piece (the actual SparseCore-candidate
+  work) in isolation from Stage A's router/projection matmuls above.
+
+  Returns `(sorted_tokens, group_sizes, valid_mask, per_expert_counts,
+  padded_token_idx, padded_combine_weight)` -- same meaning as
+  `route_and_filter_to_local_shard`'s return value (see that function's
+  docstring), since this IS its filtering half.
+
+  Runs eagerly, not jit-compiled: filtering to the local shard produces a
+  data-dependent length, same "must run outside jit" constraint as
+  `generate_local_shard_workload` and `latent_moe_forward`'s per-expert loop.
+  """
+  compute_dtype = x.dtype
+  num_tokens = topk_idx.shape[0]
   flat_expert_ids = topk_idx.reshape(-1)  # GLOBAL ids, (num_tokens*top_k,)
   token_of_slot = jnp.arange(num_tokens * config.top_k) // config.top_k
   flat_combine_weight = topk_weight.reshape(-1)
@@ -726,6 +746,83 @@ def route_and_filter_to_local_shard(
       per_expert_counts,
       padded_token_idx,
       padded_combine_weight,
+  )
+
+
+def _combine_shard_contribution(
+    routed_out: jax.Array,
+    shard_out: jax.Array,
+    padded_token_idx: jax.Array,
+    padded_combine_weight: jax.Array,
+) -> jax.Array:
+  """WP4 profiling Stage D: scatter one shard's expert output back to
+  (token,) order, weighted by the router's combine weight, ADDED into the
+  running cross-shard accumulator `routed_out` -- multiple shards can
+  contribute to the same token, since a token's `top_k` picks can land in
+  different shards (see `check_sharded_forward_correctness`, which sums
+  every shard's contribution to reconstruct the full combine). Padding rows
+  have `padded_combine_weight==0`, so they contribute nothing regardless of
+  which token `padded_token_idx` points them at -- see
+  `filter_and_pad_to_shard`'s docstring for why the `-1` placeholder is
+  safe here (JAX/numpy negative-index semantics index the LAST token, but
+  the added contribution is exactly 0).
+
+  Split out as its own function 2026-08-28 (previously inlined identically
+  in both `check_sharded_forward_correctness` and, in
+  `kimi_k3_latent_moe_ragged_dot.py`, `check_sharded_ragged_dot_correctness`)
+  so WP4's profiling harness has a single, real target to time for the
+  "combine" stage, and so the two correctness checks share one
+  implementation instead of two copies that could drift apart.
+
+  Jit-compatible: fixed shapes for a single shard's contribution.
+  """
+  weighted = shard_out * padded_combine_weight[:, None]
+  return routed_out.at[padded_token_idx].add(weighted.astype(routed_out.dtype))
+
+
+def route_and_filter_to_local_shard(
+    hidden_states: jax.Array,
+    x: jax.Array,
+    router_weight: jax.Array,
+    e_score_correction_bias: jax.Array,
+    config: LatentMoEConfig,
+    local_expert_start: int,
+    local_num_experts: int,
+    capacity_factor: float = 2.0,
+    tile_size: int = _MOSAIC_TILE_SIZE,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """WP-Kimi step 2b, part 2: REAL global `config.top_k`-of-`config.num_experts`
+  top-k routing, filtered down to the local shard
+  `[local_expert_start, local_expert_start + local_num_experts)`, with a
+  fixed-total, tile-aligned padding scheme (one trailing padding-bucket
+  group) so implementations with different tiling requirements (xla vs.
+  Mosaic) all see the identical shape.
+
+  `x` is the ALREADY down-projected representation (`hidden_states @
+  down_proj`, step 2 of the real forward pass) -- the router itself runs on
+  `hidden_states` (pre-projection), matching the real model's step ordering;
+  passing both in lets the caller reuse a single down-projection across
+  shards/calls instead of recomputing it here.
+
+  **2026-08-28: split into `_router_gate` (Stage A: router matmul/sigmoid/
+  top-k, regular compute) + `filter_and_pad_to_shard` (Stage B: the
+  irregular reshape/filter/argsort/gather/bincount/padding) for WP4's
+  profiling harness** -- this function's own signature/return value/
+  behavior is UNCHANGED, it just delegates to the two pieces now instead of
+  inlining them; every existing caller keeps working as before.
+
+  Returns `(sorted_tokens, group_sizes, valid_mask, per_expert_counts,
+  padded_token_idx, padded_combine_weight)` -- see `filter_and_pad_to_shard`'s
+  docstring for the meaning of each.
+
+  Runs eagerly, not jit-compiled overall (Stage B's filtering step forces
+  this), same "must run outside jit" constraint as
+  `generate_local_shard_workload` and `latent_moe_forward`'s per-expert loop.
+  """
+  topk_idx, topk_weight = _router_gate(hidden_states, router_weight, e_score_correction_bias, config)
+  return filter_and_pad_to_shard(
+      topk_idx, topk_weight, x, config, local_expert_start, local_num_experts,
+      capacity_factor=capacity_factor, tile_size=tile_size,
   )
 
 
@@ -1072,14 +1169,7 @@ def check_sharded_forward_correctness(
         sorted_tokens, shard_gate, shard_up, shard_down, group_sizes, config
     )  # (m_padded, latent_size)
 
-    # Scatter each dispatched row's contribution back to its token, weighted
-    # by the combine weight. Padding rows have padded_combine_weight==0, so
-    # they contribute exactly nothing regardless of which index
-    # padded_token_idx points them at -- the -1 placeholder for padding rows
-    # is therefore safe here: JAX/numpy negative-index semantics make it
-    # index the LAST token, but the weighted contribution added there is 0.
-    weighted = shard_out * padded_combine_weight[:, None]
-    routed_out = routed_out.at[padded_token_idx].add(weighted.astype(compute_dtype))
+    routed_out = _combine_shard_contribution(routed_out, shard_out, padded_token_idx, padded_combine_weight)
 
   # Every (token, slot) pair lands in EXACTLY one shard (shards tile
   # [0, global_num_experts) with no overlap) -- so summing every shard's

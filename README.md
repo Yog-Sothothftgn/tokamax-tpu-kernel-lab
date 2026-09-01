@@ -42,6 +42,18 @@ TPU v6e using `tokamax.ragged_dot`.
   `single_chip_kimi_k3_config` simplification
   (`run_realistic_shard_latency_sweep`) -- both written 2026-08-28 but not
   yet run on hardware.
+- **WP4 (SparseCore feasibility)**: a profiling harness splitting the
+  forward pass into 4 stages -- A (router+projection, regular), B (dispatch
+  indexing: reshape/filter/argsort/gather/bincount/padding, irregular), C
+  (expert compute), D (combine, irregular) -- to measure whether B+D are
+  actually a bottleneck, rather than assuming it. `profile_dispatch_vs_compute.py`
+  runs A/B/D for real (Stage C is a dense-matmul stand-in, no tokamax
+  needed) and is verified locally: on this machine's CPU, the irregular
+  (B+D) share is 8.8% (num_tokens=128) shrinking to 3.7% (num_tokens=2048)
+  -- explicitly a CPU methodology check, not a TPU finding (no MXU/VMEM on
+  CPU to reflect real TPU behavior). `kimi_k3_latent_moe_ragged_dot.py`'s
+  `profile_four_stages_wp4` is the same A/B/D functions plus the REAL
+  `tokamax.ragged_dot` for Stage C -- written, not yet run on hardware.
 
 **Not yet covered:**
 - The real, MXFP4-quantized Kimi K3 checkpoint weights (bundles so far use
@@ -219,6 +231,10 @@ python test_ragged_dot_against_pytorch_golden.py \
 # 5. Latency across multiple batch sizes/sequence lengths (also needs a TPU VM).
 cd ../05_ragged_dot_on_tpu
 python kimi_k3_latent_moe_ragged_dot.py --latency-sweep
+
+# 6. WP4 profiling: 4-stage dispatch-vs-compute breakdown.
+python profile_dispatch_vs_compute.py            # A/B/D for real, C is a dense-matmul stand-in (no TPU needed)
+python kimi_k3_latent_moe_ragged_dot.py --wp4-profile  # same A/B/D, C is the REAL tokamax.ragged_dot (needs a TPU VM)
 ```
 
 ## Requirements

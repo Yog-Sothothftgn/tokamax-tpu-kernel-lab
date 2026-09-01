@@ -1,40 +1,54 @@
 """WP4 (SparseCore feasibility): profiling harness isolating the cost of
-Kimi K3 LatentMoE's irregular indexing steps (dispatch: router + argsort +
-gather; combine: scatter + weighted-sum) from the regular dense per-expert
-matmul cost, within one forward pass.
+Kimi K3 LatentMoE's irregular indexing steps from the regular compute steps
+around them, split into the four stages actually relevant to the SparseCore
+decision:
 
-This feeds WP4's decision criteria directly (see project research plan):
-only build a SparseCore prototype if profiling actually shows the irregular
-part is a real bottleneck (time or memory-traffic sense) -- a hypothesis
-("SparseCore for irregular indexing, MXU for dense matmul") is not itself
-evidence. WP-Pre already confirmed SparseCore's pallas API exists; this
-file is the first attempt at the actual measurement WP4 needs before
-deciding whether to build anything.
+  A. Router + projection (regular, matmul-heavy): router matmul, sigmoid,
+     top-k selection, latent down-projection.
+  B. Dispatch indexing (irregular -- the SparseCore candidate): reshape
+     expert ids, filter to a local shard, argsort, generate token index,
+     gather, bincount into group_sizes, capacity padding.
+  C. Expert compute (regular, matmul-heavy): the per-expert FFN. On this
+     machine, a dense-matmul stand-in (see below); on a TPU VM, the REAL
+     `tokamax.ragged_dot` -- see `kimi_k3_latent_moe_ragged_dot.py`'s
+     `profile_four_stages_wp4`.
+  D. Combine (irregular -- also a SparseCore candidate): scatter each
+     shard's contribution back to its token, weighted by the router's
+     combine weight.
 
-**Two things this file does NOT measure, on purpose:**
-1. The real `tokamax.ragged_dot` matmul cost -- this machine has no working
-   tokamax install (Windows long-path issue, see project memory), so the
-   "regular compute" side below uses a single dense matmul over all
-   dispatched rows with ONE shared weight matrix as a rough magnitude
-   stand-in (ignores group_sizes/per-expert boundaries entirely -- NOT
-   numerically meaningful, only useful for a "how expensive is a matmul
-   this size" timing comparison). The real comparison against
-   `tokamax.ragged_dot`'s actual cost needs a TPU VM -- see
-   `kimi_k3_latent_moe_ragged_dot.py` for a tokamax-dependent follow-up if
-   this rough version's ratio looks close enough to be worth pinning down
-   precisely.
+This is a refinement of an earlier, cruder 2-stage version of this file
+(dispatch=A+B lumped together, combine=D) -- lumping A into "dispatch"
+diluted the irregular-share metric WP4 actually needs with regular compute
+that has nothing to do with the SparseCore question. A/B/D below reuse the
+SAME functions `kimi_k3_latent_moe_ragged_dot.py`'s `profile_four_stages_wp4`
+uses on real hardware (`router_and_projection`, `filter_and_pad_to_shard`,
+`_combine_shard_contribution`, all in `kimi_k3_latent_moe_reference.py`) --
+only Stage C differs between the two files (dense stand-in here vs. real
+ragged_dot there), so A/B/D numbers from this CPU run and a future TPU run
+are directly comparable stage-by-stage.
+
+**What this file does NOT measure, on purpose:**
+1. The real `tokamax.ragged_dot` matmul cost (Stage C) -- this machine has
+   no working tokamax install (Windows long-path issue, see project
+   memory), so Stage C here is a single dense matmul over the shard's
+   dispatched rows with ONE shared weight matrix (ignores group_sizes/
+   per-expert boundaries entirely -- NOT numerically meaningful, only a
+   rough magnitude stand-in). The real Stage C cost needs a TPU VM.
 2. HBM bytes moved / VMEM traffic -- CPU timing has no MXU/VMEM to reflect,
-   so these numbers say nothing about TPU memory-traffic patterns (the
-   actual quantity WP4's research question cares about, per the "memory
-   performance first" framing in the research plan). This is a
-   dispatch-vs-compute TIME ratio sanity check on CPU, not a TPU memory
-   profiling result -- do not cite it as a memory-traffic finding.
+   so none of this says anything about TPU memory-traffic patterns (the
+   actual quantity WP4's research question cares about). This is a
+   dispatch-vs-compute TIME ratio methodology check on CPU, not a TPU
+   memory-profiling result.
 
 No tokamax dependency -- runs anywhere `kimi_k3_latent_moe_reference.py`
 does. Follows the same timing discipline as
 `01_pallas_basics/03_matmul_k_tiled.py`'s `check()`: one untimed warmup call
 (excludes compile time), then `num_repeats` timed calls, `block_until_ready()`
-on each.
+on each. Stage B is timed eagerly (not jitted) since it's genuinely not
+jit-compatible (filtering to a shard produces a data-dependent length, same
+constraint as `filter_and_pad_to_shard`/`generate_local_shard_workload`
+elsewhere in this project) -- this is the real usage pattern, not a
+measurement artifact.
 
 Usage:
   python profile_dispatch_vs_compute.py
@@ -48,59 +62,12 @@ import jax.numpy as jnp
 
 from kimi_k3_latent_moe_reference import (
     LatentMoEConfig,
+    _combine_shard_contribution,
     _situ_and_mul,
+    filter_and_pad_to_shard,
     kimi_k3_config,
+    router_and_projection,
 )
-
-
-def _dispatch_only(
-    hidden_states: jax.Array,
-    router_weight: jax.Array,
-    e_score_correction_bias: jax.Array,
-    down_proj: jax.Array,
-    config: LatentMoEConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-  """Steps 1-3 of `latent_moe_forward`: router + shared down-projection +
-  dispatch (argsort + gather). Unlike `latent_moe_forward`'s per-expert
-  loop, this has no dynamic Python-int slicing, so it IS jit-compatible --
-  needed to get a real device-timed measurement rather than eager
-  Python-dispatch overhead.
-  """
-  logits = hidden_states.astype(jnp.float32) @ router_weight.astype(jnp.float32)
-  scores = jax.nn.sigmoid(logits)
-  scores_for_choice = scores + e_score_correction_bias.astype(jnp.float32)[None, :]
-  _, topk_idx = jax.lax.top_k(scores_for_choice, config.top_k)
-  topk_weight = jnp.take_along_axis(scores, topk_idx, axis=-1)
-  if config.top_k > 1 and config.moe_renormalize:
-    denom = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-    topk_weight = topk_weight / denom
-  topk_weight = topk_weight * config.routed_scaling_factor
-
-  x = hidden_states @ down_proj
-  num_tokens = hidden_states.shape[0]
-  flat_expert_ids = topk_idx.reshape(-1)
-  order = jnp.argsort(flat_expert_ids)
-  token_of_slot = jnp.arange(num_tokens * config.top_k) // config.top_k
-  sorted_token_idx = token_of_slot[order]
-  sorted_tokens = x[sorted_token_idx]
-  group_sizes = jnp.bincount(flat_expert_ids, length=config.num_experts)
-  return sorted_tokens, group_sizes, order, topk_weight
-
-
-def _combine_only(
-    outs: jax.Array,
-    order: jax.Array,
-    topk_weight: jax.Array,
-    num_tokens: int,
-    config: LatentMoEConfig,
-) -> jax.Array:
-  """Step 5 of `latent_moe_forward`: scatter back to (token, slot) order,
-  then weighted-sum over the top_k slots per token. Jit-compatible (fixed
-  output shape, no dynamic slicing)."""
-  unsorted = jnp.zeros_like(outs).at[order].set(outs)
-  unsorted = unsorted.reshape(num_tokens, config.top_k, config.latent_size)
-  routed_out = jnp.sum(unsorted * topk_weight[..., None], axis=1)
-  return routed_out.astype(outs.dtype)
 
 
 def _dense_matmul_stand_in(
@@ -110,15 +77,14 @@ def _dense_matmul_stand_in(
     dense_down: jax.Array,
     config: LatentMoEConfig,
 ) -> jax.Array:
-  """A single, unsharded dense matmul over ALL dispatched rows at once,
-  using ONE shared weight matrix -- ignores group_sizes/per-expert
-  boundaries entirely. NOT numerically meaningful as a replacement for the
-  real per-expert FFN; purely a rough magnitude stand-in for "how expensive
-  is a matmul this size," since the real per-expert loop can't be jitted
-  (needs concrete Python ints for its dynamic slice sizes) and
-  `tokamax.ragged_dot` isn't available on this machine. See this module's
-  docstring for what a real `tokamax.ragged_dot`-based comparison would
-  need instead.
+  """Stage C stand-in: a single, unsharded dense matmul over all of a
+  shard's dispatched rows at once, using ONE shared weight matrix --
+  ignores group_sizes/per-expert boundaries entirely. NOT numerically
+  meaningful as a replacement for the real per-expert FFN; purely a rough
+  magnitude stand-in for "how expensive is a matmul this size," since the
+  real per-expert loop can't be jitted and `tokamax.ragged_dot` isn't
+  available on this machine. See this module's docstring for what the real
+  comparison needs instead.
   """
   gate = sorted_tokens @ dense_gate
   up = sorted_tokens @ dense_up
@@ -146,31 +112,47 @@ def _time_jit_fn(f, *args, num_repeats: int = 20) -> float:
   return elapsed_ms
 
 
-def profile_dispatch_combine_vs_matmul(
+def _time_eager_fn(f, *args, num_repeats: int = 20) -> float:
+  """Times `f` called eagerly (not jitted) -- for Stage B, which is
+  genuinely not jit-compatible (data-dependent output length from filtering
+  to a shard), so eager timing IS the real usage pattern here, not a
+  simplification. One untimed warmup call first (JAX still compiles each
+  internal op eagerly the first time it sees a given shape, so this still
+  excludes most of that one-time cost)."""
+  out = f(*args)
+  jax.block_until_ready(out)
+
+  t0 = time.perf_counter()
+  for _ in range(num_repeats):
+    out = f(*args)
+  jax.block_until_ready(out)
+  elapsed_ms = (time.perf_counter() - t0) * 1000 / num_repeats
+  return elapsed_ms
+
+
+def profile_four_stages_cpu(
     config: LatentMoEConfig | None = None,
     num_tokens: int = 512,
+    local_num_experts: int = 64,
+    capacity_factor: float = 2.0,
     seed: int = 0,
     num_repeats: int = 20,
 ) -> dict:
-  """Times dispatch, combine, and a rough matmul stand-in separately, at
-  real Kimi K3 per-expert dims (default `kimi_k3_config()`) unless a
-  smaller config is passed in for faster local iteration. Returns a dict of
-  millisecond timings plus the dispatch+combine share of the total -- WP4's
-  actual decision input, not a hypothesis.
+  """Times Stage A (router+projection), Stage B (dispatch indexing to one
+  local shard), and Stage D (combine) at real Kimi K3 per-expert dims
+  (default `kimi_k3_config()`), plus a Stage C dense-matmul stand-in (see
+  module docstring for why it's not the real `tokamax.ragged_dot` cost).
 
   **CPU numbers here are a methodology check, not a TPU finding** -- CPU has
-  no MXU/VMEM, so the dispatch-vs-matmul RATIO on CPU may not resemble the
-  ratio on real TPU hardware at all (e.g. TPU's MXU is dramatically faster
-  at dense matmul than CPU is, which would make dispatch/combine a LARGER
-  relative share of total time on TPU than what's measured here -- or
-  smaller, if TPU's gather/scatter path is also much faster; there's no way
-  to know without actually measuring on the target hardware). Re-run the
-  same methodology on a TPU VM before treating any ratio here as evidence
-  for or against a SparseCore prototype.
+  no MXU/VMEM, so the irregular-vs-regular RATIO on CPU may not resemble the
+  ratio on real TPU hardware at all. Re-run
+  `kimi_k3_latent_moe_ragged_dot.py`'s `profile_four_stages_wp4` (same
+  Stage A/B/D functions, real Stage C) on a TPU VM before treating any
+  ratio here as evidence for or against a SparseCore prototype.
   """
   config = config or kimi_k3_config()
   key = jax.random.key(seed)
-  keys = jax.random.split(key, 6)
+  keys = jax.random.split(key, 7)
   scale = 0.02
 
   def normal(k, shape):
@@ -184,49 +166,63 @@ def profile_dispatch_combine_vs_matmul(
   dense_down = normal(keys[4], (config.intermediate_size, config.latent_size))
   hidden_states = jax.random.normal(keys[5], (num_tokens, config.hidden_size), dtype=jnp.float32)
 
-  # config (a plain dataclass, not a registered pytree) and num_tokens (used
-  # as a static .reshape() target shape, not an array value) both get bound
-  # via functools.partial rather than passed as jit-traced call arguments --
-  # see _time_jit_fn's docstring for why passing them directly crashes.
-  dispatch_fn = functools.partial(_dispatch_only, config=config)
-  dispatch_ms = _time_jit_fn(
-      dispatch_fn, hidden_states, router_weight, e_score_correction_bias, down_proj,
+  # config (a plain dataclass, not a registered pytree) is bound via
+  # functools.partial rather than passed as a jit-traced call argument --
+  # see _time_jit_fn's docstring for why passing it directly crashes.
+  stage_a_fn = functools.partial(router_and_projection, config=config)
+  stage_a_ms = _time_jit_fn(
+      stage_a_fn, hidden_states, router_weight, e_score_correction_bias, down_proj,
       num_repeats=num_repeats,
   )
-
-  sorted_tokens, _group_sizes, order, topk_weight = jax.jit(dispatch_fn)(
+  topk_idx, topk_weight, x = jax.jit(stage_a_fn)(
       hidden_states, router_weight, e_score_correction_bias, down_proj
   )
 
-  matmul_fn = functools.partial(_dense_matmul_stand_in, config=config)
-  matmul_ms = _time_jit_fn(
-      matmul_fn, sorted_tokens, dense_gate, dense_up, dense_down,
+  stage_b_fn = functools.partial(
+      filter_and_pad_to_shard, config=config, local_expert_start=0,
+      local_num_experts=local_num_experts, capacity_factor=capacity_factor,
+  )
+  stage_b_ms = _time_eager_fn(stage_b_fn, topk_idx, topk_weight, x, num_repeats=num_repeats)
+  (
+      sorted_tokens, group_sizes, valid_mask, per_expert_counts,
+      padded_token_idx, padded_combine_weight,
+  ) = stage_b_fn(topk_idx, topk_weight, x)
+  print(
+      f"[wp4-profile] Stage B output: M_padded={sorted_tokens.shape[0]} "
+      f"valid_rows={int(jnp.sum(valid_mask))} "
+      f"mean_per_expert={float(jnp.mean(per_expert_counts)):.2f}"
+  )
+
+  stage_c_fn = functools.partial(_dense_matmul_stand_in, config=config)
+  stage_c_ms = _time_jit_fn(
+      stage_c_fn, sorted_tokens, dense_gate, dense_up, dense_down,
+      num_repeats=num_repeats,
+  )
+  shard_out = jax.jit(stage_c_fn)(sorted_tokens, dense_gate, dense_up, dense_down)
+
+  routed_out_init = jnp.zeros((num_tokens, config.latent_size), dtype=jnp.float32)
+  stage_d_ms = _time_jit_fn(
+      _combine_shard_contribution, routed_out_init, shard_out, padded_token_idx, padded_combine_weight,
       num_repeats=num_repeats,
   )
 
-  outs = jax.jit(matmul_fn)(sorted_tokens, dense_gate, dense_up, dense_down)
-
-  combine_fn = functools.partial(_combine_only, num_tokens=num_tokens, config=config)
-  combine_ms = _time_jit_fn(
-      combine_fn, outs, order, topk_weight,
-      num_repeats=num_repeats,
-  )
-
-  total_ms = dispatch_ms + matmul_ms + combine_ms
-  irregular_ms = dispatch_ms + combine_ms
+  total_ms = stage_a_ms + stage_b_ms + stage_c_ms + stage_d_ms
+  irregular_ms = stage_b_ms + stage_d_ms  # B and D are the SparseCore-relevant steps; A and C are regular compute
   irregular_share = irregular_ms / total_ms
 
   result = {
       "num_tokens": num_tokens,
-      "dispatch_ms": dispatch_ms,
-      "combine_ms": combine_ms,
-      "matmul_stand_in_ms": matmul_ms,
+      "stage_a_router_projection_ms": stage_a_ms,
+      "stage_b_dispatch_indexing_ms": stage_b_ms,
+      "stage_c_matmul_stand_in_ms": stage_c_ms,
+      "stage_d_combine_ms": stage_d_ms,
       "irregular_share_of_total": irregular_share,
   }
   print(
-      f"[wp4-profile] num_tokens={num_tokens} dispatch={dispatch_ms:.3f}ms "
-      f"combine={combine_ms:.3f}ms matmul_stand_in={matmul_ms:.3f}ms "
-      f"irregular_share={irregular_share:.1%}"
+      f"[wp4-profile] num_tokens={num_tokens} "
+      f"A(router+proj)={stage_a_ms:.3f}ms B(dispatch-idx)={stage_b_ms:.3f}ms "
+      f"C(matmul-stand-in)={stage_c_ms:.3f}ms D(combine)={stage_d_ms:.3f}ms "
+      f"irregular_share(B+D)={irregular_share:.1%}"
   )
   return result
 
@@ -235,8 +231,9 @@ if __name__ == "__main__":
   print(f"devices: {jax.devices()}")
   print(
       "NOTE: this run is on whatever device is available locally (CPU on this "
-      "machine) -- see profile_dispatch_combine_vs_matmul's docstring for why "
-      "the resulting ratio is a methodology check, not a TPU finding.\n"
+      "machine) -- see profile_four_stages_cpu's docstring for why the "
+      "resulting ratio is a methodology check, not a TPU finding. Stage C is a "
+      "dense-matmul stand-in, not the real tokamax.ragged_dot cost.\n"
   )
   for num_tokens in (128, 512, 2048):
-    profile_dispatch_combine_vs_matmul(num_tokens=num_tokens)
+    profile_four_stages_cpu(num_tokens=num_tokens)

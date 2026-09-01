@@ -63,6 +63,7 @@ which is pure JAX and needs neither tokamax nor a TPU):
   python kimi_k3_latent_moe_ragged_dot.py --latency-sweep           # latency across multiple batch_size/seq_len pairs, one table (Zifan's 2026-08-28 standing request, see run_latency_sweep)
   python kimi_k3_latent_moe_ragged_dot.py --sharded-ragged-dot-correctness  # ragged_dot version of the sharded end-to-end correctness proof (WP-Kimi step 3 follow-up, see check_sharded_ragged_dot_correctness)
   python kimi_k3_latent_moe_ragged_dot.py --realistic-shard-latency-sweep  # latency under the REAL 16-of-896 routing distribution, not the dense/uniform simplification (see run_realistic_shard_latency_sweep)
+  python kimi_k3_latent_moe_ragged_dot.py --wp4-profile                  # WP4: real 4-stage profiling (router+projection / dispatch indexing / REAL ragged_dot / combine), see profile_four_stages_wp4
 
 **2026-08-26, WP-Kimi step 2b (review's P1-C item, two-step plan per user
 direction):** `single_chip_kimi_k3_config`'s num_experts=64/top_k=16 setup
@@ -117,6 +118,8 @@ compatibility with `run_shard_workload_benchmark`/the CLI below.
 
 import argparse
 import dataclasses
+import functools
+import time
 
 # Same environment workaround as benchmark_harness.py -- must run before
 # `import tokamax` on this jax/flax/qwix version combination.
@@ -136,10 +139,13 @@ import tokamax  # noqa: E402
 from kimi_k3_latent_moe_reference import (  # noqa: E402
     LatentMoEConfig,
     LatentMoEWeights,
+    _combine_shard_contribution,
     _rms_norm,
+    _router_gate,
     _situ_and_mul,
     _situ_glu_mlp,
     check_route_and_filter_correctness,
+    filter_and_pad_to_shard,
     generate_local_shard_workload,
     init_weights,
     kimi_k3_config,
@@ -511,8 +517,7 @@ def check_sharded_ragged_dot_correctness(
             sorted_tokens, shard_gate, shard_up, shard_down, group_sizes, config,
             implementation=impl,
         )
-        weighted = shard_out * padded_combine_weight[:, None]
-        routed_out = routed_out.at[padded_token_idx].add(weighted.astype(compute_dtype))
+        routed_out = _combine_shard_contribution(routed_out, shard_out, padded_token_idx, padded_combine_weight)
     except NotImplementedError as e:
       print(f"[sharded-ragged-dot-correctness] implementation={impl!r}: SKIPPED ({e}) -- counted as FAIL")
       all_ok = False
@@ -658,6 +663,137 @@ def run_realistic_shard_latency_sweep(
           f"{batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
           f"{exec_ms:>15.4f} {mem_mb:>12.2f}"
       )
+
+
+def profile_four_stages_wp4(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    num_tokens: int = 2048,
+    capacity_factor: float = 2.0,
+    implementation: str | None = None,
+    num_repeats: int = 20,
+) -> dict:
+  """WP4 (SparseCore feasibility): the REAL 4-stage profiling breakdown --
+  A (router+projection, regular matmul), B (dispatch indexing, irregular),
+  C (expert compute, REAL tokamax.ragged_dot), D (combine, irregular
+  scatter) -- timed separately at real Kimi K3 per-expert dims. This is the
+  hardware follow-up to `profile_dispatch_vs_compute.py`'s CPU-only,
+  dense-matmul-stand-in version: Stage A/B/D here are the EXACT SAME
+  functions that script uses (`router_and_projection`,
+  `filter_and_pad_to_shard`, `_combine_shard_contribution`, all in
+  `kimi_k3_latent_moe_reference.py`), so those three stages are directly
+  comparable between a CPU run and this TPU run -- only Stage C differs
+  (real ragged_dot here vs. a dense-matmul stand-in there). This is the
+  irregular-share number WP4's actual decision should be based on, not the
+  CPU stand-in version.
+
+  Deliberately does NOT call `init_weights(kimi_k3_config(), ...)` -- see
+  `run_realistic_shard_latency_sweep`'s docstring for why (would allocate
+  the full 896-expert weight tensors, ~59GB, the OOM already documented
+  elsewhere in this project). Only router/down_proj (small, hidden_size-scale)
+  and this shard's own `local_num_experts + 1` expert rows are allocated.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM. Do not trust its output until it has actually executed
+  on hardware.
+  """
+  global_config = kimi_k3_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 6)
+  scale = 0.02
+
+  def normal(k, shape):
+    return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+  router_weight = normal(keys[0], (global_config.hidden_size, global_config.num_experts))
+  e_score_correction_bias = jnp.zeros((global_config.num_experts,), dtype=jnp.bfloat16)
+  down_proj = normal(keys[1], (global_config.hidden_size, global_config.latent_size))
+  shard_gate = normal(
+      keys[2], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_up = normal(
+      keys[3], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_down = normal(
+      keys[4], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+  )
+  hidden_states = jax.random.normal(keys[5], (num_tokens, global_config.hidden_size), dtype=jnp.bfloat16)
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  def _time_eager(f, *args, num_repeats=num_repeats):
+    out = f(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  # config (a plain dataclass, not a registered pytree) and other
+  # non-array values are bound via functools.partial rather than passed as
+  # jit-traced call arguments -- passing them directly crashes (confirmed
+  # twice this session: once for a string `impl`, once for `config` itself).
+  stage_a_fn = functools.partial(router_and_projection, config=global_config)
+  stage_a_ms = _time_jit(stage_a_fn, hidden_states, router_weight, e_score_correction_bias, down_proj)
+  topk_idx, topk_weight, x = jax.jit(stage_a_fn)(
+      hidden_states, router_weight, e_score_correction_bias, down_proj
+  )
+
+  stage_b_fn = functools.partial(
+      filter_and_pad_to_shard, config=global_config, local_expert_start=0,
+      local_num_experts=local_num_experts, capacity_factor=capacity_factor,
+  )
+  stage_b_ms = _time_eager(stage_b_fn, topk_idx, topk_weight, x)
+  (
+      sorted_tokens, group_sizes, valid_mask, per_expert_counts,
+      padded_token_idx, padded_combine_weight,
+  ) = stage_b_fn(topk_idx, topk_weight, x)
+  print(
+      f"[wp4-profile] Stage B output: M_padded={sorted_tokens.shape[0]} "
+      f"valid_rows={int(jnp.sum(valid_mask))} "
+      f"mean_per_expert={float(jnp.mean(per_expert_counts)):.2f}"
+  )
+
+  stage_c_fn = functools.partial(
+      _local_shard_expert_ffn_ragged_dot, group_sizes=group_sizes, config=global_config,
+      implementation=implementation,
+  )
+  stage_c_ms = _time_jit(stage_c_fn, sorted_tokens, shard_gate, shard_up, shard_down)
+  shard_out = jax.jit(stage_c_fn)(sorted_tokens, shard_gate, shard_up, shard_down)
+
+  routed_out_init = jnp.zeros((num_tokens, global_config.latent_size), dtype=jnp.bfloat16)
+  stage_d_ms = _time_jit(
+      _combine_shard_contribution, routed_out_init, shard_out, padded_token_idx, padded_combine_weight
+  )
+
+  total_ms = stage_a_ms + stage_b_ms + stage_c_ms + stage_d_ms
+  irregular_ms = stage_b_ms + stage_d_ms
+  irregular_share = irregular_ms / total_ms
+
+  result = {
+      "num_tokens": num_tokens,
+      "stage_a_router_projection_ms": stage_a_ms,
+      "stage_b_dispatch_indexing_ms": stage_b_ms,
+      "stage_c_ragged_dot_ms": stage_c_ms,
+      "stage_d_combine_ms": stage_d_ms,
+      "irregular_share_of_total": irregular_share,
+  }
+  print(
+      f"[wp4-profile-tpu] num_tokens={num_tokens} implementation={implementation!r} "
+      f"A(router+proj)={stage_a_ms:.3f}ms B(dispatch-idx)={stage_b_ms:.3f}ms "
+      f"C(ragged_dot)={stage_c_ms:.3f}ms D(combine)={stage_d_ms:.3f}ms "
+      f"irregular_share(B+D)={irregular_share:.1%}"
+  )
+  return result
 
 
 def run_shard_workload_benchmark(
@@ -1059,6 +1195,14 @@ if __name__ == "__main__":
       "distribution (not the dense/uniform 16-of-64 simplification the other benchmarks use) "
       "-- see run_realistic_shard_latency_sweep's docstring",
   )
+  parser.add_argument(
+      "--wp4-profile",
+      action="store_true",
+      help="WP4 (SparseCore feasibility): real 4-stage profiling breakdown (router+projection / "
+      "dispatch indexing / REAL ragged_dot expert compute / combine) -- see "
+      "profile_four_stages_wp4's docstring. Companion to profile_dispatch_vs_compute.py's "
+      "CPU-only, dense-matmul-stand-in version of the same 4 stages.",
+  )
   args = parser.parse_args()
 
   if (
@@ -1070,6 +1214,7 @@ if __name__ == "__main__":
       and not args.latency_sweep
       and not args.sharded_ragged_dot_correctness
       and not args.realistic_shard_latency_sweep
+      and not args.wp4_profile
   ):
     args.correctness = True  # default to the cheap check
 
@@ -1113,3 +1258,6 @@ if __name__ == "__main__":
 
   if args.realistic_shard_latency_sweep:
     run_realistic_shard_latency_sweep()
+
+  if args.wp4_profile:
+    profile_four_stages_wp4()
