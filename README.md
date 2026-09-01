@@ -29,6 +29,12 @@ TPU v6e using `tokamax.ragged_dot`.
   (`max_err=9.31e-10` at a small toy scale). See
   `check_sharded_forward_correctness` in
   `05_ragged_dot_on_tpu/kimi_k3_latent_moe_reference.py`.
+- 10 local (CPU-only, no TPU needed) unit tests for that routing pipeline's
+  edge cases -- empty shards, extreme skew, capacity overflow, padding
+  contamination, `top_k=16`, global/local expert-id boundary off-by-ones,
+  first/last shard, batch/seq invariance, fp32/bf16 dtype promotion, and
+  the sharded-sum-vs-reference check across several configs (not just one)
+  -- all pass. See `05_ragged_dot_on_tpu/test_sharded_routing_local.py`.
 
 **In progress / open:**
 - bf16 on `xla`/`mosaic` (v1)/`mosaic_tpu_v2` shows a tolerance-exceeding
@@ -222,6 +228,15 @@ Observations:
   performance.
 
 ## Reproducing
+
+**Local routing unit tests** (no TPU needed, run this any time -- also the
+first step `run_v6e_experiment_suite.py` runs, so a logic regression is
+caught before spending real VM time on it):
+
+```bash
+cd 05_ragged_dot_on_tpu
+python test_sharded_routing_local.py
+```
 
 **One-shot TPU VM entry point**: once golden bundles exist (step 2 below,
 no TPU needed), everything that needs a v6e VM can run in one command:

@@ -10,24 +10,31 @@ one step's OOM or compile error never blocks the rest.
 
 Runs, in order:
   1. Environment/device check (jax/tokamax versions, jax.devices()).
-  2. Official Kimi K3 source snapshot verification (hash-checked against
+  2. Local (CPU-only, no TPU/tokamax needed) routing edge-case unit tests --
+     empty shards, extreme skew, capacity overflow, padding contamination,
+     top_k=16, global/local boundary off-by-ones, first/last shard,
+     batch/seq invariance, dtype promotion, multi-config sharded-sum-vs-
+     reference. Runs first and fast specifically so an ordinary logic
+     regression is caught here, before any of the expensive TPU-dependent
+     steps below spend real VM time on it.
+  3. Official Kimi K3 source snapshot verification (hash-checked against
      the pinned commit).
-  3. Sharded ragged_dot correctness (the real 16-of-896-then-filtered-to-
+  4. Sharded ragged_dot correctness (the real 16-of-896-then-filtered-to-
      shard routing, using tokamax.ragged_dot instead of the naive loop).
-  4. Latency sweep under the REAL routing distribution (not the dense/
+  5. Latency sweep under the REAL routing distribution (not the dense/
      uniform simplification the earlier benchmark used).
-  5. Direct, same-device, element-wise comparison of xla/mosaic/
+  6. Direct, same-device, element-wise comparison of xla/mosaic/
      mosaic_tpu_v2's bf16 outputs against EACH OTHER -- not just each vs.
      the golden PyTorch reference separately (closes a long-flagged gap:
      prior "shared bf16 precision effect" conclusions were only ever an
      inference from matching summary statistics across separate runs).
-  6. The full existing golden-validation battery: every bundle set (small/
+  7. The full existing golden-validation battery: every bundle set (small/
      mosaic/mosaic_wide) x every dtype (fp32/bf16) x every implementation
      (xla/mosaic/mosaic_tpu_v2) -- the broadest correctness sweep this
      project currently has, referred to here as the "full-dimension smoke
      test" since a literal full-896-expert/unsharded run is infeasible on
      one chip (confirmed OOM elsewhere in this project, ~59GB).
-  7. WP4's real 4-stage profiling breakdown (router+projection / dispatch
+  8. WP4's real 4-stage profiling breakdown (router+projection / dispatch
      indexing / REAL tokamax.ragged_dot / combine).
 
 Each step runs as its own subprocess (not an in-process function call) so
@@ -153,7 +160,15 @@ def main(output_dir: pathlib.Path) -> None:
       "note": "" if env_ok else "no TPU device found in jax.devices()",
   })
 
-  # Step 2: official snapshot verification.
+  # Step 2: local (CPU-only) routing edge-case unit tests -- fast, no TPU
+  # needed, run first so an ordinary logic regression is caught before any
+  # expensive TPU-dependent step below spends real VM time rediscovering it.
+  results.append(_run_step(
+      "local_sharded_routing_edge_cases", _RAGGED_DOT_DIR,
+      [sys.executable, "test_sharded_routing_local.py"], output_dir,
+  ))
+
+  # Step 3: official snapshot verification.
   results.append(_run_step(
       "official_config_validation", _GOLDEN_DIR,
       [sys.executable, "validate_official_config.py"], output_dir,
@@ -163,25 +178,25 @@ def main(output_dir: pathlib.Path) -> None:
       [sys.executable, "verify_official_snapshot.py"], output_dir,
   ))
 
-  # Step 3: sharded ragged_dot correctness.
+  # Step 4: sharded ragged_dot correctness.
   results.append(_run_step(
       "sharded_ragged_dot_correctness", _RAGGED_DOT_DIR,
       [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--sharded-ragged-dot-correctness"], output_dir,
   ))
 
-  # Step 4: realistic-distribution latency sweep.
+  # Step 5: realistic-distribution latency sweep.
   results.append(_run_step(
       "realistic_shard_latency_sweep", _RAGGED_DOT_DIR,
       [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--realistic-shard-latency-sweep"], output_dir,
   ))
 
-  # Step 5: direct same-device bf16 cross-implementation comparison.
+  # Step 6: direct same-device bf16 cross-implementation comparison.
   results.append(_run_step(
       "bf16_cross_implementation_direct_compare", _GOLDEN_DIR,
       [sys.executable, "compare_bf16_implementations_direct.py", "--bundle-set", "mosaic_wide"], output_dir,
   ))
 
-  # Step 6: the full existing golden-validation battery (every bundle set x
+  # Step 7: the full existing golden-validation battery (every bundle set x
   # dtype x implementation) -- the broadest correctness sweep currently
   # available; see this file's module docstring for why this stands in for
   # a literal full-896-expert "full-dimension" smoke test.
@@ -192,7 +207,7 @@ def main(output_dir: pathlib.Path) -> None:
       output_dir, timeout=2400,
   ))
 
-  # Step 7: WP4's real 4-stage profiling.
+  # Step 8: WP4's real 4-stage profiling.
   results.append(_run_step(
       "wp4_four_stage_profiling", _RAGGED_DOT_DIR,
       [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp4-profile"], output_dir,
