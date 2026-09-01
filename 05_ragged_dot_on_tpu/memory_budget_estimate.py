@@ -57,8 +57,10 @@ Usage:
   python memory_budget_estimate.py
 """
 
+import csv as _csv
 import dataclasses
 import math
+import pathlib
 
 from kimi_k3_latent_moe_reference import (
     LatentMoEConfig,
@@ -217,6 +219,7 @@ def print_budget_table(
     local_num_experts: int = 64,
     shapes: tuple[tuple[int, int], ...] = _SWEEP_SHAPES,
     capacity_factor: float = 2.0,
+    output_dir: pathlib.Path | None = None,
 ) -> list[MemoryBudget]:
   config = config or kimi_k3_config()
   weight_bd = compute_weight_memory(config, local_num_experts)
@@ -265,11 +268,42 @@ def print_budget_table(
         f"{_ASSUMED_V6E_HBM_GB}GB ceiling -- consider extending _SWEEP_SHAPES further if a tighter "
         "upper bound is needed."
     )
+
+  if output_dir is not None:
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "memory_budget.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+      writer = _csv.DictWriter(f, fieldnames=[
+          "batch_size", "seq_len", "num_tokens", "expected_local_assignments", "m_padded",
+          "weight_memory_bytes", "activation_memory_bytes", "padding_memory_bytes",
+          "fp32_accumulator_bytes", "estimated_total_bytes", "estimated_total_gb", "fits_assumed_hbm",
+      ])
+      writer.writeheader()
+      for b in budgets:
+        writer.writerow({
+            "batch_size": b.batch_size, "seq_len": b.seq_len, "num_tokens": b.num_tokens,
+            "expected_local_assignments": b.expected_local_assignments, "m_padded": b.m_padded,
+            "weight_memory_bytes": b.weight_memory_bytes, "activation_memory_bytes": b.activation_memory_bytes,
+            "padding_memory_bytes": b.padding_memory_bytes, "fp32_accumulator_bytes": b.fp32_accumulator_bytes,
+            "estimated_total_bytes": b.estimated_total_bytes, "estimated_total_gb": b.estimated_total_gb,
+            "fits_assumed_hbm": b.estimated_total_gb < _ASSUMED_V6E_HBM_GB,
+        })
+    print(f"\n[memory-budget] structured data written to {csv_path}")
   return budgets
 
 
 if __name__ == "__main__":
-  print_budget_table()
+  import argparse
+
+  parser = argparse.ArgumentParser()
+  parser.add_argument(
+      "--output-dir", type=pathlib.Path, default=None,
+      help="if given, also write memory_budget.csv there",
+  )
+  args = parser.parse_args()
+
+  print_budget_table(output_dir=args.output_dir)
 
   print(
       "\n[memory-budget] to get v6e's REAL per-chip HBM capacity (replacing the "

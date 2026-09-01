@@ -117,8 +117,10 @@ compatibility with `run_shard_workload_benchmark`/the CLI below.
 """
 
 import argparse
+import csv as _csv
 import dataclasses
 import functools
+import pathlib
 import time
 
 # Same environment workaround as benchmark_harness.py -- must run before
@@ -153,6 +155,20 @@ from kimi_k3_latent_moe_reference import (  # noqa: E402
     route_and_filter_to_local_shard,
     toy_config,
 )
+
+
+def _write_csv(path: pathlib.Path, rows: list[dict], fieldnames: list[str]) -> None:
+  """Shared structured-output helper: writes benchmark/profiling results as
+  CSV (not just printed to stdout, which prior versions of these functions
+  only did -- a reviewer pointed out that meant every real number lived
+  only in a text log, needing manual transcription later)."""
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with path.open("w", newline="", encoding="utf-8") as f:
+    writer = _csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+      writer.writerow(row)
+  print(f"  (structured data written to {path})")
 
 
 def latent_moe_forward_ragged_dot(
@@ -555,6 +571,7 @@ def run_realistic_shard_latency_sweep(
     local_num_experts: int = 64,
     shapes: tuple[tuple[int, int], ...] = _DEFAULT_LATENCY_SWEEP_SHAPES,
     capacity_factor: float = 2.0,
+    output_dir: pathlib.Path | None = None,
 ) -> None:
   """Latency for one chip's shard under the REAL 16-of-896 routing
   distribution (via route_and_filter_to_local_shard), not the artificially
@@ -607,6 +624,7 @@ def run_realistic_shard_latency_sweep(
   )
 
   rows: list[tuple[int, int, int, str, float | None, float | None, str | None]] = []
+  shape_stats: dict[tuple[int, int], dict] = {}
 
   for batch_size, seq_len in shapes:
     num_tokens = batch_size * seq_len
@@ -623,6 +641,13 @@ def run_realistic_shard_latency_sweep(
         global_config, local_expert_start=0, local_num_experts=local_num_experts,
         capacity_factor=capacity_factor,
     )
+    shape_stats[(batch_size, seq_len)] = {
+        "m_padded": int(sorted_tokens.shape[0]),
+        "valid_rows": int(jnp.sum(valid_mask)),
+        "mean_per_expert": float(jnp.mean(per_expert_counts)),
+        "min_per_expert": int(jnp.min(per_expert_counts)),
+        "max_per_expert": int(jnp.max(per_expert_counts)),
+    }
     print(
         f"[realistic-shard-latency] num_tokens={num_tokens} local_num_experts={local_num_experts} "
         f"M_padded={sorted_tokens.shape[0]} valid_rows={int(jnp.sum(valid_mask))} "
@@ -664,6 +689,24 @@ def run_realistic_shard_latency_sweep(
           f"{exec_ms:>15.4f} {mem_mb:>12.2f}"
       )
 
+  if output_dir is not None:
+    csv_rows = []
+    for b, s, n, impl, exec_ms, mem_mb, err in rows:
+      stats = shape_stats[(b, s)]
+      csv_rows.append({
+          "batch_size": b, "seq_len": s, "num_tokens": n, "implementation": impl,
+          "median_exec_ms": exec_ms if err is None else "", "peak_mem_mb": mem_mb if err is None else "",
+          "status": "SKIPPED" if err is not None else "OK", "error": err or "",
+          "m_padded": stats["m_padded"], "valid_rows": stats["valid_rows"],
+          "mean_per_expert": stats["mean_per_expert"], "min_per_expert": stats["min_per_expert"],
+          "max_per_expert": stats["max_per_expert"],
+      })
+    _write_csv(
+        pathlib.Path(output_dir) / "realistic_shard_latency.csv", csv_rows,
+        ["batch_size", "seq_len", "num_tokens", "implementation", "median_exec_ms", "peak_mem_mb",
+         "status", "error", "m_padded", "valid_rows", "mean_per_expert", "min_per_expert", "max_per_expert"],
+    )
+
 
 def profile_four_stages_wp4(
     seed: int = 0,
@@ -672,6 +715,7 @@ def profile_four_stages_wp4(
     capacity_factor: float = 2.0,
     implementation: str | None = None,
     num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
 ) -> dict:
   """WP4 (SparseCore feasibility): the REAL 4-stage profiling breakdown --
   A (router+projection, regular matmul), B (dispatch indexing, irregular),
@@ -683,9 +727,36 @@ def profile_four_stages_wp4(
   `filter_and_pad_to_shard`, `_combine_shard_contribution`, all in
   `kimi_k3_latent_moe_reference.py`), so those three stages are directly
   comparable between a CPU run and this TPU run -- only Stage C differs
-  (real ragged_dot here vs. a dense-matmul stand-in there). This is the
-  irregular-share number WP4's actual decision should be based on, not the
-  CPU stand-in version.
+  (real ragged_dot here vs. a dense-matmul stand-in there).
+
+  **Important caveat, flagged by a reviewer (2026-09-02), NOT yet fixed --
+  Stage B is not timed on a fair, device-only basis compared to A/C/D**:
+  A, C, and D are all timed via a jitted, compiled, repeated-call loop
+  (`_time_jit`) -- effectively pure device execution time, warmup-excluded.
+  Stage B (`filter_and_pad_to_shard`) is timed via `_time_eager` instead,
+  because it is genuinely NOT jit-compatible as currently written (its
+  boolean-mask shard-filtering step produces a data-dependent array length
+  -- the same "must run outside jit" constraint documented on
+  `filter_and_pad_to_shard`/`route_and_filter_to_local_shard` themselves).
+  This means Stage B's measured time includes Python dispatch overhead,
+  multiple separate eager JAX ops, host/device synchronization, and dynamic
+  shape handling -- NOT purely comparable to A/C/D's compiled device time.
+  **`irregular_share = (B+D)/(A+B+C+D)` below should therefore be read as
+  "eager dispatch PIPELINE latency's share," not a clean device-only
+  SparseCore-relevant-cost fraction** -- Python-only overhead that
+  SparseCore cannot help with either way may be inflating B's apparent
+  share. Two ways to fix this properly, neither attempted here (too risky
+  to rush into working code right before a scarce TPU session): (a)
+  restructure `filter_and_pad_to_shard` to avoid the dynamic-length
+  intermediate entirely -- e.g. sort ALL `num_tokens*top_k` (token,slot)
+  pairs by a key that pushes out-of-shard entries past `m_padded` (a
+  sentinel value like `global_num_experts` instead of their real id), then
+  take a fixed-size prefix, avoiding ever computing a data-dependent shape
+  -- or (b) use `jax.profiler`'s trace to explicitly separate host time,
+  device indexing time, and host-device sync, rather than wall-clock timing
+  eager Python calls. Until one of those lands, treat the B/D irregular
+  share from this function as an upper-bound-ish approximation, not a
+  number to make a SparseCore go/no-go decision on by itself.
 
   Deliberately does NOT call `init_weights(kimi_k3_config(), ...)` -- see
   `run_realistic_shard_latency_sweep`'s docstring for why (would allocate
@@ -789,10 +860,27 @@ def profile_four_stages_wp4(
   }
   print(
       f"[wp4-profile-tpu] num_tokens={num_tokens} implementation={implementation!r} "
-      f"A(router+proj)={stage_a_ms:.3f}ms B(dispatch-idx)={stage_b_ms:.3f}ms "
+      f"A(router+proj)={stage_a_ms:.3f}ms B(dispatch-idx, EAGER-timed)={stage_b_ms:.3f}ms "
       f"C(ragged_dot)={stage_c_ms:.3f}ms D(combine)={stage_d_ms:.3f}ms "
-      f"irregular_share(B+D)={irregular_share:.1%}"
+      f"irregular_share(B+D)={irregular_share:.1%} "
+      "-- Stage B is eager-timed (Python+host/device sync included), NOT directly comparable to "
+      "A/C/D's jitted device time; see this function's docstring caveat before using this ratio "
+      "for a SparseCore decision."
   )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp4_profiling.csv",
+        [{
+            "num_tokens": num_tokens, "implementation": implementation or "default",
+            "stage_a_router_projection_ms": stage_a_ms, "stage_b_dispatch_indexing_ms_EAGER": stage_b_ms,
+            "stage_c_ragged_dot_ms": stage_c_ms, "stage_d_combine_ms": stage_d_ms,
+            "irregular_share_of_total": irregular_share,
+        }],
+        ["num_tokens", "implementation", "stage_a_router_projection_ms",
+         "stage_b_dispatch_indexing_ms_EAGER", "stage_c_ragged_dot_ms", "stage_d_combine_ms",
+         "irregular_share_of_total"],
+    )
   return result
 
 
@@ -1075,6 +1163,7 @@ def run_latency_sweep(
     seed: int = 0,
     num_experts: int = 64,
     shapes: tuple[tuple[int, int], ...] = _DEFAULT_LATENCY_SWEEP_SHAPES,
+    output_dir: pathlib.Path | None = None,
 ) -> None:
   """Latency across multiple batch sizes/sequence lengths, per Zifan's
   explicit standing request (2026-08-28, after reviewing the published
@@ -1092,6 +1181,10 @@ def run_latency_sweep(
   A NotImplementedError from a given implementation at a given shape (e.g.
   mosaic (v1) below its 128-row tiling floor at small num_tokens) is
   reported as SKIPPED in the table, not a failure or a missing row.
+
+  If `output_dir` is given, also writes `latency_sweep.csv` there (a
+  reviewer pointed out that without this, every real number only ever
+  lived in a text log, needing manual transcription for later analysis).
   """
   config = single_chip_kimi_k3_config(num_experts)
   rows: list[tuple[int, int, int, str, float | None, float | None, str | None]] = []
@@ -1148,6 +1241,20 @@ def run_latency_sweep(
           f"{exec_ms:>15.4f} {mem_mb:>12.2f}"
       )
 
+  if output_dir is not None:
+    csv_rows = [
+        {
+            "batch_size": b, "seq_len": s, "num_tokens": n, "implementation": impl,
+            "median_exec_ms": exec_ms if err is None else "", "peak_mem_mb": mem_mb if err is None else "",
+            "status": "SKIPPED" if err is not None else "OK", "error": err or "",
+        }
+        for b, s, n, impl, exec_ms, mem_mb, err in rows
+    ]
+    _write_csv(
+        pathlib.Path(output_dir) / "latency_sweep.csv", csv_rows,
+        ["batch_size", "seq_len", "num_tokens", "implementation", "median_exec_ms", "peak_mem_mb", "status", "error"],
+    )
+
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -1203,6 +1310,14 @@ if __name__ == "__main__":
       "profile_four_stages_wp4's docstring. Companion to profile_dispatch_vs_compute.py's "
       "CPU-only, dense-matmul-stand-in version of the same 4 stages.",
   )
+  parser.add_argument(
+      "--output-dir",
+      type=pathlib.Path,
+      default=None,
+      help="if given, also write structured CSV results (latency_sweep.csv / "
+      "realistic_shard_latency.csv / wp4_profiling.csv, depending which flag above is used) "
+      "here, not just print them -- see _write_csv",
+  )
   args = parser.parse_args()
 
   if (
@@ -1247,7 +1362,7 @@ if __name__ == "__main__":
     assert ok_route, "route_and_filter_to_local_shard failed its standalone correctness/overflow check"
 
   if args.latency_sweep:
-    run_latency_sweep()
+    run_latency_sweep(output_dir=args.output_dir)
 
   if args.sharded_ragged_dot_correctness:
     ok_sharded_ragged_dot = check_sharded_ragged_dot_correctness()
@@ -1257,7 +1372,7 @@ if __name__ == "__main__":
     )
 
   if args.realistic_shard_latency_sweep:
-    run_realistic_shard_latency_sweep()
+    run_realistic_shard_latency_sweep(output_dir=args.output_dir)
 
   if args.wp4_profile:
-    profile_four_stages_wp4()
+    profile_four_stages_wp4(output_dir=args.output_dir)

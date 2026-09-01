@@ -13,18 +13,22 @@ SUMMARY STATISTICS computed in different runs, never from a direct
 tensor-level diff between the implementations' own raw outputs. This
 script computes every available implementation in one process on the same
 device, saves each one's full output bundle, and diffs them against EACH
-OTHER directly across all 18 intermediates -- the three pairwise
-comparisons (xla-vs-mosaic-v1, xla-vs-mosaic-v2, mosaic-v1-vs-mosaic-v2)
-are what actually distinguish "PyTorch-vs-TPU-backend bf16 rounding noise"
-from "an implementation issue shared by all three kernels": if all three
-report BIT-IDENTICAL values at the 4 previously-flagged stages
-(`expert_up_output`, `up_projection_output`, `normalized_output`,
-`final_output`), that's strong (though not certain) evidence of the former
--- three independently-coded kernels landing on the exact same bits by
-coincidence of a shared BUG is far less likely than landing on the same
-bits because they all route through the same underlying bf16 MXU
-primitive. If the three implementations DISAGREE with each other (not just
-with golden), that would point to the latter and needs further digging.
+OTHER directly across all 18 intermediates.
+
+**Scope of what this actually proves (tightened 2026-09-02 per reviewer
+feedback)**: `xla`/`mosaic`/`mosaic_tpu_v2` are NOT three fully independent
+end-to-end implementations -- they share routing, dispatch, combine,
+RMSNorm, projection, and this test's own instrumentation wrapper; the only
+thing that differs between them is the `tokamax.ragged_dot` backend
+itself. So if all three report BIT-IDENTICAL values at the 4
+previously-flagged stages (`expert_up_output`, `up_projection_output`,
+`normalized_output`, `final_output`), that RULES OUT a difference among
+the three ragged_dot backends at those stages, and SUPPORTS -- but does
+not by itself PROVE -- a shared PyTorch-vs-TPU precision effect (a bug in
+the shared surrounding code, not just in one backend, would also produce
+bit-identical results across all three). If the three implementations
+DISAGREE with each other (not just with golden), that points to a
+backend-specific difference and needs further digging.
 
 Not a pass/fail tolerance check like `test_ragged_dot_against_pytorch_golden.py`'s
 `run_one` -- this is a diagnostic comparison. It reports the actual direct
@@ -46,6 +50,7 @@ Usage:
 
 import argparse
 import itertools
+import json
 import pathlib
 import sys
 
@@ -244,9 +249,11 @@ def compare_bf16_implementations(
   print(f"\n[bf16-direct-compare] direct pairwise comparisons across all {len(_ALL_STAGES)} stages "
         f"({len(computed)} implementations computed):")
   per_pair_flagged: dict[tuple[str, str], dict[str, float]] = {}
+  all_stage_results: dict[str, dict[str, float]] = {}
   for impl_a, impl_b in itertools.combinations(computed, 2):
     stage_results = compare_two_implementations(impl_a, bundles[impl_a], impl_b, bundles[impl_b], config)
     per_pair_flagged[(impl_a, impl_b)] = {k: stage_results[k] for k in _FLAGGED_STAGES}
+    all_stage_results[f"{impl_a}_vs_{impl_b}"] = stage_results
 
   print(f"\n[bf16-direct-compare] VERDICT on the {len(_FLAGGED_STAGES)} previously-flagged stages "
         f"({', '.join(_FLAGGED_STAGES)}):")
@@ -257,22 +264,49 @@ def compare_bf16_implementations(
         all_bit_identical = False
       print(f"    {impl_a!r} vs {impl_b!r} / {stage}: max_abs_diff={diff:.3e}")
 
+  # NOTE (reviewer, 2026-09-02): xla/mosaic/mosaic_tpu_v2 are NOT three fully
+  # independent end-to-end implementations -- they share routing, dispatch,
+  # combine, RMSNorm, projection, and this test's own instrumentation
+  # wrapper; the only thing that actually differs between them is the
+  # ragged_dot backend. So bit-identical results across all three pairs
+  # rule out a difference AMONG THE RAGGED_DOT BACKENDS specifically at
+  # these stages -- they do NOT, by themselves, rule out a problem in the
+  # shared surrounding code (wrapper, projections, precision handling) that
+  # all three would reproduce identically. The verdict below is phrased to
+  # reflect exactly that scope, not a stronger claim.
   if all_bit_identical:
     print(
         "\n[bf16-direct-compare] All computed implementation pairs are BIT-IDENTICAL at every "
-        "previously-flagged stage. This is real evidence (not just matching summary statistics "
-        "from separate runs) that the bf16 residual vs. the PyTorch golden reference is a "
-        "PyTorch-vs-TPU-backend precision effect shared across kernels, not a bug specific to "
-        "any one of xla/mosaic/mosaic_tpu_v2 -- three independently-coded kernels landing on "
-        "the exact same bits by coincidence of a shared BUG is far less likely than landing on "
-        "the same bits because they all route through the same underlying bf16 MXU behavior."
+        "previously-flagged stage. This rules out an implementation-specific difference among "
+        "the three ragged-dot backends at the compared stages, and supports -- but does not by "
+        "itself prove -- a shared PyTorch-vs-TPU precision effect (the three backends share "
+        "everything except the ragged_dot call itself: routing, dispatch, combine, RMSNorm, "
+        "projection, and this test's own wrapper code are identical across all three, so a bug "
+        "in any of THOSE shared parts would also show up as 'bit-identical across backends')."
     )
   else:
     print(
         "\n[bf16-direct-compare] Computed implementations DISAGREE with each other on at least "
         "one previously-flagged stage -- this points AWAY from 'shared PyTorch-vs-TPU precision "
-        "effect' and toward a kernel-specific difference that needs further investigation."
+        "effect' and toward a difference specific to one of the ragged_dot backends that needs "
+        "further investigation."
     )
+
+  correctness_path = pathlib.Path(output_dir) / "correctness.json"
+  correctness_path.parent.mkdir(parents=True, exist_ok=True)
+  correctness_path.write_text(
+      json.dumps(
+          {
+              "bundle_set": bundle_set,
+              "implementations_computed": computed,
+              "all_stage_results": all_stage_results,
+              "flagged_stages_all_bit_identical": all_bit_identical,
+          },
+          indent=2,
+      ),
+      encoding="utf-8",
+  )
+  print(f"\n[bf16-direct-compare] structured per-stage results written to {correctness_path}")
 
   return True
 

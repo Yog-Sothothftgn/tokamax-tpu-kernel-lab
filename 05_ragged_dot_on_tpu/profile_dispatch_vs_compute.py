@@ -54,7 +54,9 @@ Usage:
   python profile_dispatch_vs_compute.py
 """
 
+import csv as _csv
 import functools
+import pathlib
 import time
 
 import jax
@@ -137,6 +139,7 @@ def profile_four_stages_cpu(
     capacity_factor: float = 2.0,
     seed: int = 0,
     num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
 ) -> dict:
   """Times Stage A (router+projection), Stage B (dispatch indexing to one
   local shard), and Stage D (combine) at real Kimi K3 per-expert dims
@@ -149,6 +152,16 @@ def profile_four_stages_cpu(
   `kimi_k3_latent_moe_ragged_dot.py`'s `profile_four_stages_wp4` (same
   Stage A/B/D functions, real Stage C) on a TPU VM before treating any
   ratio here as evidence for or against a SparseCore prototype.
+
+  **Second caveat, flagged by a reviewer (2026-09-02), applies here too**:
+  Stage B is timed via `_time_eager_fn` (genuinely not jit-compatible, see
+  that helper's docstring), while A/C/D use `_time_jit_fn` -- so Stage B's
+  number includes Python dispatch/host-device sync overhead that A/C/D's
+  compiled-loop timing does not. `irregular_share` below is therefore an
+  "eager pipeline latency share," not a clean device-only comparison, on
+  CPU same as on TPU -- see `profile_four_stages_wp4`'s matching docstring
+  in `kimi_k3_latent_moe_ragged_dot.py` for the two ways to fix this
+  properly (neither attempted yet).
   """
   config = config or kimi_k3_config()
   key = jax.random.key(seed)
@@ -220,14 +233,35 @@ def profile_four_stages_cpu(
   }
   print(
       f"[wp4-profile] num_tokens={num_tokens} "
-      f"A(router+proj)={stage_a_ms:.3f}ms B(dispatch-idx)={stage_b_ms:.3f}ms "
+      f"A(router+proj)={stage_a_ms:.3f}ms B(dispatch-idx, EAGER-timed)={stage_b_ms:.3f}ms "
       f"C(matmul-stand-in)={stage_c_ms:.3f}ms D(combine)={stage_d_ms:.3f}ms "
       f"irregular_share(B+D)={irregular_share:.1%}"
   )
+
+  if output_dir is not None:
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "wp4_profiling_cpu.csv"
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+      writer = _csv.DictWriter(f, fieldnames=list(result.keys()))
+      if write_header:
+        writer.writeheader()
+      writer.writerow(result)
+    print(f"  (structured data appended to {csv_path})")
   return result
 
 
 if __name__ == "__main__":
+  import argparse
+
+  parser = argparse.ArgumentParser()
+  parser.add_argument(
+      "--output-dir", type=pathlib.Path, default=None,
+      help="if given, also append structured results to wp4_profiling_cpu.csv there",
+  )
+  args = parser.parse_args()
+
   print(f"devices: {jax.devices()}")
   print(
       "NOTE: this run is on whatever device is available locally (CPU on this "
@@ -236,4 +270,4 @@ if __name__ == "__main__":
       "dense-matmul stand-in, not the real tokamax.ragged_dot cost.\n"
   )
   for num_tokens in (128, 512, 2048):
-    profile_four_stages_cpu(num_tokens=num_tokens)
+    profile_four_stages_cpu(num_tokens=num_tokens, output_dir=args.output_dir)

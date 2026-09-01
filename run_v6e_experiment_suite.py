@@ -9,7 +9,10 @@ collects as much data as possible even if some individual step fails --
 one step's OOM or compile error never blocks the rest.
 
 Runs, in order:
-  1. Environment/device check (jax/tokamax versions, jax.devices()).
+  1. Environment/device check (jax/tokamax/jaxlib versions, jax.devices(),
+     TPU device kind, GCE zone/machine-type if running on a real GCE VM,
+     this repo's own git commit, and the tokamax repo's git commit if
+     `~/tokamax` exists).
   2. Local (CPU-only, no TPU/tokamax needed) routing edge-case unit tests --
      empty shards, extreme skew, capacity overflow, padding contamination,
      top_k=16, global/local boundary off-by-ones, first/last shard,
@@ -33,17 +36,30 @@ Runs, in order:
      separately (closes a long-flagged gap: prior "shared bf16 precision
      effect" conclusions were only ever an inference from matching summary
      statistics across separate runs). Saves each implementation's full
-     raw output bundle to <name>_outputs.npz under this step's own
-     subdirectory of --output-dir, so the raw tensors can be re-examined
-     later without a TPU.
-  7. The full existing golden-validation battery: every bundle set (small/
-     mosaic/mosaic_wide) x every dtype (fp32/bf16) x every implementation
-     (xla/mosaic/mosaic_tpu_v2) -- the broadest correctness sweep this
-     project currently has, referred to here as the "full-dimension smoke
-     test" since a literal full-896-expert/unsharded run is infeasible on
-     one chip (confirmed OOM elsewhere in this project, ~59GB).
+     raw output bundle to <name>_outputs.npz plus a correctness.json under
+     this step's own subdirectory of --output-dir.
+  7. **`reduced_scale_golden_regression_battery`** -- one fine-grained step
+     PER (bundle_set, variant, implementation) combination that's actually
+     expected to run (12 combinations; combinations already known to hit
+     Mosaic v1's 128-row tiling floor, e.g. mosaic v1 against the "small"
+     or original "mosaic" bundles, are NOT attempted -- they'd always
+     report an expected skip, and running them in the SAME subprocess as a
+     combination that might have a real mismatch risks the classifier
+     seeing "SKIPPED" and "FAIL" in the same combined output and
+     misclassifying the whole step as UNSUPPORTED, masking the real
+     failure). **NOT a full-dimension smoke test** -- every bundle here
+     uses reduced scale (`num_experts=8`, `top_k=2`), not the real
+     `num_experts=896`/`top_k=16`/`hidden=7168`/`latent=3584`/
+     `intermediate=3072` -- a literal full-dimension run is infeasible on
+     one chip anyway (confirmed OOM elsewhere in this project, ~59GB) and
+     remains a separate, not-yet-done item. Each combination's structured
+     per-stage results are written to its own correctness.json.
   8. WP4's real 4-stage profiling breakdown (router+projection / dispatch
-     indexing / REAL tokamax.ragged_dot / combine).
+     indexing / REAL tokamax.ragged_dot / combine) -- see
+     `profile_four_stages_wp4`'s docstring for an important caveat: Stage B
+     is timed eagerly, not on the same jitted-device basis as A/C/D, so the
+     resulting irregular-share ratio is not yet a clean device-only
+     SparseCore-decision number.
 
 Each step runs as its own subprocess (not an in-process function call) so
 that one step's crash, OOM, or compile error can never take down the
@@ -51,15 +67,30 @@ suite -- every subsequent step still runs. Status per step is one of:
   PASS           -- exit code 0
   FAIL           -- non-zero exit code, no more specific pattern matched
   UNSUPPORTED    -- output contains a NotImplementedError/SKIPPED marker
-                    (e.g. Mosaic v1 below its tiling floor)
+                    (e.g. Mosaic v1 below its tiling floor) -- with step 7
+                    now split per-implementation, an UNSUPPORTED here is
+                    genuinely unexpected (every guaranteed-skip combination
+                    was excluded from the matrix), so it counts toward the
+                    suite's overall failure the same as FAIL/OOM/COMPILE_ERROR.
   OOM            -- output mentions RESOURCE_EXHAUSTED / an out-of-memory pattern
   COMPILE_ERROR  -- output mentions a Mosaic/XLA compilation failure
 
+The suite's own exit code is 1 if ANY step's status is FAIL, OOM,
+COMPILE_ERROR, or UNSUPPORTED (0 only if every step is PASS) -- an earlier
+version of this file always exited 0 regardless of step failures, which
+would have made an automated caller think the whole suite succeeded even
+when several steps failed.
+
 Outputs, all under --output-dir:
-  environment.json     -- jax/tokamax versions, jax.devices() (also step 1's own record)
+  environment.json     -- versions, jax.devices(), git commits, GCE metadata
   summary.json          -- structured list of {name, status, returncode, elapsed_s, log_file, note}
   summary.csv            -- same, as CSV
   <step_name>.log         -- full stdout+stderr+command+timing for each step
+  latency_sweep.csv / realistic_shard_latency.csv / wp4_profiling.csv --
+    structured benchmark data from the corresponding steps (not just text logs)
+  memory_budget.csv      -- from the memory budget step
+  bf16_direct_compare_outputs/ -- <impl>_outputs.npz + correctness.json
+  golden_regression/<combo>.json -- per-(bundle_set,variant,implementation) correctness.json
 
 Usage:
   python run_v6e_experiment_suite.py --output-dir results/2026-09-01-v6e
@@ -73,12 +104,34 @@ import platform
 import subprocess
 import sys
 import time
+import urllib.request
 
 _HERE = pathlib.Path(__file__).parent
 _GOLDEN_DIR = _HERE / "06_kimi_k3_golden_validation"
 _RAGGED_DOT_DIR = _HERE / "05_ragged_dot_on_tpu"
 
 _DEFAULT_TIMEOUT_S = 1800  # 30 minutes per step -- generous, but bounded so one hung step doesn't eat the whole session
+
+# The 12 (bundle_set, variant, implementation) combinations actually expected
+# to execute a kernel -- deliberately excludes combinations already known to
+# hit Mosaic v1's 128-row tiling floor (mosaic v1 against "small" or the
+# original "mosaic" bundle), per this file's module docstring.
+_GOLDEN_REGRESSION_MATRIX: tuple[tuple[str, str, str], ...] = (
+    ("small", "fp32", "xla"),
+    ("small", "bf16", "xla"),
+    ("mosaic", "fp32", "xla"),
+    ("mosaic", "fp32", "mosaic_tpu_v2"),
+    ("mosaic", "bf16", "xla"),
+    ("mosaic", "bf16", "mosaic_tpu_v2"),
+    ("mosaic_wide", "fp32", "xla"),
+    ("mosaic_wide", "fp32", "mosaic"),
+    ("mosaic_wide", "fp32", "mosaic_tpu_v2"),
+    ("mosaic_wide", "bf16", "xla"),
+    ("mosaic_wide", "bf16", "mosaic"),
+    ("mosaic_wide", "bf16", "mosaic_tpu_v2"),
+)
+
+_FAILURE_STATUSES = frozenset({"FAIL", "OOM", "COMPILE_ERROR", "UNSUPPORTED"})
 
 
 def _classify(returncode: int | None, stdout: str, stderr: str) -> str:
@@ -94,6 +147,31 @@ def _classify(returncode: int | None, stdout: str, stderr: str) -> str:
   return "FAIL"
 
 
+def _git_commit(repo_dir: pathlib.Path) -> str | None:
+  try:
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=10,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+  except Exception:  # noqa: BLE001 -- best-effort only, absence is recorded as None
+    return None
+
+
+def _gce_metadata(path: str) -> str | None:
+  """Best-effort GCE instance metadata query -- only succeeds when actually
+  running on a GCE VM (silently returns None everywhere else, e.g. locally)."""
+  try:
+    req = urllib.request.Request(
+        f"http://metadata.google.internal/computeMetadata/v1/{path}",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(req, timeout=2) as resp:
+      return resp.read().decode().strip()
+  except Exception:  # noqa: BLE001
+    return None
+
+
 def _env_info() -> dict:
   info: dict = {
       "python_version": platform.python_version(),
@@ -103,13 +181,27 @@ def _env_info() -> dict:
     import jax
     info["jax_version"] = jax.__version__
     info["jax_devices"] = [str(d) for d in jax.devices()]
+    try:
+      info["tpu_device_kind"] = jax.devices()[0].device_kind
+    except Exception:  # noqa: BLE001
+      pass
   except Exception as e:  # noqa: BLE001 -- recording the failure itself is the point
     info["jax_error"] = str(e)
+  try:
+    import jaxlib
+    info["jaxlib_version"] = jaxlib.__version__
+  except Exception as e:  # noqa: BLE001
+    info["jaxlib_error"] = str(e)
   try:
     import tokamax
     info["tokamax_version"] = getattr(tokamax, "__version__", "unknown")
   except Exception as e:  # noqa: BLE001
     info["tokamax_error"] = str(e)
+
+  info["kernel_lab_git_commit"] = _git_commit(_HERE)
+  info["tokamax_git_commit"] = _git_commit(pathlib.Path.home() / "tokamax")
+  info["gce_zone"] = _gce_metadata("instance/zone")
+  info["gce_machine_type"] = _gce_metadata("instance/machine-type")
   return info
 
 
@@ -127,6 +219,7 @@ def _run_step(
     proc = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
     elapsed = time.time() - t0
     status = _classify(proc.returncode, proc.stdout, proc.stderr)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
         f"CMD: {' '.join(args)}\nCWD: {cwd}\nRETURNCODE: {proc.returncode}\n"
         f"ELAPSED_S: {elapsed:.1f}\n\n--- STDOUT ---\n{proc.stdout}\n\n--- STDERR ---\n{proc.stderr}\n",
@@ -139,6 +232,7 @@ def _run_step(
     }
   except subprocess.TimeoutExpired as e:
     elapsed = time.time() - t0
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
         f"CMD: {' '.join(args)}\nCWD: {cwd}\nTIMED OUT after {timeout}s\n\n"
         f"--- STDOUT (partial) ---\n{e.stdout or ''}\n\n--- STDERR (partial) ---\n{e.stderr or ''}\n",
@@ -152,7 +246,10 @@ def _run_step(
     }
 
 
-def main(output_dir: pathlib.Path) -> None:
+def main(output_dir: pathlib.Path) -> bool:
+  """Returns True if every step passed (see module docstring for exactly
+  what counts as a failure) -- the CLI below turns this into the process
+  exit code."""
   output_dir.mkdir(parents=True, exist_ok=True)
   results: list[dict] = []
 
@@ -182,7 +279,8 @@ def main(output_dir: pathlib.Path) -> None:
   # steps hit it for real.
   results.append(_run_step(
       "memory_budget_estimate", _RAGGED_DOT_DIR,
-      [sys.executable, "memory_budget_estimate.py"], output_dir,
+      [sys.executable, "memory_budget_estimate.py", "--output-dir", str(output_dir.resolve())],
+      output_dir,
   ))
 
   # Step 3: official snapshot verification.
@@ -201,16 +299,17 @@ def main(output_dir: pathlib.Path) -> None:
       [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--sharded-ragged-dot-correctness"], output_dir,
   ))
 
-  # Step 5: realistic-distribution latency sweep.
+  # Step 5: realistic-distribution latency sweep. --output-dir is ABSOLUTE --
+  # this subprocess's cwd is _RAGGED_DOT_DIR, not wherever this orchestrator
+  # itself was invoked from.
   results.append(_run_step(
       "realistic_shard_latency_sweep", _RAGGED_DOT_DIR,
-      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--realistic-shard-latency-sweep"], output_dir,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--realistic-shard-latency-sweep",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
   ))
 
   # Step 6: direct same-device bf16 cross-implementation comparison.
-  # --output-dir is passed as an ABSOLUTE path -- this subprocess's cwd is
-  # _GOLDEN_DIR, not wherever this orchestrator itself was invoked from, so
-  # a relative path here would land somewhere unintended.
   bf16_npz_dir = (output_dir / "bf16_direct_compare_outputs").resolve()
   results.append(_run_step(
       "bf16_cross_implementation_direct_compare", _GOLDEN_DIR,
@@ -219,21 +318,30 @@ def main(output_dir: pathlib.Path) -> None:
       output_dir,
   ))
 
-  # Step 7: the full existing golden-validation battery (every bundle set x
-  # dtype x implementation) -- the broadest correctness sweep currently
-  # available; see this file's module docstring for why this stands in for
-  # a literal full-896-expert "full-dimension" smoke test.
-  results.append(_run_step(
-      "full_golden_validation_battery", _GOLDEN_DIR,
-      [sys.executable, "test_ragged_dot_against_pytorch_golden.py",
-       "--bundle-set", "both", "--variant", "both", "--implementation", "all"],
-      output_dir, timeout=2400,
-  ))
+  # Step 7: the reduced-scale golden-validation regression battery, one
+  # step PER (bundle_set, variant, implementation) combination -- see this
+  # file's module docstring for why this replaced a single combined
+  # subprocess invocation (an expected skip and a real mismatch could land
+  # in the same combined stdout/stderr and get misclassified as one
+  # UNSUPPORTED status, masking the real failure).
+  golden_regression_dir = (output_dir / "golden_regression").resolve()
+  for bundle_set, variant, implementation in _GOLDEN_REGRESSION_MATRIX:
+    step_name = f"reduced_scale_golden_regression__{bundle_set}__{variant}__{implementation}"
+    json_path = golden_regression_dir / f"{bundle_set}__{variant}__{implementation}.json"
+    results.append(_run_step(
+        step_name, _GOLDEN_DIR,
+        [sys.executable, "test_ragged_dot_against_pytorch_golden.py",
+         "--bundle-set", bundle_set, "--variant", variant, "--implementation", implementation,
+         "--json-output", str(json_path)],
+        output_dir,
+    ))
 
   # Step 8: WP4's real 4-stage profiling.
   results.append(_run_step(
       "wp4_four_stage_profiling", _RAGGED_DOT_DIR,
-      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp4-profile"], output_dir,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp4-profile",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
   ))
 
   # Save JSON + CSV summaries.
@@ -247,17 +355,28 @@ def main(output_dir: pathlib.Path) -> None:
 
   print(f"\n{'=' * 70}\n[suite] SUMMARY\n{'=' * 70}")
   for r in results:
-    print(f"  {r['status']:>12}  {r['name']:<40} ({r['elapsed_s']}s)")
+    print(f"  {r['status']:>12}  {r['name']:<55} ({r['elapsed_s']}s)")
   print(f"\n[suite] full results written to {output_dir}/summary.json and summary.csv")
   print(f"[suite] per-step logs (full stdout/stderr) in {output_dir}/*.log")
+
+  has_failure = any(r["status"] in _FAILURE_STATUSES for r in results)
+  if has_failure:
+    print(
+        "\n[suite] AT LEAST ONE STEP DID NOT PASS (FAIL/OOM/COMPILE_ERROR/UNSUPPORTED counted as "
+        "failure) -- see summary.csv for which."
+    )
+  else:
+    print("\n[suite] ALL STEPS PASSED.")
+  return not has_failure
 
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument(
       "--output-dir", type=pathlib.Path, required=True,
-      help="directory to write environment.json, summary.json/.csv, and per-step .log files to "
-      "(created if it doesn't exist) -- e.g. results/2026-09-01-v6e",
+      help="directory to write environment.json, summary.json/.csv, and per-step .log/.csv/.json "
+      "files to (created if it doesn't exist) -- e.g. results/2026-09-01-v6e",
   )
   args = parser.parse_args()
-  main(args.output_dir)
+  all_passed = main(args.output_dir)
+  sys.exit(0 if all_passed else 1)

@@ -50,6 +50,7 @@ Usage (on the TPU VM, tokamax installed):
   python test_ragged_dot_against_pytorch_golden.py --bundle-set both --variant both  # full sweep, this project's recommended default
 """
 
+import json
 import pathlib
 import sys
 
@@ -201,7 +202,14 @@ def _run_instrumented_ragged_dot(hidden_states, weights, config, implementation:
   return final_output, intermediates
 
 
-def run_one(bundle_dir: pathlib.Path, config, variant: str, implementation: str) -> bool:
+def run_one(bundle_dir: pathlib.Path, config, variant: str, implementation: str) -> tuple[bool, dict]:
+  """Returns `(all_ok, per_stage_results)` -- `per_stage_results` maps each
+  compared stage name to `{"max_abs_diff": float, "ok": bool}` (or
+  `{"skipped": reason, "ok": False}` if `implementation` raised
+  `NotImplementedError` before any stage could be compared), added 2026-09-02
+  per reviewer feedback so callers can persist structured per-stage data
+  (e.g. as JSON), not just a single pass/fail bool with the numbers only
+  ever printed to a text log."""
   jax_dtype = jnp.float32 if variant == "fp32" else jnp.bfloat16
   atol, rtol = TOLERANCES[variant]
 
@@ -232,10 +240,20 @@ def run_one(bundle_dir: pathlib.Path, config, variant: str, implementation: str)
       )
   except NotImplementedError as e:
     print(f"[kv4] implementation={implementation!r}: SKIPPED ({e}) -- not counted as a pass")
-    return False
+    return False, {"_skipped": {"reason": str(e), "ok": False}}
+
+  stage_results: dict[str, dict] = {}
 
   def compare(name: str, golden: np.ndarray, ours: np.ndarray, exact: bool = False) -> bool:
-    return _compare(name, golden, ours, exact=exact, atol=atol, rtol=rtol)
+    ok = _compare(name, golden, ours, exact=exact, atol=atol, rtol=rtol)
+    if golden.shape != ours.shape:
+      stage_results[name] = {"shape_mismatch": True, "ok": False}
+    elif exact:
+      stage_results[name] = {"exact_match": ok, "ok": ok}
+    else:
+      max_abs = float(np.abs(golden.astype(np.float64) - ours.astype(np.float64)).max()) if golden.size else 0.0
+      stage_results[name] = {"max_abs_diff": max_abs, "ok": ok}
+    return ok
 
   all_ok = True
 
@@ -288,7 +306,7 @@ def run_one(bundle_dir: pathlib.Path, config, variant: str, implementation: str)
   all_ok &= compare("final_output", golden_final, np.asarray(final_output))
 
   print(f"[kv4] variant={variant} implementation={implementation!r}: {'ALL STAGES MATCH' if all_ok else 'MISMATCH DETECTED'}")
-  return all_ok
+  return all_ok, stage_results
 
 
 BUNDLE_DIR_MOSAIC_FP32 = _HERE / "golden_bundle_mosaic_fp32"
@@ -345,12 +363,21 @@ if __name__ == "__main__":
       "(mosaic/mosaic_tpu_v2 can't run at all below the 128-tiling floor, so testing them "
       "against the small bundle would just report an expected NotImplementedError as FAIL)",
   )
+  parser.add_argument(
+      "--json-output",
+      type=pathlib.Path,
+      default=None,
+      help="if given, write correctness.json there with per-(bundle_set,variant,implementation) "
+      "per-stage results -- added 2026-09-02 so the real numbers don't only ever live in a text "
+      "log",
+  )
   args = parser.parse_args()
 
   bundle_sets = ["small", "mosaic", "mosaic_wide"] if args.bundle_set == "both" else [args.bundle_set]
   variants = ["fp32", "bf16"] if args.variant == "both" else [args.variant]
 
   all_ok = True
+  all_results: dict[str, dict] = {}
   for bset in bundle_sets:
     spec = BUNDLE_SETS[bset]
     implementations = (
@@ -361,7 +388,14 @@ if __name__ == "__main__":
     for v in variants:
       bundle_dir, config = spec[v]
       for impl in implementations:
-        all_ok = run_one(bundle_dir, config, v, impl) and all_ok
+        ok, stage_results = run_one(bundle_dir, config, v, impl)
+        all_ok = ok and all_ok
+        all_results[f"{bset}__{v}__{impl}"] = {"all_ok": ok, "stages": stage_results}
+
+  if args.json_output is not None:
+    args.json_output.parent.mkdir(parents=True, exist_ok=True)
+    args.json_output.write_text(json.dumps(all_results, indent=2), encoding="utf-8")
+    print(f"\n[kv4] structured per-stage results written to {args.json_output}")
 
   print(f"\n[kv4] {'ALL PASS' if all_ok else 'AT LEAST ONE MISMATCH/SKIP'}")
   sys.exit(0 if all_ok else 1)
