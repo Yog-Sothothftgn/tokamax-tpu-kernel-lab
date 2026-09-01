@@ -91,10 +91,22 @@ TPU v6e using `tokamax.ragged_dot`.
   (every step correctly attempted and logged; the real steps all FAIL here
   since this machine has neither a TPU nor tokamax installed) -- the
   actual PASS/FAIL results are only meaningful once run on a v6e VM.
+- **WP-KV6 (real checkpoint) prep**, without downloading the actual
+  ~17GB-per-layer shard: the exact MXFP4 weight-field mapping for one MoE
+  layer (confirmed against the real cached official source, not guessed --
+  see `06_kimi_k3_golden_validation/prepare_real_checkpoint_layer.py`),
+  which tensors need dequantization (routed-expert `w1`/`w2`/`w3` only),
+  the extraction-script interface, the metadata/hash format, disk/memory
+  requirements, and a real (not hand-rolled) MXFP4 dequantization round-trip
+  verified locally against a small synthetic tensor using the actual
+  `compressed-tensors` library.
 
 **Not yet covered:**
 - The real, MXFP4-quantized Kimi K3 checkpoint weights (bundles so far use
-  random weight init).
+  random weight init) -- the extraction pipeline is designed and its
+  dequantization step verified (see above), but the actual checkpoint shard
+  has not been downloaded and `extract_moe_layer_from_shard` is not yet
+  runnable.
 - Actual multi-device/multi-chip execution (everything so far has run on a
   single chip; the sharded routing above proves the per-shard math is
   correct, not that multiple chips actually combine their contributions
@@ -280,6 +292,61 @@ spec, not independently confirmed by a real device query in this project --
 `memory_budget_estimate.py`'s `__main__` prints the `jax.devices()[0].memory_stats()`
 snippet needed to get the real number next time a TPU VM is available.
 
+## Real checkpoint validation prep (`prepare_real_checkpoint_layer.py`)
+
+Preparation for WP-KV6 (validating against the real, MXFP4-quantized Kimi
+K3 checkpoint, not the random-init bundles used everywhere else) -- done
+without downloading the actual checkpoint, so that step doesn't need
+designing from scratch whenever the ~17GB-per-layer shard (or server
+resources to hold it) become available.
+
+**Weight field mapping**, confirmed directly against the cached, hash-verified
+official source (`official_kimi_k3/modeling_kimi_linear.py`), not guessed:
+for MoE layer `{i}` (`i >= 1` -- layer 0 is dense, not MoE), under
+`model.layers.{i}.block_sparse_moe.`:
+
+| Component | Key | Quantized? |
+|---|---|---|
+| Router weight | `gate.weight` | No (plain bf16) |
+| Router bias | `gate.e_score_correction_bias` | No |
+| Down projection | `routed_expert_down_proj.weight` | No |
+| Up projection | `routed_expert_up_proj.weight` | No |
+| RMSNorm scale | `routed_expert_norm.weight` | No |
+| Shared experts | `shared_experts.{gate,up,down}_proj.weight` | No |
+| Routed expert gate (w1) | `experts.{e}.w1.weight_packed` + `.weight_scale` | **Yes -- MXFP4** |
+| Routed expert up (w3) | `experts.{e}.w3.weight_packed` + `.weight_scale` | **Yes -- MXFP4** |
+| Routed expert down (w2) | `experts.{e}.w2.weight_packed` + `.weight_scale` | **Yes -- MXFP4** |
+
+**Dequantization**: verified locally using the real
+[`compressed-tensors`](https://github.com/vllm-project/compressed-tensors)
+library (`MXFP4PackedCompressor`, format `mxfp4-pack-quantized`,
+`num_bits=4`, `group_size=32`) -- not a hand-rolled bit-unpacker. A synthetic
+round-trip test (random weight -> quantize -> pack -> the real library's
+`decompress()` -> compare) confirms the calling convention is correct;
+production-scale numerical accuracy against real trained weights is a
+separate question this test doesn't (and can't, without the real weights)
+answer.
+
+**Disk / memory requirements** (from WP-KV1's already-confirmed real
+measurements, 2026-08-26): one shard holds one full layer (~17GB), 96
+shards total (~1.42TiB / ~1.56TB decimal). Dequantizing all 896 experts'
+routed weights for one layer at once needs ~55GB in bf16 -- would OOM a
+single chip, same figure already confirmed elsewhere in this project for
+random-init weights. Restricting to this project's established
+single-chip-shard scope instead:
+
+| local_num_experts | Dequantized memory |
+|---:|---:|
+| 64 | ~3.9GB |
+| 32 | ~2.0GB |
+| 16 | ~1.0GB |
+
+**Not yet done** (needs the real checkpoint): `extract_moe_layer_from_shard`'s
+actual implementation (interface + exact logic written, raises
+`NotImplementedError` until a real shard is available), and downloading a
+shard at all -- this file only proves the pipeline it will run is
+correctly designed and its dequantization step actually works.
+
 ## Reproducing
 
 **Local routing unit tests** (no TPU needed, run this any time -- also the
@@ -290,6 +357,14 @@ caught before spending real VM time on it):
 cd 05_ragged_dot_on_tpu
 python test_sharded_routing_local.py
 python memory_budget_estimate.py
+```
+
+**Real checkpoint prep check** (no TPU needed, needs the `.venv_torch`-style
+environment with `torch` + `compressed-tensors`, not the jax/tokamax one):
+
+```bash
+cd 06_kimi_k3_golden_validation
+python prepare_real_checkpoint_layer.py
 ```
 
 **One-shot TPU VM entry point**: once golden bundles exist (step 2 below,
@@ -365,6 +440,10 @@ python kimi_k3_latent_moe_ragged_dot.py --wp4-profile  # same A/B/D, C is the RE
   `06_kimi_k3_golden_validation/official_kimi_k3/` (not redistributed here,
   since its license is not ours to redistribute -- see
   `validate_official_config.py`).
+- **Real checkpoint prep** (`prepare_real_checkpoint_layer.py`, no TPU
+  needed): `torch` + `compressed-tensors` (`compressed-tensors==0.18.0`
+  tested). Actually running `extract_moe_layer_from_shard` will additionally
+  need `safetensors` and the real checkpoint shard(s), neither available yet.
 
 ## References
 
