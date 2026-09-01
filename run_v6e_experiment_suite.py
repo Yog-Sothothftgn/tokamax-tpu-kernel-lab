@@ -28,10 +28,14 @@ Runs, in order:
   5. Latency sweep under the REAL routing distribution (not the dense/
      uniform simplification the earlier benchmark used).
   6. Direct, same-device, element-wise comparison of xla/mosaic/
-     mosaic_tpu_v2's bf16 outputs against EACH OTHER -- not just each vs.
-     the golden PyTorch reference separately (closes a long-flagged gap:
-     prior "shared bf16 precision effect" conclusions were only ever an
-     inference from matching summary statistics across separate runs).
+     mosaic_tpu_v2's bf16 outputs against EACH OTHER, across all 18 staged
+     intermediates -- not just each vs. the golden PyTorch reference
+     separately (closes a long-flagged gap: prior "shared bf16 precision
+     effect" conclusions were only ever an inference from matching summary
+     statistics across separate runs). Saves each implementation's full
+     raw output bundle to <name>_outputs.npz under this step's own
+     subdirectory of --output-dir, so the raw tensors can be re-examined
+     later without a TPU.
   7. The full existing golden-validation battery: every bundle set (small/
      mosaic/mosaic_wide) x every dtype (fp32/bf16) x every implementation
      (xla/mosaic/mosaic_tpu_v2) -- the broadest correctness sweep this
@@ -204,9 +208,15 @@ def main(output_dir: pathlib.Path) -> None:
   ))
 
   # Step 6: direct same-device bf16 cross-implementation comparison.
+  # --output-dir is passed as an ABSOLUTE path -- this subprocess's cwd is
+  # _GOLDEN_DIR, not wherever this orchestrator itself was invoked from, so
+  # a relative path here would land somewhere unintended.
+  bf16_npz_dir = (output_dir / "bf16_direct_compare_outputs").resolve()
   results.append(_run_step(
       "bf16_cross_implementation_direct_compare", _GOLDEN_DIR,
-      [sys.executable, "compare_bf16_implementations_direct.py", "--bundle-set", "mosaic_wide"], output_dir,
+      [sys.executable, "compare_bf16_implementations_direct.py", "--bundle-set", "mosaic_wide",
+       "--output-dir", str(bf16_npz_dir)],
+      output_dir,
   ))
 
   # Step 7: the full existing golden-validation battery (every bundle set x

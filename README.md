@@ -66,12 +66,20 @@ TPU v6e using `tokamax.ragged_dot`.
   `profile_four_stages_wp4` is the same A/B/D functions plus the REAL
   `tokamax.ragged_dot` for Stage C -- written, not yet run on hardware.
 - A direct, same-device, element-wise comparison of `xla`/`mosaic`/
-  `mosaic_tpu_v2`'s bf16 outputs against EACH OTHER
-  (`compare_bf16_implementations_direct.py`) -- every prior "shared bf16
-  precision effect" conclusion was only ever inferred from matching
-  max-abs-diff *summary statistics* computed in separate runs against the
-  golden reference, never a direct tensor diff between the implementations'
-  own outputs in one run. Written 2026-08-28, not yet run on hardware.
+  `mosaic_tpu_v2`'s bf16 outputs against EACH OTHER, across all 18 staged
+  intermediates (`compare_bf16_implementations_direct.py`) -- every prior
+  "shared bf16 precision effect" conclusion was only ever inferred from
+  matching max-abs-diff *summary statistics* computed in separate runs
+  against the golden reference, never a direct tensor diff between the
+  implementations' own outputs in one run. Saves each implementation's full
+  raw output bundle to `<name>_outputs.npz` so the tensors can be
+  re-examined later without a TPU, and prints an explicit verdict: if every
+  pair is bit-identical at the 4 previously-flagged stages, that's real
+  evidence of a shared PyTorch-vs-TPU precision effect rather than a
+  kernel-specific bug (three independently-coded kernels landing on the
+  exact same bits by coincidence of a shared bug is far less likely than
+  landing on the same bits via the same underlying bf16 MXU behavior).
+  Written 2026-08-28, not yet run on hardware.
 - **`run_v6e_experiment_suite.py`**: a one-shot entry point running the
   full battery above (env check, snapshot verification, sharded
   correctness, realistic-distribution latency, direct bf16 comparison, the
@@ -320,8 +328,9 @@ python test_ragged_dot_against_pytorch_golden.py \
   --bundle-set both --variant both --implementation all
 
 # 5. Direct, same-device, element-wise comparison of the three
-#    implementations' bf16 outputs against each other (needs a TPU VM).
-python compare_bf16_implementations_direct.py --bundle-set mosaic_wide
+#    implementations' bf16 outputs against each other, across all 18
+#    stages -- saves <name>_outputs.npz per implementation (needs a TPU VM).
+python compare_bf16_implementations_direct.py --bundle-set mosaic_wide --output-dir bf16_direct_compare_outputs
 
 # 6. Latency across multiple batch sizes/sequence lengths (also needs a TPU VM).
 cd ../05_ragged_dot_on_tpu
