@@ -17,6 +17,10 @@ Runs, in order:
      reference. Runs first and fast specifically so an ordinary logic
      regression is caught here, before any of the expensive TPU-dependent
      steps below spend real VM time on it.
+  2b. Memory budget estimate (also CPU-only, no TPU needed): a theoretical
+      lower-bound byte-count table (weight/activation/padding memory per
+      batch_size/seq_len shape) flagging which shapes are likely to OOM
+      before any of them are actually attempted below.
   3. Official Kimi K3 source snapshot verification (hash-checked against
      the pinned commit).
   4. Sharded ragged_dot correctness (the real 16-of-896-then-filtered-to-
@@ -166,6 +170,15 @@ def main(output_dir: pathlib.Path) -> None:
   results.append(_run_step(
       "local_sharded_routing_edge_cases", _RAGGED_DOT_DIR,
       [sys.executable, "test_sharded_routing_local.py"], output_dir,
+  ))
+
+  # Step 2b: memory budget estimate -- also CPU-only/no TPU needed, prints
+  # the theoretical (lower-bound) memory table for the shapes about to be
+  # exercised below, so an OOM-prone shape is flagged before the expensive
+  # steps hit it for real.
+  results.append(_run_step(
+      "memory_budget_estimate", _RAGGED_DOT_DIR,
+      [sys.executable, "memory_budget_estimate.py"], output_dir,
   ))
 
   # Step 3: official snapshot verification.

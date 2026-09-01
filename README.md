@@ -35,6 +35,11 @@ TPU v6e using `tokamax.ragged_dot`.
   first/last shard, batch/seq invariance, fp32/bf16 dtype promotion, and
   the sharded-sum-vs-reference check across several configs (not just one)
   -- all pass. See `05_ragged_dot_on_tpu/test_sharded_routing_local.py`.
+- A theoretical (lower-bound) memory budget estimate for the sharded
+  pipeline at real Kimi K3 dims, across a wide batch/seq sweep, so
+  OOM-prone shapes are flagged before ever attempting them on hardware --
+  see `05_ragged_dot_on_tpu/memory_budget_estimate.py` and the Memory
+  budget section below.
 
 **In progress / open:**
 - bf16 on `xla`/`mosaic` (v1)/`mosaic_tpu_v2` shows a tolerance-exceeding
@@ -227,6 +232,46 @@ Observations:
   read as "heuristic-config latency," not a ceiling on Mosaic's achievable
   performance.
 
+## Memory budget (`memory_budget_estimate.py`)
+
+Theoretical (lower-bound) memory estimate for the sharded pipeline at real
+Kimi K3 dims (`local_num_experts=64`, bf16, `capacity_factor=2.0`), computed
+without any TPU -- exact byte counts for every named tensor the pipeline
+actually holds, deliberately excluding compiler-managed temporaries (upcast
+copies, Pallas double-buffering, XLA scratch), so this is a genuine floor:
+if the estimate already exceeds available HBM, the real run definitely
+OOMs; staying under it is not a guarantee.
+
+Weight memory is constant across shapes: **~4.46GB** (`expert_gate`/`up`/
+`down` at ~1.33GB each dominate; router/projection/shared-expert weights
+are a few hundred MB combined).
+
+| Tokens | Local assignments | Weight memory | Activation memory | Padding memory | Estimated total |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 146.3 | 4457.3MB | 26.1MB | 3.3MB | 4.38GB |
+| 2,048 | 2,340.6 | 4457.3MB | 374.0MB | 32.8MB | 4.74GB |
+| 8,192 | 9,362.3 | 4457.3MB | 1,492.0MB | 129.3MB | 5.89GB |
+| 32,768 | 37,449.1 | 4457.3MB | 5,960.0MB | 513.5MB | 10.50GB |
+| 131,072 | 149,796.6 | 4457.3MB | 23,828.0MB | 2,048.8MB | 28.94GB |
+| 262,144 | 299,593.1 | 4457.3MB | 47,656.0MB | 4,097.5MB | **53.53GB -- OOM** |
+
+(Full sweep, including the `(batch_size, seq_len)` pairs already used
+elsewhere in this README, in `memory_budget_estimate.py`'s output --
+`(1,2048)`/`(2,1024)` and `(1,4096)`/`(4,1024)` give identical rows, the
+same batch/seq invariance already confirmed for latency.)
+
+**Every shape actually used in this project's existing latency sweeps fits
+comfortably** (well under 6GB up to `num_tokens=8192`); the estimate only
+crosses the assumed 32GB v6e HBM ceiling somewhere between `num_tokens=
+131,072` and `262,144` -- a useful upper bound for how far a future
+batch/seq sweep could push before needing to worry about OOM, though the
+real (non-lower-bound) threshold will be lower than this.
+
+**Caveat**: the 32GB per-chip HBM figure is a public TPU v6e (Trillium)
+spec, not independently confirmed by a real device query in this project --
+`memory_budget_estimate.py`'s `__main__` prints the `jax.devices()[0].memory_stats()`
+snippet needed to get the real number next time a TPU VM is available.
+
 ## Reproducing
 
 **Local routing unit tests** (no TPU needed, run this any time -- also the
@@ -236,6 +281,7 @@ caught before spending real VM time on it):
 ```bash
 cd 05_ragged_dot_on_tpu
 python test_sharded_routing_local.py
+python memory_budget_estimate.py
 ```
 
 **One-shot TPU VM entry point**: once golden bundles exist (step 2 below,
