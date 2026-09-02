@@ -153,6 +153,7 @@ from kimi_k3_latent_moe_reference import (  # noqa: E402
     kimi_k3_config,
     latent_moe_forward,
     route_and_filter_to_local_shard,
+    router_and_projection,
     toy_config,
 )
 
