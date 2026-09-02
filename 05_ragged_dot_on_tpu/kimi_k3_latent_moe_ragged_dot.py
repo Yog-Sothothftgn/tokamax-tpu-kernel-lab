@@ -730,6 +730,25 @@ def profile_four_stages_wp4(
   comparable between a CPU run and this TPU run -- only Stage C differs
   (real ragged_dot here vs. a dense-matmul stand-in there).
 
+  **Second important caveat, flagged by a reviewer (2026-09-02) after reading a
+  real hardware run's result: `implementation=None` does NOT mean "a fast
+  default" -- confirmed via tokamax's own source
+  (`tokamax/_src/ops/ragged_dot/api.py`): `None` resolves to
+  `_DEFAULT_IMPLEMENTATIONS`, which on a TPU platform is `("mosaic", "xla")` --
+  and `"mosaic"` maps to `mosaic_tpu` (Mosaic v1, NOT `mosaic_tpu_v2`). Since
+  v1 does not raise `NotImplementedError` at realistic-shard shapes (M_padded
+  well above the 128 tiling floor), it is used, and `"xla"` is never tried.
+  Stage C's measured time under the default is therefore Mosaic v1's (the
+  slow, unautotuned backend already known from every other benchmark in this
+  project to be ~15-25x slower than xla/mosaic_tpu_v2) -- NOT the fast
+  `mosaic_tpu_v2` backend this project's other benchmarks favor. Any
+  `irregular_share` computed under the default is inflated toward
+  looking-small precisely because Stage C is being padded out by a slow
+  backend -- it says nothing about whether dispatch/combine matter once Stage
+  C is on a fast backend. Always pass `implementation` explicitly (`"xla"` or
+  `"mosaic_tpu_v2"`) for any conclusion that compares Stage C against B/D --
+  never rely on the default for this specific measurement.**
+
   **Important caveat, flagged by a reviewer (2026-09-02), NOT yet fixed --
   Stage B is not timed on a fair, device-only basis compared to A/C/D**:
   A, C, and D are all timed via a jitted, compiled, repeated-call loop
@@ -764,6 +783,13 @@ def profile_four_stages_wp4(
   the full 896-expert weight tensors, ~59GB, the OOM already documented
   elsewhere in this project). Only router/down_proj (small, hidden_size-scale)
   and this shard's own `local_num_experts + 1` expert rows are allocated.
+
+  **Third caveat**: Stage C being the largest measured time does not by
+  itself prove the expert matmul is MXU-compute-bound -- it could equally be
+  limited by weight HBM read bandwidth, padding overhead (`M_padded` includes
+  a padding bucket, see `filter_and_pad_to_shard`), or tiling/kernel-launch
+  efficiency. Distinguishing these needs a real profiler trace (e.g.
+  `jax.profiler`), not just wall-clock timing -- not attempted here.
 
   Has a real tokamax dependency and CANNOT be verified locally -- must run
   on the v6e TPU VM. Do not trust its output until it has actually executed
@@ -859,6 +885,14 @@ def profile_four_stages_wp4(
       "stage_d_combine_ms": stage_d_ms,
       "irregular_share_of_total": irregular_share,
   }
+  if implementation is None:
+    print(
+        "[wp4-profile-tpu] WARNING: implementation=None resolves to tokamax's own default "
+        "preference order, which on TPU is ('mosaic', 'xla') -- 'mosaic' maps to Mosaic v1 "
+        "(mosaic_tpu), NOT mosaic_tpu_v2. Stage C below is therefore Mosaic v1's (slow, "
+        "unautotuned) timing, not the fast mosaic_tpu_v2 backend. Pass --wp4-implementation "
+        "xla or mosaic_tpu_v2 explicitly for a meaningful B/D-vs-C comparison."
+    )
   print(
       f"[wp4-profile-tpu] num_tokens={num_tokens} implementation={implementation!r} "
       f"A(router+proj)={stage_a_ms:.3f}ms B(dispatch-idx, EAGER-timed)={stage_b_ms:.3f}ms "
@@ -1312,6 +1346,16 @@ if __name__ == "__main__":
       "CPU-only, dense-matmul-stand-in version of the same 4 stages.",
   )
   parser.add_argument(
+      "--wp4-implementation",
+      type=str,
+      default=None,
+      choices=["xla", "mosaic", "mosaic_tpu_v2"],
+      help="ragged_dot backend for --wp4-profile's Stage C. Leaving this unset resolves to "
+      "tokamax's own default preference order, which on TPU tries Mosaic v1 BEFORE xla -- see "
+      "profile_four_stages_wp4's docstring caveat. Pass 'xla' or 'mosaic_tpu_v2' explicitly for "
+      "any conclusion comparing Stage C's cost against Stage B/D.",
+  )
+  parser.add_argument(
       "--output-dir",
       type=pathlib.Path,
       default=None,
@@ -1376,4 +1420,4 @@ if __name__ == "__main__":
     run_realistic_shard_latency_sweep(output_dir=args.output_dir)
 
   if args.wp4_profile:
-    profile_four_stages_wp4(output_dir=args.output_dir)
+    profile_four_stages_wp4(implementation=args.wp4_implementation, output_dir=args.output_dir)

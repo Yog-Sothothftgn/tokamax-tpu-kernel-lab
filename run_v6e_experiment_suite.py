@@ -367,13 +367,20 @@ def main(output_dir: pathlib.Path) -> bool:
         output_dir,
     ))
 
-  # Step 8: WP4's real 4-stage profiling.
-  results.append(_run_step(
-      "wp4_four_stage_profiling", _RAGGED_DOT_DIR,
-      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp4-profile",
-       "--output-dir", str(output_dir.resolve())],
-      output_dir,
-  ))
+  # Step 8: WP4's real 4-stage profiling. Runs once per EXPLICIT implementation
+  # -- never relying on --wp4-implementation's default, since tokamax's own
+  # `implementation=None` resolution order tries Mosaic v1 before xla on TPU
+  # (confirmed via tokamax/_src/ops/ragged_dot/api.py), which would silently
+  # profile the slow, unautotuned backend and understate Stage B/D's relative
+  # cost against a fast Stage C.
+  for wp4_impl in ("xla", "mosaic_tpu_v2"):
+    results.append(_run_step(
+        f"wp4_four_stage_profiling__{wp4_impl}", _RAGGED_DOT_DIR,
+        [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp4-profile",
+         "--wp4-implementation", wp4_impl,
+         "--output-dir", str(output_dir.resolve())],
+        output_dir,
+    ))
 
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
