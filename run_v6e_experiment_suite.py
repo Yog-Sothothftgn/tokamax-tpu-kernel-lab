@@ -172,31 +172,62 @@ def _gce_metadata(path: str) -> str | None:
     return None
 
 
+_JAX_TOKAMAX_PROBE = """
+import json
+info = {}
+try:
+    import jax
+    info['jax_version'] = jax.__version__
+    info['jax_devices'] = [str(d) for d in jax.devices()]
+    try:
+        info['tpu_device_kind'] = jax.devices()[0].device_kind
+    except Exception:
+        pass
+except Exception as e:
+    info['jax_error'] = str(e)
+try:
+    import jaxlib
+    info['jaxlib_version'] = jaxlib.__version__
+except Exception as e:
+    info['jaxlib_error'] = str(e)
+try:
+    import tokamax
+    info['tokamax_version'] = getattr(tokamax, '__version__', 'unknown')
+except Exception as e:
+    info['tokamax_error'] = str(e)
+print(json.dumps(info))
+"""
+
+
+def _probe_jax_tokamax_env() -> dict:
+  """Query jax/jaxlib/tokamax/TPU-device info in a SEPARATE, throwaway process.
+
+  Must NEVER `import jax` in the orchestrator's own long-lived process:
+  `jax.devices()` initializes the PJRT TPU client and claims the TPU for that
+  process's entire lifetime (a v6e chip allows exactly one process at a time).
+  Confirmed on real hardware (2026-09-02): the orchestrator process itself
+  held the TPU after this check ran in-process, so every subsequent per-step
+  subprocess failed with `ABORTED: The TPU is already in use by process with
+  pid <orchestrator-pid>`. Probing in a subprocess that exits immediately
+  releases the TPU before any real step needs it.
+  """
+  try:
+    proc = subprocess.run(
+        [sys.executable, "-c", _JAX_TOKAMAX_PROBE],
+        capture_output=True, text=True, timeout=60,
+    )
+    line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    return json.loads(line)
+  except Exception as e:  # noqa: BLE001 -- recording the failure itself is the point
+    return {"jax_error": f"failed to probe jax/tokamax in subprocess: {e}"}
+
+
 def _env_info() -> dict:
   info: dict = {
       "python_version": platform.python_version(),
       "platform": platform.platform(),
   }
-  try:
-    import jax
-    info["jax_version"] = jax.__version__
-    info["jax_devices"] = [str(d) for d in jax.devices()]
-    try:
-      info["tpu_device_kind"] = jax.devices()[0].device_kind
-    except Exception:  # noqa: BLE001
-      pass
-  except Exception as e:  # noqa: BLE001 -- recording the failure itself is the point
-    info["jax_error"] = str(e)
-  try:
-    import jaxlib
-    info["jaxlib_version"] = jaxlib.__version__
-  except Exception as e:  # noqa: BLE001
-    info["jaxlib_error"] = str(e)
-  try:
-    import tokamax
-    info["tokamax_version"] = getattr(tokamax, "__version__", "unknown")
-  except Exception as e:  # noqa: BLE001
-    info["tokamax_error"] = str(e)
+  info.update(_probe_jax_tokamax_env())
 
   info["kernel_lab_git_commit"] = _git_commit(_HERE)
   info["tokamax_git_commit"] = _git_commit(pathlib.Path.home() / "tokamax")
@@ -256,7 +287,7 @@ def main(output_dir: pathlib.Path) -> bool:
   # Step 1: environment/device check.
   env = _env_info()
   (output_dir / "environment.json").write_text(json.dumps(env, indent=2), encoding="utf-8")
-  env_ok = bool(env.get("jax_devices")) and any("Tpu" in d for d in env.get("jax_devices", []))
+  env_ok = bool(env.get("jax_devices")) and any("tpu" in d.lower() for d in env.get("jax_devices", []))
   print(f"[suite] environment: {json.dumps(env, indent=2)}")
   results.append({
       "name": "environment_check",

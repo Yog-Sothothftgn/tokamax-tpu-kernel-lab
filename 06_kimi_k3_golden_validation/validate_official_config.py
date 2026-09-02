@@ -34,7 +34,7 @@ REPO = "moonshotai/Kimi-K3"
 DEFAULT_COMMIT = "a590ce090cb049c93a33dfe8c208ec652aa20503"
 OUT_DIR = pathlib.Path(__file__).parent / "official_kimi_k3"
 
-FILES = ("config.json", "modeling_kimi_linear.py")
+FILES = ("config.json", "modeling_kimi_linear.py", "configuration_kimi_k3.py")
 
 # Confirmed by direct fetch of config.json's `text_config` on 2026-08-26 (see
 # project memory / this session's feasibility pre-check) -- update this dict
