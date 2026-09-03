@@ -162,14 +162,24 @@ def _write_csv(path: pathlib.Path, rows: list[dict], fieldnames: list[str]) -> N
   """Shared structured-output helper: writes benchmark/profiling results as
   CSV (not just printed to stdout, which prior versions of these functions
   only did -- a reviewer pointed out that meant every real number lived
-  only in a text log, needing manual transcription later)."""
+  only in a text log, needing manual transcription later).
+
+  Appends (header written only if the file doesn't already exist yet) rather
+  than truncating -- a real bug until 2026-09-03: profile_four_stages_wp4 is
+  now invoked once per explicit --wp4-implementation by
+  run_v6e_experiment_suite.py, both writing to the same wp4_profiling.csv;
+  under the old truncate-on-every-call behavior the second invocation
+  silently erased the first's row (confirmed on real hardware -- only the
+  later-run mosaic_tpu_v2 row survived, the earlier xla row vanished)."""
   path.parent.mkdir(parents=True, exist_ok=True)
-  with path.open("w", newline="", encoding="utf-8") as f:
+  write_header = not path.exists()
+  with path.open("a", newline="", encoding="utf-8") as f:
     writer = _csv.DictWriter(f, fieldnames=fieldnames)
-    writer.writeheader()
+    if write_header:
+      writer.writeheader()
     for row in rows:
       writer.writerow(row)
-  print(f"  (structured data written to {path})")
+  print(f"  (structured data appended to {path})")
 
 
 def latent_moe_forward_ragged_dot(
