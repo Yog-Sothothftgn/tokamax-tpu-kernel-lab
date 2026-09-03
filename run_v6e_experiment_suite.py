@@ -382,6 +382,18 @@ def main(output_dir: pathlib.Path) -> bool:
         output_dir,
     ))
 
+  # Step 8b: WP4 Stage B host/device attribution (2026-09-03 plan) -- does
+  # NOT rewrite filter_and_pad_to_shard, only attributes its ~7.5ms eager
+  # cost via an instrumented mirror plus a real jax.profiler trace. See
+  # profile_dispatch_host_device_attribution's docstring.
+  results.append(_run_step(
+      "wp4_dispatch_host_device_attribution", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp4-dispatch-attribution",
+       "--wp4-dispatch-trace-dir", str((output_dir / "dispatch_traces").resolve()),
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]
