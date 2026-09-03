@@ -140,6 +140,7 @@ Usage:
 
 import dataclasses
 import functools
+import time
 
 import jax
 import jax.numpy as jnp
@@ -749,6 +750,177 @@ def filter_and_pad_to_shard(
   )
 
 
+def _filter_and_pad_to_shard_instrumented(
+    topk_idx: jax.Array,
+    topk_weight: jax.Array,
+    x: jax.Array,
+    config: LatentMoEConfig,
+    local_expert_start: int,
+    local_num_experts: int,
+    capacity_factor: float = 2.0,
+    tile_size: int = _MOSAIC_TILE_SIZE,
+) -> tuple[tuple[jax.Array, ...], dict]:
+  """WP4 host/device attribution ONLY (2026-09-03 plan) -- a byte-for-byte
+  mirror of `filter_and_pad_to_shard` above, with `time.perf_counter()`/
+  `jax.block_until_ready()` checkpoints inserted between its EXISTING
+  internal boundaries. Never used by any production/benchmark code path and
+  never replaces the real function -- inserting timing directly into
+  `filter_and_pad_to_shard` itself would change what's being measured (extra
+  `block_until_ready` calls are not part of its real eager-call cost as
+  used elsewhere). Every line of actual computation here is copy-identical
+  to `filter_and_pad_to_shard`'s -- ONLY checkpoint calls are added -- and
+  `check_dispatch_instrumented_matches_baseline` below proves this claim by
+  diffing outputs bit-for-bit against the real function, rather than just
+  asserting it in a comment.
+
+  Four measured phases, chosen to match natural boundaries already present
+  in the real function's data-dependent-shape structure (not arbitrary
+  cut points):
+    - `t_mask_filter_ms`: computing `in_shard` and the three boolean-mask
+      indexing operations (`kept_local_ids`/`kept_token_idx`/
+      `kept_combine_weight`) -- this is the FIRST forced host/device sync
+      point, since JAX must concretize `in_shard`'s value to know the
+      output length of a boolean-masked index. This is the real irregular
+      "which tokens landed in this shard" computation.
+    - `t_m_padded_scalar_ms`: `int(jnp.ceil(expected_total * capacity_factor))`
+      -- `expected_total` is pure Python arithmetic (config fields and
+      `capacity_factor` are plain Python values, not JAX arrays), but
+      `jnp.ceil` on a Python float still dispatches a real (if tiny) device
+      computation and `int(...)` forces a sync on it. This is isolated
+      specifically because it does NOT depend on any real routing data --
+      if it turns out non-negligible, it is pure avoidable overhead
+      (`math.ceil` would do the same thing with zero device involvement),
+      not evidence of anything intrinsic to dispatch/indexing cost.
+    - `t_issue_sort_gather_ms`: argsort + the three sorted-order indexing
+      ops + the overflow check + slicing + bincount + the `gathered = x[...]`
+      row-gather + the padding/concatenate calls that build the final
+      6 return arrays. All shapes are already concrete by this point, so
+      these are dispatched WITHOUT an explicit wait in between -- this
+      phase's wall-clock time is mostly host-side Python/tracing overhead
+      for issuing async device work, not device completion time.
+    - `t_final_sync_ms`: `jax.block_until_ready` on all 6 return arrays --
+      whatever device work from the previous phase was still in flight.
+
+  `t_mask_filter_ms + t_m_padded_scalar_ms + t_issue_sort_gather_ms +
+  t_final_sync_ms` should be close to `profile_four_stages_wp4`'s existing
+  eager-timed `stage_b_dispatch_indexing_ms` for the same inputs -- a sanity
+  cross-check, not a new "official" latency number. Per the 2026-09-03 plan:
+  this breakdown is for ATTRIBUTION only; the existing non-instrumented
+  eager timing remains what gets reported as dispatch latency.
+  """
+  compute_dtype = x.dtype
+  num_tokens = topk_idx.shape[0]
+  flat_expert_ids = topk_idx.reshape(-1)
+  token_of_slot = jnp.arange(num_tokens * config.top_k) // config.top_k
+  flat_combine_weight = topk_weight.reshape(-1)
+
+  local_end = local_expert_start + local_num_experts
+  in_shard = (flat_expert_ids >= local_expert_start) & (flat_expert_ids < local_end)
+
+  t0 = time.perf_counter()
+  kept_local_ids = flat_expert_ids[in_shard] - local_expert_start
+  kept_token_idx = token_of_slot[in_shard]
+  kept_combine_weight = flat_combine_weight[in_shard]
+  jax.block_until_ready((kept_local_ids, kept_token_idx, kept_combine_weight))
+  num_raw = kept_local_ids.shape[0]
+  t1 = time.perf_counter()
+
+  expected_total = num_tokens * config.top_k * local_num_experts / config.num_experts
+  m_padded = _round_up_to_tile(int(jnp.ceil(expected_total * capacity_factor)), tile_size)
+  t2 = time.perf_counter()
+
+  order = jnp.argsort(kept_local_ids)
+  sorted_local_ids = kept_local_ids[order]
+  sorted_token_idx = kept_token_idx[order]
+  sorted_combine_weight = kept_combine_weight[order]
+
+  if num_raw > m_padded:
+    keep_count = m_padded
+  else:
+    keep_count = num_raw
+
+  kept_sorted_local_ids = sorted_local_ids[:keep_count]
+  kept_sorted_token_idx = sorted_token_idx[:keep_count]
+  kept_sorted_combine_weight = sorted_combine_weight[:keep_count]
+
+  per_expert_counts = jnp.bincount(kept_sorted_local_ids, length=local_num_experts).astype(jnp.int32)
+  pad_size = m_padded - keep_count
+  group_sizes = jnp.concatenate([per_expert_counts, jnp.array([pad_size], dtype=jnp.int32)])
+
+  gathered = x[kept_sorted_token_idx]
+  pad_tokens = jnp.zeros((pad_size, x.shape[-1]), dtype=x.dtype)
+  sorted_tokens = jnp.concatenate([gathered, pad_tokens], axis=0)
+
+  valid_mask = jnp.concatenate(
+      [jnp.ones((keep_count,), dtype=jnp.bool_), jnp.zeros((pad_size,), dtype=jnp.bool_)]
+  )
+  padded_token_idx = jnp.concatenate(
+      [kept_sorted_token_idx.astype(jnp.int32), -jnp.ones((pad_size,), dtype=jnp.int32)]
+  )
+  padded_combine_weight = jnp.concatenate(
+      [kept_sorted_combine_weight, jnp.zeros((pad_size,), dtype=compute_dtype)]
+  )
+  t3 = time.perf_counter()
+
+  outputs = (
+      sorted_tokens, group_sizes, valid_mask, per_expert_counts,
+      padded_token_idx, padded_combine_weight,
+  )
+  jax.block_until_ready(outputs)
+  t4 = time.perf_counter()
+
+  timings = {
+      "t_mask_filter_ms": (t1 - t0) * 1000,
+      "t_m_padded_scalar_ms": (t2 - t1) * 1000,
+      "t_issue_sort_gather_ms": (t3 - t2) * 1000,
+      "t_final_sync_ms": (t4 - t3) * 1000,
+  }
+  return outputs, timings
+
+
+def check_dispatch_instrumented_matches_baseline(seed: int = 0) -> bool:
+  """Proves `_filter_and_pad_to_shard_instrumented` is byte-for-byte
+  identical to the real `filter_and_pad_to_shard` before it is ever trusted
+  for timing -- required precisely because it is a manually-copied mirror,
+  and this project has already been bitten twice by transcription bugs in
+  hand-copied code (see project memory). CPU-only, no tokamax/TPU needed.
+  """
+  config = toy_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 3)
+  num_tokens = 64
+  global_num_experts = 32
+  local_expert_start = 5
+  local_num_experts = 8
+
+  topk_idx = jax.random.randint(keys[0], (num_tokens, config.top_k), 0, global_num_experts)
+  topk_weight = jax.random.uniform(keys[1], (num_tokens, config.top_k), dtype=jnp.float32)
+  x = jax.random.normal(keys[2], (num_tokens, config.latent_size), dtype=jnp.bfloat16)
+
+  baseline = filter_and_pad_to_shard(
+      topk_idx, topk_weight, x, config=config,
+      local_expert_start=local_expert_start, local_num_experts=local_num_experts,
+  )
+  instrumented_outputs, timings = _filter_and_pad_to_shard_instrumented(
+      topk_idx, topk_weight, x, config=config,
+      local_expert_start=local_expert_start, local_num_experts=local_num_experts,
+  )
+
+  all_ok = True
+  for name, base_arr, instr_arr in zip(
+      ("sorted_tokens", "group_sizes", "valid_mask", "per_expert_counts",
+       "padded_token_idx", "padded_combine_weight"),
+      baseline, instrumented_outputs,
+  ):
+    exact_match = bool(jnp.array_equal(base_arr, instr_arr))
+    print(f"[dispatch-instrumented-check] {name}: exact_match={exact_match}")
+    all_ok = all_ok and exact_match
+
+  print(f"[dispatch-instrumented-check] timings (single warm call, not for reporting): {timings}")
+  print(f"[dispatch-instrumented-check] {'ALL OUTPUTS MATCH' if all_ok else 'MISMATCH -- instrumented mirror has a transcription bug'}")
+  return all_ok
+
+
 def _combine_shard_contribution(
     routed_out: jax.Array,
     shard_out: jax.Array,
@@ -1244,3 +1416,10 @@ if __name__ == "__main__":
       "is not yet mathematically equivalent to computing over all experts directly"
   )
   print("OK: sharded end-to-end forward pass matches the unsharded reference")
+
+  dispatch_instrumented_ok = check_dispatch_instrumented_matches_baseline()
+  assert dispatch_instrumented_ok, (
+      "_filter_and_pad_to_shard_instrumented (WP4 host/device attribution mirror) diverges "
+      "from the real filter_and_pad_to_shard -- do not trust any timing from it until fixed"
+  )
+  print("OK: dispatch host/device attribution mirror matches the real dispatch function")

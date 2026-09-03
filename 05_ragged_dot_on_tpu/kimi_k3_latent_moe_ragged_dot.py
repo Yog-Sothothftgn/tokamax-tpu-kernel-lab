@@ -142,10 +142,12 @@ from kimi_k3_latent_moe_reference import (  # noqa: E402
     LatentMoEConfig,
     LatentMoEWeights,
     _combine_shard_contribution,
+    _filter_and_pad_to_shard_instrumented,
     _rms_norm,
     _router_gate,
     _situ_and_mul,
     _situ_glu_mlp,
+    check_dispatch_instrumented_matches_baseline,
     check_route_and_filter_correctness,
     filter_and_pad_to_shard,
     generate_local_shard_workload,
@@ -929,6 +931,137 @@ def profile_four_stages_wp4(
   return result
 
 
+def profile_dispatch_host_device_attribution(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    num_tokens_list: tuple[int, ...] = (128, 2048, 4096),
+    capacity_factor: float = 2.0,
+    num_repeats: int = 20,
+    num_trace_repeats: int = 5,
+    trace_dir: pathlib.Path | None = None,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """WP4 step 1+3 (2026-09-03 plan): attribute Stage B's ~7.5ms eager
+  dispatch cost to a host-side mask/filter phase, a trivial-looking
+  Python-scalar phase, an async-issue phase, and a final device-sync phase
+  -- WITHOUT rewriting `filter_and_pad_to_shard` (the real, production
+  dispatch function stays exactly as benchmarked elsewhere in this file).
+  Runs at the primary scale (num_tokens=2048, matching
+  `profile_four_stages_wp4`'s default) plus two boundary scales (128, 4096)
+  to check whether the attribution generalizes across scale, per the plan's
+  explicit instruction not to re-scan the whole latency-sweep range here.
+
+  Uses `_filter_and_pad_to_shard_instrumented`
+  (`kimi_k3_latent_moe_reference.py`), a byte-for-byte mirror of the real
+  function with `time.perf_counter()`/`jax.block_until_ready()`
+  checkpoints inserted between its EXISTING internal boundaries -- verified
+  exact-match against the real function by
+  `check_dispatch_instrumented_matches_baseline` (called once here as a
+  guard before trusting any timing from it) before ever being trusted.
+
+  Also captures a real `jax.profiler.trace` of a handful of warmed-up calls
+  to the REAL, unmodified `filter_and_pad_to_shard` at each scale, written
+  under `trace_dir` if given -- this is the actual traceable artifact
+  (viewable via `tensorboard --logdir=<trace_dir>`), kept SEPARATE from the
+  instrumented breakdown's numbers since a profiler's own overhead can
+  perturb timing; the instrumented breakdown's numbers, not the profiler
+  run, are what should be read for the coarse phase attribution.
+
+  Per the 2026-09-03 plan: this function's output is for ATTRIBUTION only.
+  `profile_four_stages_wp4`'s existing eager-timed `stage_b_dispatch_indexing_ms`
+  remains the reported dispatch latency number.
+  """
+  if not check_dispatch_instrumented_matches_baseline(seed=seed):
+    raise AssertionError(
+        "_filter_and_pad_to_shard_instrumented does not match the real "
+        "filter_and_pad_to_shard -- refusing to report timing from a mirror "
+        "that isn't proven correct."
+    )
+
+  global_config = kimi_k3_config()
+  results = []
+
+  for num_tokens in num_tokens_list:
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, 3)
+    scale = 0.02
+
+    def normal(k, shape):
+      return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+    router_weight = normal(keys[0], (global_config.hidden_size, global_config.num_experts))
+    e_score_correction_bias = jnp.zeros((global_config.num_experts,), dtype=jnp.bfloat16)
+    down_proj = normal(keys[1], (global_config.hidden_size, global_config.latent_size))
+    hidden_states = jax.random.normal(keys[2], (num_tokens, global_config.hidden_size), dtype=jnp.bfloat16)
+
+    stage_a_fn = functools.partial(router_and_projection, config=global_config)
+    topk_idx, topk_weight, x = jax.jit(stage_a_fn)(
+        hidden_states, router_weight, e_score_correction_bias, down_proj
+    )
+    jax.block_until_ready((topk_idx, topk_weight, x))
+
+    dispatch_kwargs = dict(
+        config=global_config, local_expert_start=0,
+        local_num_experts=local_num_experts, capacity_factor=capacity_factor,
+    )
+
+    # Warmup (not timed) -- first call includes any first-compile/dispatch
+    # setup cost, which would otherwise contaminate the first "real" repeat.
+    _ = _filter_and_pad_to_shard_instrumented(topk_idx, topk_weight, x, **dispatch_kwargs)
+
+    phase_totals = {
+        "t_mask_filter_ms": 0.0, "t_m_padded_scalar_ms": 0.0,
+        "t_issue_sort_gather_ms": 0.0, "t_final_sync_ms": 0.0,
+    }
+    for _ in range(num_repeats):
+      _, timings = _filter_and_pad_to_shard_instrumented(topk_idx, topk_weight, x, **dispatch_kwargs)
+      for phase, ms in timings.items():
+        phase_totals[phase] += ms
+    phase_means = {phase: total / num_repeats for phase, total in phase_totals.items()}
+    instrumented_total_ms = sum(phase_means.values())
+
+    if trace_dir is not None:
+      trace_path = pathlib.Path(trace_dir) / f"dispatch_trace_n{num_tokens}"
+      out = filter_and_pad_to_shard(topk_idx, topk_weight, x, **dispatch_kwargs)
+      jax.block_until_ready(out)
+      with jax.profiler.trace(str(trace_path)):
+        for _ in range(num_trace_repeats):
+          out = filter_and_pad_to_shard(topk_idx, topk_weight, x, **dispatch_kwargs)
+          jax.block_until_ready(out)
+      print(f"[dispatch-attribution] num_tokens={num_tokens}: jax.profiler trace written to "
+            f"{trace_path} -- view with `tensorboard --logdir={trace_path}`")
+
+    result = {
+        "num_tokens": num_tokens,
+        "t_mask_filter_ms": phase_means["t_mask_filter_ms"],
+        "t_m_padded_scalar_ms": phase_means["t_m_padded_scalar_ms"],
+        "t_issue_sort_gather_ms": phase_means["t_issue_sort_gather_ms"],
+        "t_final_sync_ms": phase_means["t_final_sync_ms"],
+        "instrumented_total_ms": instrumented_total_ms,
+    }
+    results.append(result)
+    print(
+        f"[dispatch-attribution] num_tokens={num_tokens} "
+        f"mask_filter={phase_means['t_mask_filter_ms']:.3f}ms "
+        f"m_padded_scalar={phase_means['t_m_padded_scalar_ms']:.3f}ms "
+        f"issue_sort_gather={phase_means['t_issue_sort_gather_ms']:.3f}ms "
+        f"final_sync={phase_means['t_final_sync_ms']:.3f}ms "
+        f"total={instrumented_total_ms:.3f}ms "
+        "-- compare instrumented_total_ms against profile_four_stages_wp4's "
+        "stage_b_dispatch_indexing_ms for the same num_tokens as a sanity check; "
+        "a large discrepancy would mean this breakdown itself has a measurement bug."
+    )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp4_dispatch_attribution.csv",
+        results,
+        ["num_tokens", "t_mask_filter_ms", "t_m_padded_scalar_ms",
+         "t_issue_sort_gather_ms", "t_final_sync_ms", "instrumented_total_ms"],
+    )
+  return results
+
+
 def run_shard_workload_benchmark(
     seed: int = 0, num_experts: int = 64, num_tokens: int = 2048
 ) -> None:
@@ -1366,12 +1499,28 @@ if __name__ == "__main__":
       "any conclusion comparing Stage C's cost against Stage B/D.",
   )
   parser.add_argument(
+      "--wp4-dispatch-attribution",
+      action="store_true",
+      help="WP4 step 1+3 (2026-09-03 plan): host/device attribution for Stage B's dispatch cost "
+      "(mask/filter phase, m_padded-scalar phase, async-issue phase, final-sync phase), at "
+      "num_tokens in {128, 2048, 4096}, plus a jax.profiler trace of the real dispatch function "
+      "-- see profile_dispatch_host_device_attribution's docstring. Does NOT rewrite "
+      "filter_and_pad_to_shard; for ATTRIBUTION only, not a new reported latency number.",
+  )
+  parser.add_argument(
+      "--wp4-dispatch-trace-dir",
+      type=pathlib.Path,
+      default=None,
+      help="if given (with --wp4-dispatch-attribution), also write a real jax.profiler trace per "
+      "num_tokens scale under this directory, viewable via `tensorboard --logdir=<dir>`",
+  )
+  parser.add_argument(
       "--output-dir",
       type=pathlib.Path,
       default=None,
       help="if given, also write structured CSV results (latency_sweep.csv / "
-      "realistic_shard_latency.csv / wp4_profiling.csv, depending which flag above is used) "
-      "here, not just print them -- see _write_csv",
+      "realistic_shard_latency.csv / wp4_profiling.csv / wp4_dispatch_attribution.csv, "
+      "depending which flag above is used) here, not just print them -- see _write_csv",
   )
   args = parser.parse_args()
 
@@ -1385,6 +1534,7 @@ if __name__ == "__main__":
       and not args.sharded_ragged_dot_correctness
       and not args.realistic_shard_latency_sweep
       and not args.wp4_profile
+      and not args.wp4_dispatch_attribution
   ):
     args.correctness = True  # default to the cheap check
 
@@ -1431,3 +1581,8 @@ if __name__ == "__main__":
 
   if args.wp4_profile:
     profile_four_stages_wp4(implementation=args.wp4_implementation, output_dir=args.output_dir)
+
+  if args.wp4_dispatch_attribution:
+    profile_dispatch_host_device_attribution(
+        trace_dir=args.wp4_dispatch_trace_dir, output_dir=args.output_dir
+    )
