@@ -420,6 +420,33 @@ _DEFAULT_LATENCY_SWEEP_SHAPES: tuple[tuple[int, int], ...] = (
 )
 
 
+_DECODE_PREFILL_SWEEP_SHAPES: tuple[tuple[int, int], ...] = (
+    # Decode-scale: seq_len=1 (one token per sequence), varying batch size --
+    # added 2026-09-04 per Zifan's explicit request to report prefill/decode
+    # latencies separately. num_tokens here (1-128) is a range NEVER measured
+    # anywhere else in this project (the smallest num_tokens tested before
+    # this was 128) -- worth covering on its own since the fixed 128-row
+    # Mosaic tiling floor (see filter_and_pad_to_shard's padding-bucket
+    # scheme) means small decode batches spend most of their padded rows on
+    # padding, not real tokens, a regime this project has never measured.
+    (1, 1),
+    (2, 1),
+    (4, 1),
+    (8, 1),
+    (16, 1),
+    (32, 1),
+    (64, 1),
+    (128, 1),
+    # Prefill-scale: batch_size=1, varying (longer) sequence length -- reuses
+    # the same num_tokens points already in _DEFAULT_LATENCY_SWEEP_SHAPES so
+    # prefill numbers stay directly comparable to existing data.
+    (1, 128),
+    (1, 512),
+    (1, 2048),
+    (1, 4096),
+)
+
+
 def _local_shard_expert_ffn_ragged_dot(
     sorted_tokens: jax.Array,
     expert_gate: jax.Array,
@@ -582,7 +609,7 @@ def check_sharded_ragged_dot_correctness(
 def run_realistic_shard_latency_sweep(
     seed: int = 0,
     local_num_experts: int = 64,
-    shapes: tuple[tuple[int, int], ...] = _DEFAULT_LATENCY_SWEEP_SHAPES,
+    shapes: tuple[tuple[int, int], ...] = _DECODE_PREFILL_SWEEP_SHAPES,
     capacity_factor: float = 2.0,
     output_dir: pathlib.Path | None = None,
 ) -> None:
@@ -597,6 +624,19 @@ def run_realistic_shard_latency_sweep(
   uneven across experts) -- this is the first latency data for this project
   that's realistic in BOTH matmul shape AND routing distribution, not just
   the former.
+
+  Default `shapes` is `_DECODE_PREFILL_SWEEP_SHAPES` (2026-09-04, per
+  Zifan's explicit request to report prefill/decode latencies separately):
+  each row is labeled `workload="decode"` when `seq_len==1` (one token per
+  sequence, varying batch size) or `workload="prefill"` otherwise (longer
+  sequences, batch_size=1) -- this labeling is purely a function of the
+  shape tuple itself, since the standalone MoE layer has no other way to
+  distinguish the two (it only ever sees the flattened `num_tokens` axis).
+  Also reports `padding_ratio` (`1 - valid_rows/m_padded`) per shape, since
+  decode's very small batch sizes are expected to waste most of their
+  fixed-tile-size padded rows on padding rather than real tokens -- a
+  regime this project had never measured before this addition (previously
+  the smallest `num_tokens` tested anywhere was 128).
 
   Heuristic config only (skip_autotune -- same reasoning as
   run_fair_baseline/run_latency_sweep: autotuning this shape was confirmed
@@ -654,16 +694,23 @@ def run_realistic_shard_latency_sweep(
         global_config, local_expert_start=0, local_num_experts=local_num_experts,
         capacity_factor=capacity_factor,
     )
+    workload = "decode" if seq_len == 1 else "prefill"
+    m_padded_val = int(sorted_tokens.shape[0])
+    valid_rows_val = int(jnp.sum(valid_mask))
+    padding_ratio_val = 1.0 - (valid_rows_val / m_padded_val if m_padded_val else 0.0)
     shape_stats[(batch_size, seq_len)] = {
-        "m_padded": int(sorted_tokens.shape[0]),
-        "valid_rows": int(jnp.sum(valid_mask)),
+        "workload": workload,
+        "m_padded": m_padded_val,
+        "valid_rows": valid_rows_val,
+        "padding_ratio": padding_ratio_val,
         "mean_per_expert": float(jnp.mean(per_expert_counts)),
         "min_per_expert": int(jnp.min(per_expert_counts)),
         "max_per_expert": int(jnp.max(per_expert_counts)),
     }
     print(
-        f"[realistic-shard-latency] num_tokens={num_tokens} local_num_experts={local_num_experts} "
-        f"M_padded={sorted_tokens.shape[0]} valid_rows={int(jnp.sum(valid_mask))} "
+        f"[realistic-shard-latency] workload={workload} num_tokens={num_tokens} "
+        f"local_num_experts={local_num_experts} M_padded={m_padded_val} valid_rows={valid_rows_val} "
+        f"padding_ratio={padding_ratio_val:.1%} "
         f"mean_per_expert={float(jnp.mean(per_expert_counts)):.2f} "
         f"min={int(jnp.min(per_expert_counts))} max={int(jnp.max(per_expert_counts))}"
     )
@@ -688,18 +735,23 @@ def run_realistic_shard_latency_sweep(
       f"\n[realistic-shard-latency] single-chip shard (local_num_experts={local_num_experts}, "
       "REAL 16-of-896 routing distribution) -- heuristic (untuned) latency across batch_size/seq_len:"
   )
-  header = f"{'batch':>6} {'seq_len':>8} {'num_tokens':>11} {'impl':>14} {'median_exec_ms':>15} {'peak_mem_mb':>12}"
+  header = (
+      f"{'workload':>8} {'batch':>6} {'seq_len':>8} {'num_tokens':>11} {'impl':>14} "
+      f"{'median_exec_ms':>15} {'peak_mem_mb':>12} {'padding_ratio':>14}"
+  )
   print(header)
   for batch_size, seq_len, num_tokens, impl, exec_ms, mem_mb, err in rows:
+    workload = shape_stats[(batch_size, seq_len)]["workload"]
+    padding_ratio_val = shape_stats[(batch_size, seq_len)]["padding_ratio"]
     if err is not None:
       print(
-          f"{batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
-          f"{'SKIPPED':>15} {'':>12}  ({err})"
+          f"{workload:>8} {batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
+          f"{'SKIPPED':>15} {'':>12} {padding_ratio_val:>14.1%}  ({err})"
       )
     else:
       print(
-          f"{batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
-          f"{exec_ms:>15.4f} {mem_mb:>12.2f}"
+          f"{workload:>8} {batch_size:>6} {seq_len:>8} {num_tokens:>11} {impl:>14} "
+          f"{exec_ms:>15.4f} {mem_mb:>12.2f} {padding_ratio_val:>14.1%}"
       )
 
   if output_dir is not None:
@@ -707,17 +759,20 @@ def run_realistic_shard_latency_sweep(
     for b, s, n, impl, exec_ms, mem_mb, err in rows:
       stats = shape_stats[(b, s)]
       csv_rows.append({
-          "batch_size": b, "seq_len": s, "num_tokens": n, "implementation": impl,
+          "workload": stats["workload"], "batch_size": b, "seq_len": s, "num_tokens": n,
+          "implementation": impl,
           "median_exec_ms": exec_ms if err is None else "", "peak_mem_mb": mem_mb if err is None else "",
           "status": "SKIPPED" if err is not None else "OK", "error": err or "",
           "m_padded": stats["m_padded"], "valid_rows": stats["valid_rows"],
+          "padding_ratio": stats["padding_ratio"],
           "mean_per_expert": stats["mean_per_expert"], "min_per_expert": stats["min_per_expert"],
           "max_per_expert": stats["max_per_expert"],
       })
     _write_csv(
         pathlib.Path(output_dir) / "realistic_shard_latency.csv", csv_rows,
-        ["batch_size", "seq_len", "num_tokens", "implementation", "median_exec_ms", "peak_mem_mb",
-         "status", "error", "m_padded", "valid_rows", "mean_per_expert", "min_per_expert", "max_per_expert"],
+        ["workload", "batch_size", "seq_len", "num_tokens", "implementation", "median_exec_ms",
+         "peak_mem_mb", "status", "error", "m_padded", "valid_rows", "padding_ratio",
+         "mean_per_expert", "min_per_expert", "max_per_expert"],
     )
 
 
