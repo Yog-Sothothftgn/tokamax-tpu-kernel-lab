@@ -394,6 +394,18 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Step 8c: WP5 goal 3 (wp4_summary.md section 9) -- direct before/after
+  # dispatch latency comparison, eager filter_and_pad_to_shard vs the
+  # jit-compiled filter_and_pad_to_shard_jittable restructuring. Guarded by
+  # check_jittable_dispatch_matches_baseline; refuses to report a
+  # "speedup" from an unproven-correct jitted function.
+  results.append(_run_step(
+      "wp5_dispatch_jit_vs_eager", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp5-dispatch-jit-vs-eager",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]

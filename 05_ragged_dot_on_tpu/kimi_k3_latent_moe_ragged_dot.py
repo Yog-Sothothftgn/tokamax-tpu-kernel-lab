@@ -148,8 +148,10 @@ from kimi_k3_latent_moe_reference import (  # noqa: E402
     _situ_and_mul,
     _situ_glu_mlp,
     check_dispatch_instrumented_matches_baseline,
+    check_jittable_dispatch_matches_baseline,
     check_route_and_filter_correctness,
     filter_and_pad_to_shard,
+    filter_and_pad_to_shard_jittable,
     generate_local_shard_workload,
     init_weights,
     kimi_k3_config,
@@ -1117,6 +1119,114 @@ def profile_dispatch_host_device_attribution(
   return results
 
 
+def profile_dispatch_jit_vs_eager_latency(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    num_tokens_list: tuple[int, ...] = (128, 2048, 4096),
+    capacity_factor: float = 2.0,
+    num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """WP5 goal 3 (`wp4_summary.md` section 9): direct before/after latency
+  comparison for dispatch -- eager `filter_and_pad_to_shard` (the existing,
+  already-measured ~7.5ms baseline, see WP4) vs. `jax.jit`-compiled
+  `filter_and_pad_to_shard_jittable` (WP5's fixed-shape restructuring) --
+  at the same `num_tokens` scales WP4's attribution used (128, 2048, 4096),
+  so this is directly comparable to `wp4_dispatch_attribution.csv`.
+
+  Refuses to report a "speedup" from a jitted function that hasn't been
+  proven correct: guarded by `check_jittable_dispatch_matches_baseline`.
+
+  Has a real tokamax-adjacent dependency via `router_and_projection`'s
+  shared code path with the rest of this file -- in practice this specific
+  function only needs jax (no tokamax.ragged_dot call), but lives in this
+  file for consistency with `profile_four_stages_wp4`/
+  `profile_dispatch_host_device_attribution`'s setup. Not yet run on
+  hardware -- needs the v6e TPU VM to produce a real device-timing
+  comparison (the CPU-only correctness proof is `check_jittable_dispatch_matches_baseline`,
+  called locally in `kimi_k3_latent_moe_reference.py`'s own `__main__`).
+  """
+  if not check_jittable_dispatch_matches_baseline(seed=seed):
+    raise AssertionError(
+        "filter_and_pad_to_shard_jittable does not match the real "
+        "filter_and_pad_to_shard -- refusing to report a latency comparison "
+        "against a mirror that isn't proven correct."
+    )
+
+  global_config = kimi_k3_config()
+  results = []
+
+  for num_tokens in num_tokens_list:
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, 3)
+    scale = 0.02
+
+    def normal(k, shape):
+      return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+    router_weight = normal(keys[0], (global_config.hidden_size, global_config.num_experts))
+    e_score_correction_bias = jnp.zeros((global_config.num_experts,), dtype=jnp.bfloat16)
+    down_proj = normal(keys[1], (global_config.hidden_size, global_config.latent_size))
+    hidden_states = jax.random.normal(keys[2], (num_tokens, global_config.hidden_size), dtype=jnp.bfloat16)
+
+    stage_a_fn = functools.partial(router_and_projection, config=global_config)
+    topk_idx, topk_weight, x = jax.jit(stage_a_fn)(
+        hidden_states, router_weight, e_score_correction_bias, down_proj
+    )
+    jax.block_until_ready((topk_idx, topk_weight, x))
+
+    dispatch_kwargs = dict(
+        config=global_config, local_expert_start=0,
+        local_num_experts=local_num_experts, capacity_factor=capacity_factor,
+    )
+
+    def _time_eager(f, *args, num_repeats=num_repeats):
+      out = f(*args)
+      jax.block_until_ready(out)
+      t0 = time.perf_counter()
+      for _ in range(num_repeats):
+        out = f(*args)
+      jax.block_until_ready(out)
+      return (time.perf_counter() - t0) * 1000 / num_repeats
+
+    def _time_jit(f, *args, num_repeats=num_repeats):
+      f_jit = jax.jit(f)
+      out = f_jit(*args)
+      jax.block_until_ready(out)
+      t0 = time.perf_counter()
+      for _ in range(num_repeats):
+        out = f_jit(*args)
+      jax.block_until_ready(out)
+      return (time.perf_counter() - t0) * 1000 / num_repeats
+
+    eager_fn = functools.partial(filter_and_pad_to_shard, **dispatch_kwargs)
+    jit_fn = functools.partial(filter_and_pad_to_shard_jittable, **dispatch_kwargs)
+
+    eager_ms = _time_eager(eager_fn, topk_idx, topk_weight, x)
+    jit_ms = _time_jit(jit_fn, topk_idx, topk_weight, x)
+    speedup = eager_ms / jit_ms if jit_ms > 0 else float("nan")
+
+    result = {
+        "num_tokens": num_tokens,
+        "eager_dispatch_ms": eager_ms,
+        "jit_dispatch_ms": jit_ms,
+        "speedup_x": speedup,
+    }
+    results.append(result)
+    print(
+        f"[dispatch-jit-vs-eager] num_tokens={num_tokens} "
+        f"eager={eager_ms:.3f}ms jit={jit_ms:.3f}ms speedup={speedup:.2f}x"
+    )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp5_dispatch_jit_vs_eager.csv",
+        results,
+        ["num_tokens", "eager_dispatch_ms", "jit_dispatch_ms", "speedup_x"],
+    )
+  return results
+
+
 def run_shard_workload_benchmark(
     seed: int = 0, num_experts: int = 64, num_tokens: int = 2048
 ) -> None:
@@ -1563,6 +1673,13 @@ if __name__ == "__main__":
       "filter_and_pad_to_shard; for ATTRIBUTION only, not a new reported latency number.",
   )
   parser.add_argument(
+      "--wp5-dispatch-jit-vs-eager",
+      action="store_true",
+      help="WP5 goal 3 (wp4_summary.md section 9): direct before/after latency comparison, "
+      "eager filter_and_pad_to_shard vs jit-compiled filter_and_pad_to_shard_jittable, at the "
+      "same num_tokens scales WP4 used -- see profile_dispatch_jit_vs_eager_latency's docstring.",
+  )
+  parser.add_argument(
       "--wp4-dispatch-trace-dir",
       type=pathlib.Path,
       default=None,
@@ -1590,6 +1707,7 @@ if __name__ == "__main__":
       and not args.realistic_shard_latency_sweep
       and not args.wp4_profile
       and not args.wp4_dispatch_attribution
+      and not args.wp5_dispatch_jit_vs_eager
   ):
     args.correctness = True  # default to the cheap check
 
@@ -1641,3 +1759,6 @@ if __name__ == "__main__":
     profile_dispatch_host_device_attribution(
         trace_dir=args.wp4_dispatch_trace_dir, output_dir=args.output_dir
     )
+
+  if args.wp5_dispatch_jit_vs_eager:
+    profile_dispatch_jit_vs_eager_latency(output_dir=args.output_dir)

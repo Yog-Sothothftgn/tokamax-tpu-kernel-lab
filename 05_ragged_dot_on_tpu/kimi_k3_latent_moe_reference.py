@@ -140,6 +140,7 @@ Usage:
 
 import dataclasses
 import functools
+import math
 import time
 
 import jax
@@ -748,6 +749,194 @@ def filter_and_pad_to_shard(
       padded_token_idx,
       padded_combine_weight,
   )
+
+
+def filter_and_pad_to_shard_jittable(
+    topk_idx: jax.Array,
+    topk_weight: jax.Array,
+    x: jax.Array,
+    config: LatentMoEConfig,
+    local_expert_start: int,
+    local_num_experts: int,
+    capacity_factor: float = 2.0,
+    tile_size: int = _MOSAIC_TILE_SIZE,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """WP5 (`wp4_summary.md` section 9): a fully `jax.jit`-compatible
+  restructuring of `filter_and_pad_to_shard`, motivated by WP4's finding
+  that the eager version's ~7.5ms cost is dominated by host/Python issuing
+  overhead and a forced dynamic-shape sync, not real device-side data
+  movement (still unconfirmed on hardware -- see `wp4_summary.md`).
+
+  The eager version's blocker is filtering BEFORE sorting: boolean-mask
+  indexing (`flat_expert_ids[in_shard]`) produces a length that depends on
+  the DATA, not just the shapes, so JAX must concretize it -- incompatible
+  with `jax.jit`. This version inverts the order: sort ALL
+  `num_tokens*top_k` (token, slot) entries by a key that gives EVERY
+  out-of-shard entry a SENTINEL value (`local_num_experts`, strictly
+  greater than any real local expert id in `[0, local_num_experts)`), so
+  real entries always sort before sentinel ones. A STATIC (`m_padded`-sized)
+  prefix of this full, fixed-shape sort is then exactly the
+  filtered+sorted+padded result the eager version computes -- no
+  data-dependent shape appears anywhere, so this whole function can be
+  wrapped in `jax.jit`.
+
+  If `num_tokens*top_k < m_padded` (small decode batches -- confirmed to
+  actually happen: at `num_tokens=1`, `top_k=16`, there are only 16 total
+  dispatch slots but `m_padded` is still 128), the flat arrays are padded
+  with `local_num_experts`-sentinel-keyed dummy entries up to `m_padded`
+  BEFORE sorting, so the post-sort static slice is always well-defined.
+  `num_tokens`/`m_padded` are both static (Python ints) at trace time
+  (`topk_idx.shape[0]` is a shape, never a traced value; `m_padded` is
+  computed from `config`/`capacity_factor` alone via `math.ceil`, not
+  `jnp.ceil` -- also fixes the confirmed-wasteful `t_m_padded_scalar_ms`
+  device round-trip WP4 found in the eager version).
+
+  Overflow (more real in-shard assignments than `m_padded`) truncates the
+  SAME way the eager version does: the full sort is stable (confirmed
+  elsewhere in this project -- see `check_route_and_filter_correctness`)
+  and ascending by (local_id, sentinel), so the kept `m_padded` prefix is
+  exactly the lowest-local-id-sorted entries; ties preserve original
+  relative order. The eager version's overflow WARNING print is dropped
+  here (a side effect that doesn't fit a jitted function) -- the
+  TRUNCATION BEHAVIOR itself, not the print statement, is what
+  `check_jittable_dispatch_matches_baseline` verifies bit-for-bit.
+
+  This function's numerical/shape logic is intentionally NOT proven correct
+  by comment alone -- see `check_jittable_dispatch_matches_baseline` below,
+  which diffs its output against the real `filter_and_pad_to_shard`
+  bit-for-bit across the standard case, an overflow case, and a
+  smaller-than-`m_padded` (decode-scale) case, and separately confirms this
+  function actually compiles and runs under `jax.jit` (not just that its
+  eager values happen to be correct).
+  """
+  compute_dtype = x.dtype
+  num_tokens = topk_idx.shape[0]
+  total_slots = num_tokens * config.top_k
+
+  flat_expert_ids = topk_idx.reshape(-1)
+  token_of_slot = jnp.arange(total_slots) // config.top_k
+  flat_combine_weight = topk_weight.reshape(-1)
+
+  local_end = local_expert_start + local_num_experts
+  in_shard = (flat_expert_ids >= local_expert_start) & (flat_expert_ids < local_end)
+  local_ids = flat_expert_ids - local_expert_start
+  sort_key = jnp.where(in_shard, local_ids, local_num_experts)
+
+  expected_total = num_tokens * config.top_k * local_num_experts / config.num_experts
+  m_padded = _round_up_to_tile(math.ceil(expected_total * capacity_factor), tile_size)
+
+  pad_amount = max(0, m_padded - total_slots)
+  if pad_amount > 0:
+    sort_key = jnp.concatenate(
+        [sort_key, jnp.full((pad_amount,), local_num_experts, dtype=sort_key.dtype)]
+    )
+    token_of_slot = jnp.concatenate(
+        [token_of_slot, jnp.zeros((pad_amount,), dtype=token_of_slot.dtype)]
+    )
+    flat_combine_weight = jnp.concatenate(
+        [flat_combine_weight, jnp.zeros((pad_amount,), dtype=flat_combine_weight.dtype)]
+    )
+
+  order = jnp.argsort(sort_key)[:m_padded]
+  sorted_key = sort_key[order]
+  valid_mask = sorted_key < local_num_experts
+  sorted_token_idx_all = token_of_slot[order]
+  sorted_combine_weight_all = flat_combine_weight[order]
+
+  padded_token_idx = jnp.where(valid_mask, sorted_token_idx_all, -1).astype(jnp.int32)
+  # Deliberately NOT cast to compute_dtype here -- the real
+  # filter_and_pad_to_shard keeps this in flat_combine_weight's own dtype
+  # (typically float32, matching this project's established "combine
+  # weight stays float32 until the final weighted-sum" precision
+  # discipline, see _combine_shard_contribution). Forcing compute_dtype
+  # here would silently lose precision -- confirmed as a real divergence
+  # from the baseline by check_jittable_dispatch_matches_baseline before
+  # this fix.
+  padded_combine_weight = jnp.where(
+      valid_mask, sorted_combine_weight_all, jnp.zeros((), dtype=compute_dtype)
+  )
+
+  # Relies on jnp.bincount's out-of-bounds indices (the sentinel value,
+  # == local_num_experts, is outside [0, local_num_experts)) being silently
+  # dropped rather than raised/clipped -- confirmed by
+  # check_jittable_dispatch_matches_baseline, not assumed.
+  per_expert_counts = jnp.bincount(sorted_key, length=local_num_experts).astype(jnp.int32)
+  pad_size = m_padded - jnp.sum(per_expert_counts)
+  group_sizes = jnp.concatenate([per_expert_counts, pad_size.reshape(1).astype(jnp.int32)])
+
+  gathered_all = x[sorted_token_idx_all]
+  sorted_tokens = jnp.where(valid_mask[:, None], gathered_all, jnp.zeros_like(gathered_all))
+
+  return (
+      sorted_tokens,
+      group_sizes,
+      valid_mask,
+      per_expert_counts,
+      padded_token_idx,
+      padded_combine_weight,
+  )
+
+
+def check_jittable_dispatch_matches_baseline() -> bool:
+  """Proves `filter_and_pad_to_shard_jittable` is bit-for-bit identical to
+  the real `filter_and_pad_to_shard` -- across the standard case, a forced
+  OVERFLOW case (tiny `capacity_factor`), and a smaller-than-`m_padded`
+  DECODE-SCALE case (`num_tokens=1`, confirmed elsewhere in this project to
+  have only 16 total dispatch slots against a 128-row `m_padded`) -- AND
+  that it actually compiles and runs under `jax.jit` (the entire point of
+  WP5), not just that its eager values happen to be correct. CPU-only, no
+  tokamax/TPU needed.
+  """
+  config = toy_config()
+  all_ok = True
+
+  cases = [
+      ("standard", 64, 32, 5, 8, 2.0),
+      ("overflow", 64, 32, 5, 8, 0.05),
+      ("decode_scale", 1, 32, 5, 8, 2.0),
+  ]
+  for name, num_tokens, global_num_experts, local_expert_start, local_num_experts, capacity_factor in cases:
+    key = jax.random.key(hash(name) % (2**31))
+    keys = jax.random.split(key, 3)
+    topk_idx = jax.random.randint(keys[0], (num_tokens, config.top_k), 0, global_num_experts)
+    topk_weight = jax.random.uniform(keys[1], (num_tokens, config.top_k), dtype=jnp.float32)
+    x = jax.random.normal(keys[2], (num_tokens, config.latent_size), dtype=jnp.bfloat16)
+
+    kwargs = dict(
+        config=config, local_expert_start=local_expert_start,
+        local_num_experts=local_num_experts, capacity_factor=capacity_factor,
+    )
+    baseline = filter_and_pad_to_shard(topk_idx, topk_weight, x, **kwargs)
+    eager_new = filter_and_pad_to_shard_jittable(topk_idx, topk_weight, x, **kwargs)
+
+    try:
+      jitted_fn = jax.jit(
+          functools.partial(filter_and_pad_to_shard_jittable, **kwargs)
+      )
+      jit_new = jitted_fn(topk_idx, topk_weight, x)
+      jit_compiles = True
+    except Exception as e:  # noqa: BLE001 -- recording the failure itself is the point
+      jit_new = None
+      jit_compiles = False
+      print(f"[jittable-dispatch-check] case={name}: JIT COMPILATION FAILED: {e}")
+
+    case_ok = jit_compiles
+    for i, arr_name in enumerate(
+        ("sorted_tokens", "group_sizes", "valid_mask", "per_expert_counts",
+         "padded_token_idx", "padded_combine_weight")
+    ):
+      eager_match = bool(jnp.array_equal(baseline[i], eager_new[i]))
+      jit_match = bool(jnp.array_equal(baseline[i], jit_new[i])) if jit_compiles else False
+      print(
+          f"[jittable-dispatch-check] case={name} {arr_name}: "
+          f"eager_match={eager_match} jit_match={jit_match}"
+      )
+      case_ok = case_ok and eager_match and jit_match
+    print(f"[jittable-dispatch-check] case={name}: {'OK' if case_ok else 'MISMATCH'}")
+    all_ok = all_ok and case_ok
+
+  print(f"[jittable-dispatch-check] {'ALL CASES MATCH, JIT COMPILES' if all_ok else 'FAILED'}")
+  return all_ok
 
 
 def _filter_and_pad_to_shard_instrumented(
@@ -1423,3 +1612,10 @@ if __name__ == "__main__":
       "from the real filter_and_pad_to_shard -- do not trust any timing from it until fixed"
   )
   print("OK: dispatch host/device attribution mirror matches the real dispatch function")
+
+  jittable_dispatch_ok = check_jittable_dispatch_matches_baseline()
+  assert jittable_dispatch_ok, (
+      "filter_and_pad_to_shard_jittable (WP5 jit-compatible dispatch restructuring) diverges "
+      "from the real filter_and_pad_to_shard, or fails to jax.jit-compile -- do not use it until fixed"
+  )
+  print("OK: jittable dispatch restructuring matches the real dispatch function and compiles under jax.jit")
