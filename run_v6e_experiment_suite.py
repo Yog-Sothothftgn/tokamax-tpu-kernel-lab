@@ -406,6 +406,18 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Step 8d: WP6 follow-up (external review, 2026-09-11) -- does
+  # expert_ffn_roofline.py's "reads all local_num_experts+1 experts every
+  # call" memory-bound model hold, or does tokamax.ragged_dot skip HBM
+  # reads for zero-count groups? Holds m_padded fixed while scanning the
+  # number of active (nonzero group_size) experts.
+  results.append(_run_step(
+      "wp6_stage_c_active_expert_scan", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp6-stage-c-active-expert-scan",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]

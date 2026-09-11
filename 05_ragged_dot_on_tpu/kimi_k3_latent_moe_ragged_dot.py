@@ -1227,6 +1227,135 @@ def profile_dispatch_jit_vs_eager_latency(
   return results
 
 
+def profile_stage_c_active_expert_scan(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    m_padded: int = 4736,
+    num_active_experts_list: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64),
+    implementation: str = "mosaic_tpu_v2",
+    num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """WP6 follow-up experiment (per external review, 2026-09-11): the
+  `expert_ffn_roofline.py` analysis assumed `tokamax.ragged_dot` reads ALL
+  `local_num_experts+1` experts' weights from HBM on every call, giving a
+  theoretical memory-bound floor of ~2.62ms independent of `num_tokens`.
+  But the real measured Mosaic v2 latency at the smallest tested scale
+  (2.465ms) came in FASTER than that floor -- and since ~4.3GB of weights
+  cannot fit in a TPU chip's on-chip (tens-of-MB) memory, "weight caching
+  across repeated benchmark calls" is NOT a credible explanation (weights
+  live in HBM regardless of whether the same array reference is reused).
+  A much more likely explanation: `ragged_dot` may SKIP the HBM read for
+  experts whose `group_sizes` entry is exactly 0 -- entirely plausible for
+  a kernel specifically designed to handle uneven/skewed group sizes, and
+  consistent with this project's own routing data showing many local
+  experts get ZERO tokens at small `num_tokens` (previously observed
+  `min_per_expert=0` in `realistic_shard_latency.csv`).
+
+  This function isolates that specific question: holds `m_padded` (total
+  row count, hence total matmul FLOPs) FIXED while varying how many of the
+  `local_num_experts` real groups actually receive nonzero token counts
+  (the rest get exactly 0; no padding-bucket usage here -- this is a
+  controlled synthetic microbenchmark, not a real routing draw).
+
+  - If latency GROWS with `num_active_experts` (more distinct experts
+    touched -> more HBM traffic) -- confirms per-active-expert weight
+    reads, and the roofline model's "always reads all N experts" memory
+    floor needs correcting downward for skewed real routing.
+  - If latency stays roughly FLAT across `num_active_experts` -- supports
+    the original "reads (most of) the full weight tensor regardless"
+    model, and the sub-floor anomaly needs a different explanation (see
+    this function's docstring alternatives -- padding-bucket-specific
+    optimization, dtype/execution mismatch vs. the roofline's
+    assumptions, achieved-vs-peak HBM bandwidth gap, or a benchmark/
+    fusion-boundary mismatch with what "one Stage C call" actually
+    measures).
+
+  Deliberately does NOT vary which SPECIFIC experts are active (always
+  the first `num_active_experts`, in order) -- if that turns out to
+  matter (e.g. an ordering-dependent optimization), it would need a
+  separate, follow-up experiment; not tested here.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM. Do not trust its output until it has actually
+  executed on hardware.
+  """
+  global_config = kimi_k3_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 4)
+  scale = 0.02
+
+  def normal(k, shape):
+    return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+  shard_gate = normal(
+      keys[0], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_up = normal(
+      keys[1], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_down = normal(
+      keys[2], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+  )
+  sorted_tokens = normal(keys[3], (m_padded, global_config.latent_size))
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  results = []
+  for num_active in num_active_experts_list:
+    if num_active > local_num_experts:
+      raise ValueError(f"num_active={num_active} exceeds local_num_experts={local_num_experts}")
+    per_expert = m_padded // num_active
+    remainder = m_padded - per_expert * num_active
+    group_counts = [0] * local_num_experts
+    for i in range(num_active):
+      group_counts[i] = per_expert + (1 if i < remainder else 0)
+    group_counts.append(0)  # trailing padding-bucket group, unused here
+    group_sizes = jnp.array(group_counts, dtype=jnp.int32)
+    assert int(jnp.sum(group_sizes)) == m_padded, "group_sizes must still sum to m_padded"
+
+    stage_c_fn = functools.partial(
+        _local_shard_expert_ffn_ragged_dot, group_sizes=group_sizes, config=global_config,
+        implementation=implementation,
+    )
+    stage_c_ms = _time_jit(stage_c_fn, sorted_tokens, shard_gate, shard_up, shard_down)
+
+    result = {
+        "m_padded": m_padded,
+        "num_active_experts": num_active,
+        "implementation": implementation,
+        "stage_c_ms": stage_c_ms,
+    }
+    results.append(result)
+    print(
+        f"[stage-c-active-expert-scan] m_padded={m_padded} num_active_experts={num_active} "
+        f"implementation={implementation!r} stage_c_ms={stage_c_ms:.4f}ms"
+    )
+
+  print(
+      "\n[stage-c-active-expert-scan] If stage_c_ms above GROWS with num_active_experts, weight "
+      "reads are per-active-expert (roofline's constant memory floor needs correcting downward "
+      "for skewed real routing). If stage_c_ms stays roughly FLAT, the kernel reads (most of) the "
+      "full weight tensor regardless of how many groups are actually nonzero."
+  )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp6_stage_c_active_expert_scan.csv",
+        results,
+        ["m_padded", "num_active_experts", "implementation", "stage_c_ms"],
+    )
+  return results
+
+
 def run_shard_workload_benchmark(
     seed: int = 0, num_experts: int = 64, num_tokens: int = 2048
 ) -> None:
@@ -1680,6 +1809,15 @@ if __name__ == "__main__":
       "same num_tokens scales WP4 used -- see profile_dispatch_jit_vs_eager_latency's docstring.",
   )
   parser.add_argument(
+      "--wp6-stage-c-active-expert-scan",
+      action="store_true",
+      help="WP6 follow-up (external review, 2026-09-11): holds m_padded fixed while varying how "
+      "many of the local shard's experts actually receive nonzero token counts, to check whether "
+      "tokamax.ragged_dot's HBM weight-read cost scales with the number of ACTIVE experts or "
+      "reads the full weight tensor regardless -- see profile_stage_c_active_expert_scan's "
+      "docstring and expert_ffn_roofline.py's sub-floor anomaly.",
+  )
+  parser.add_argument(
       "--wp4-dispatch-trace-dir",
       type=pathlib.Path,
       default=None,
@@ -1708,6 +1846,7 @@ if __name__ == "__main__":
       and not args.wp4_profile
       and not args.wp4_dispatch_attribution
       and not args.wp5_dispatch_jit_vs_eager
+      and not args.wp6_stage_c_active_expert_scan
   ):
     args.correctness = True  # default to the cheap check
 
@@ -1762,3 +1901,6 @@ if __name__ == "__main__":
 
   if args.wp5_dispatch_jit_vs_eager:
     profile_dispatch_jit_vs_eager_latency(output_dir=args.output_dir)
+
+  if args.wp6_stage_c_active_expert_scan:
+    profile_stage_c_active_expert_scan(output_dir=args.output_dir)
