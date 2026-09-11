@@ -1146,7 +1146,7 @@ def profile_dispatch_jit_vs_eager_latency(
   comparison (the CPU-only correctness proof is `check_jittable_dispatch_matches_baseline`,
   called locally in `kimi_k3_latent_moe_reference.py`'s own `__main__`).
   """
-  if not check_jittable_dispatch_matches_baseline(seed=seed):
+  if not check_jittable_dispatch_matches_baseline():
     raise AssertionError(
         "filter_and_pad_to_shard_jittable does not match the real "
         "filter_and_pad_to_shard -- refusing to report a latency comparison "
