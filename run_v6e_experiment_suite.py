@@ -418,6 +418,26 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Steps 8e/8f: WP6 decomposition follow-up (external review, 2026-09-12,
+  # wp4_summary.md section 11) -- step 8d confounds token-volume scaling
+  # with active-expert-count scaling. These two steps separate them: 8e
+  # holds active-expert count fixed and varies tokens-per-expert (isolates
+  # the token-volume-scaling component); 8f holds tokens-per-expert fixed
+  # and varies active-expert count (isolates the group-count-scaling
+  # component without step 8d's shrinking-per-group-size confound).
+  results.append(_run_step(
+      "wp6_stage_c_tokens_per_expert_scan", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp6-stage-c-tokens-per-expert-scan",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+  results.append(_run_step(
+      "wp6_active_expert_scan_fixed_tpe", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp6-active-expert-scan-fixed-tpe",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]

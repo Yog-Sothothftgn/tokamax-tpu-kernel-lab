@@ -1356,6 +1356,217 @@ def profile_stage_c_active_expert_scan(
   return results
 
 
+def profile_stage_c_tokens_per_expert_scan(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    num_active_experts: int = 64,
+    tokens_per_expert_list: tuple[int, ...] = (8, 16, 32, 64, 128, 256),
+    implementation: str = "mosaic_tpu_v2",
+    num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """WP6 decomposition follow-up 1 (`wp4_summary.md` section 11, per
+  external review 2026-09-12): `profile_stage_c_active_expert_scan`
+  (above) confounds two things that could each independently explain "cost
+  grows with active-expert count" -- more weight bytes to read from HBM,
+  vs. more per-group dispatch/scheduling/tiling overhead. This function
+  holds the number of ACTIVE experts FIXED while varying tokens-per-expert
+  (so total `m_padded = num_active_experts * tokens_per_expert` GROWS) --
+  isolating the part of Stage C's cost that scales with TOKEN volume
+  (compute + activation), independent of how many distinct experts/weight
+  reads are involved.
+
+  Combine this scan's results with `profile_stage_c_active_expert_scan`'s
+  (which instead holds `m_padded` FIXED while varying active-expert count)
+  to decompose `latency ~= f(tokens) + g(active_experts)` -- this function
+  measures `f`, that one measures `g` (confounded with shrinking
+  per-group size, see `profile_stage_c_active_expert_scan_fixed_tpe` for
+  the version that isolates `g` cleanly).
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  global_config = kimi_k3_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 4)
+  scale = 0.02
+
+  def normal(k, shape):
+    return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+  shard_gate = normal(
+      keys[0], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_up = normal(
+      keys[1], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_down = normal(
+      keys[2], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+  )
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  if num_active_experts > local_num_experts:
+    raise ValueError(f"num_active_experts={num_active_experts} exceeds local_num_experts={local_num_experts}")
+
+  results = []
+  for tokens_per_expert in tokens_per_expert_list:
+    m_padded = num_active_experts * tokens_per_expert
+    sorted_tokens = normal(keys[3], (m_padded, global_config.latent_size))
+    group_counts = (
+        [tokens_per_expert] * num_active_experts
+        + [0] * (local_num_experts - num_active_experts)
+        + [0]
+    )
+    group_sizes = jnp.array(group_counts, dtype=jnp.int32)
+    assert int(jnp.sum(group_sizes)) == m_padded, "group_sizes must sum to m_padded"
+
+    stage_c_fn = functools.partial(
+        _local_shard_expert_ffn_ragged_dot, group_sizes=group_sizes, config=global_config,
+        implementation=implementation,
+    )
+    stage_c_ms = _time_jit(stage_c_fn, sorted_tokens, shard_gate, shard_up, shard_down)
+
+    result = {
+        "num_active_experts": num_active_experts,
+        "tokens_per_expert": tokens_per_expert,
+        "m_padded": m_padded,
+        "implementation": implementation,
+        "stage_c_ms": stage_c_ms,
+    }
+    results.append(result)
+    print(
+        f"[stage-c-tokens-per-expert-scan] num_active_experts={num_active_experts} "
+        f"tokens_per_expert={tokens_per_expert} m_padded={m_padded} "
+        f"implementation={implementation!r} stage_c_ms={stage_c_ms:.4f}ms"
+    )
+
+  print(
+      "\n[stage-c-tokens-per-expert-scan] Combine with wp6_stage_c_active_expert_scan.csv to "
+      "decompose latency ~= f(tokens) + g(active_experts): this scan isolates f(tokens) at fixed "
+      "active_experts; see wp4_summary.md section 11 for the full decomposition plan."
+  )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp6_stage_c_tokens_per_expert_scan.csv",
+        results,
+        ["num_active_experts", "tokens_per_expert", "m_padded", "implementation", "stage_c_ms"],
+    )
+  return results
+
+
+def profile_stage_c_active_expert_scan_fixed_tpe(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    tokens_per_expert: int = 74,
+    num_active_experts_list: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64),
+    implementation: str = "mosaic_tpu_v2",
+    num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """WP6 decomposition follow-up 2 (`wp4_summary.md` section 11, per
+  external review 2026-09-12): holds tokens-PER-EXPERT FIXED while varying
+  the number of active experts -- unlike `profile_stage_c_active_expert_scan`
+  (which holds total `m_padded` fixed, so tokens-per-expert SHRINKS as
+  active-expert count grows), here `m_padded = num_active_experts *
+  tokens_per_expert` GROWS proportionally with the active-expert count.
+  This isolates the part of Stage C's cost that scales with the NUMBER OF
+  GROUPS touched, independent of any confound from shrinking per-group
+  token counts (e.g. a small-group tiling inefficiency that the
+  fixed-`m_padded` design could not distinguish from a genuine
+  per-weight-read cost). If latency still scales with `num_active_experts`
+  here too, that rules out "the original scan's trend was just an artifact
+  of shrinking per-group size" -- a genuine per-group/weight-read cost
+  should show up in BOTH experimental designs.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  global_config = kimi_k3_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 4)
+  scale = 0.02
+
+  def normal(k, shape):
+    return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+  shard_gate = normal(
+      keys[0], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_up = normal(
+      keys[1], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_down = normal(
+      keys[2], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+  )
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  results = []
+  for num_active in num_active_experts_list:
+    if num_active > local_num_experts:
+      raise ValueError(f"num_active={num_active} exceeds local_num_experts={local_num_experts}")
+    m_padded = num_active * tokens_per_expert
+    sorted_tokens = normal(keys[3], (m_padded, global_config.latent_size))
+    group_counts = (
+        [tokens_per_expert] * num_active + [0] * (local_num_experts - num_active) + [0]
+    )
+    group_sizes = jnp.array(group_counts, dtype=jnp.int32)
+    assert int(jnp.sum(group_sizes)) == m_padded, "group_sizes must sum to m_padded"
+
+    stage_c_fn = functools.partial(
+        _local_shard_expert_ffn_ragged_dot, group_sizes=group_sizes, config=global_config,
+        implementation=implementation,
+    )
+    stage_c_ms = _time_jit(stage_c_fn, sorted_tokens, shard_gate, shard_up, shard_down)
+
+    result = {
+        "num_active_experts": num_active,
+        "tokens_per_expert": tokens_per_expert,
+        "m_padded": m_padded,
+        "implementation": implementation,
+        "stage_c_ms": stage_c_ms,
+    }
+    results.append(result)
+    print(
+        f"[stage-c-active-expert-scan-fixed-tpe] num_active_experts={num_active} "
+        f"tokens_per_expert={tokens_per_expert} m_padded={m_padded} "
+        f"implementation={implementation!r} stage_c_ms={stage_c_ms:.4f}ms"
+    )
+
+  print(
+      "\n[stage-c-active-expert-scan-fixed-tpe] If stage_c_ms scales with num_active_experts here "
+      "TOO (not just in the fixed-m_padded version), that rules out 'the original trend was just "
+      "an artifact of shrinking per-group size' -- a genuine per-group/weight-read cost should "
+      "show up in BOTH experimental designs."
+  )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp6_stage_c_active_expert_scan_fixed_tpe.csv",
+        results,
+        ["num_active_experts", "tokens_per_expert", "m_padded", "implementation", "stage_c_ms"],
+    )
+  return results
+
+
 def run_shard_workload_benchmark(
     seed: int = 0, num_experts: int = 64, num_tokens: int = 2048
 ) -> None:
@@ -1818,6 +2029,23 @@ if __name__ == "__main__":
       "docstring and expert_ffn_roofline.py's sub-floor anomaly.",
   )
   parser.add_argument(
+      "--wp6-stage-c-tokens-per-expert-scan",
+      action="store_true",
+      help="WP6 decomposition follow-up 1 (external review, 2026-09-12): holds active-expert "
+      "count fixed while varying tokens-per-expert (m_padded grows) -- isolates the part of "
+      "Stage C's cost that scales with token volume. See "
+      "profile_stage_c_tokens_per_expert_scan's docstring.",
+  )
+  parser.add_argument(
+      "--wp6-active-expert-scan-fixed-tpe",
+      action="store_true",
+      help="WP6 decomposition follow-up 2 (external review, 2026-09-12): holds tokens-per-expert "
+      "fixed while varying active-expert count (m_padded grows proportionally) -- isolates the "
+      "part of Stage C's cost that scales with the number of groups, without the fixed-m_padded "
+      "scan's confound of shrinking per-group size. See "
+      "profile_stage_c_active_expert_scan_fixed_tpe's docstring.",
+  )
+  parser.add_argument(
       "--wp4-dispatch-trace-dir",
       type=pathlib.Path,
       default=None,
@@ -1847,6 +2075,8 @@ if __name__ == "__main__":
       and not args.wp4_dispatch_attribution
       and not args.wp5_dispatch_jit_vs_eager
       and not args.wp6_stage_c_active_expert_scan
+      and not args.wp6_stage_c_tokens_per_expert_scan
+      and not args.wp6_active_expert_scan_fixed_tpe
   ):
     args.correctness = True  # default to the cheap check
 
@@ -1904,3 +2134,9 @@ if __name__ == "__main__":
 
   if args.wp6_stage_c_active_expert_scan:
     profile_stage_c_active_expert_scan(output_dir=args.output_dir)
+
+  if args.wp6_stage_c_tokens_per_expert_scan:
+    profile_stage_c_tokens_per_expert_scan(output_dir=args.output_dir)
+
+  if args.wp6_active_expert_scan_fixed_tpe:
+    profile_stage_c_active_expert_scan_fixed_tpe(output_dir=args.output_dir)
