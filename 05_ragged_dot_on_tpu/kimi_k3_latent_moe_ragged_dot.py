@@ -158,6 +158,7 @@ from kimi_k3_latent_moe_reference import (  # noqa: E402
     check_dispatch_instrumented_matches_baseline,
     check_jittable_dispatch_matches_baseline,
     check_route_and_filter_correctness,
+    check_route_and_filter_jittable_matches_baseline,
     filter_and_pad_to_shard,
     filter_and_pad_to_shard_jittable,
     generate_local_shard_workload,
@@ -165,6 +166,7 @@ from kimi_k3_latent_moe_reference import (  # noqa: E402
     kimi_k3_config,
     latent_moe_forward,
     route_and_filter_to_local_shard,
+    route_and_filter_to_local_shard_jittable,
     router_and_projection,
     toy_config,
 )
@@ -485,6 +487,204 @@ def _local_shard_expert_ffn_ragged_dot(
   up = tokamax.ragged_dot(sorted_tokens, expert_up, group_sizes, implementation=implementation)
   activated = _situ_and_mul(gate, up, config.activation_situ_beta, config.activation_situ_linear_beta)
   return tokamax.ragged_dot(activated, expert_down, group_sizes, implementation=implementation)
+
+
+def latent_moe_forward_ragged_dot_single_shard_jittable(
+    hidden_states: jax.Array,
+    router_weight: jax.Array,
+    e_score_correction_bias: jax.Array,
+    down_proj: jax.Array,
+    shard_expert_gate: jax.Array,
+    shard_expert_up: jax.Array,
+    shard_expert_down: jax.Array,
+    norm_scale: jax.Array,
+    up_proj: jax.Array,
+    shared_gate: jax.Array,
+    shared_up: jax.Array,
+    shared_down: jax.Array,
+    config: LatentMoEConfig,
+    local_expert_start: int,
+    local_num_experts: int,
+    capacity_factor: float = 2.0,
+    implementation: str | None = None,
+) -> jax.Array:
+  """Wires WP5's jittable dispatch into an actual production forward pass
+  (2026-09-13, per the user's plan to follow up WP6): the full 8-step
+  LatentMoE forward for ONE shard -- router -> filter (WP5's
+  `route_and_filter_to_local_shard_jittable`, not the eager
+  `route_and_filter_to_local_shard` every other forward-pass function in
+  this project still uses) -> ragged_dot expert FFN -> combine -> RMSNorm
+  -> up-projection -> + shared experts -- structured so the ENTIRE thing
+  can be wrapped in ONE `jax.jit` call, with no eager escape hatch left
+  anywhere in the call graph.
+
+  This is the concrete difference from every other forward-pass function
+  in this project (`latent_moe_forward`, `latent_moe_forward_ragged_dot`,
+  and the per-shard loop body inside `check_sharded_ragged_dot_correctness`/
+  `run_realistic_shard_latency_sweep`): those either use the naive
+  Python-loop expert FFN, don't shard at all, or -- even when they DO
+  shard -- call the eager `route_and_filter_to_local_shard`, which forces a
+  host/device sync partway through (WP4's finding) every single call, even
+  under an outer `jax.jit`. WP5 already proved the isolated dispatch
+  speedup (23-106x, `wp4_summary.md` section 9); this function is what
+  makes that speedup reachable from an actual forward pass instead of only
+  from a standalone dispatch-only benchmark.
+
+  `shard_expert_gate`/`shard_expert_up`/`shard_expert_down` are expected
+  to already be sliced to this shard's `local_num_experts + 1` rows (the
+  local shard's real experts plus one padding-bucket row of unused
+  weights) -- same convention `_local_shard_expert_ffn_ragged_dot` and
+  `check_sharded_ragged_dot_correctness` already use; slicing a global
+  `LatentMoEWeights.expert_gate/up/down` down to one shard is the caller's
+  job, not this function's, matching how `_local_shard_expert_ffn_ragged_dot`
+  is scoped. All other weight arguments (`router_weight`,
+  `e_score_correction_bias`, `down_proj`, `norm_scale`, `up_proj`,
+  `shared_gate/up/down`) are GLOBAL, not shard-specific -- routing needs
+  to see every expert to decide which ones are local, and the shared
+  experts/norm/projections aren't sharded at all.
+
+  This computes ONE shard's full contribution as if it were the entire
+  routed population (i.e. models `single_chip_kimi_k3_config`'s "one shard
+  IS the whole locally-reachable expert set" framing, same as
+  `check_sharded_ragged_dot_correctness` does for `num_shards=1`) -- it
+  does NOT implement a cross-shard reduction for a token whose top_k picks
+  span multiple physical shards/chips; that would need an explicit
+  cross-shard combine step outside this function (this project has never
+  modeled real multi-chip communication, only sequential-in-one-process
+  shard loops as a stand-in -- see `check_sharded_ragged_dot_correctness`).
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM. Do not trust its output until it has actually
+  executed on hardware and passed `check_single_shard_forward_jittable_correctness`.
+  """
+  identity = hidden_states
+  compute_dtype = hidden_states.dtype
+  x = hidden_states @ down_proj
+  num_tokens = hidden_states.shape[0]
+
+  (
+      sorted_tokens,
+      group_sizes,
+      _valid_mask,
+      _per_expert_counts,
+      padded_token_idx,
+      padded_combine_weight,
+  ) = route_and_filter_to_local_shard_jittable(
+      hidden_states, x, router_weight, e_score_correction_bias, config,
+      local_expert_start=local_expert_start, local_num_experts=local_num_experts,
+      capacity_factor=capacity_factor,
+  )
+
+  shard_out = _local_shard_expert_ffn_ragged_dot(
+      sorted_tokens, shard_expert_gate, shard_expert_up, shard_expert_down,
+      group_sizes, config, implementation=implementation,
+  )
+
+  routed_out = jnp.zeros((num_tokens, config.latent_size), dtype=compute_dtype)
+  routed_out = _combine_shard_contribution(routed_out, shard_out, padded_token_idx, padded_combine_weight)
+
+  normed = _rms_norm(routed_out, norm_scale, config.rms_norm_eps)
+  up = normed @ up_proj
+
+  shared_out = _situ_glu_mlp(
+      identity, shared_gate, shared_up, shared_down,
+      config.activation_situ_beta, config.activation_situ_linear_beta,
+  )
+
+  return up + shared_out
+
+
+def check_single_shard_forward_jittable_correctness(
+    seed: int = 0,
+    num_tokens: int = 96,
+    num_experts: int = 32,
+    top_k: int = 4,
+    capacity_factor: float = 4.0,
+    implementations: tuple[str, ...] = ("xla",),
+) -> bool:
+  """Proves `latent_moe_forward_ragged_dot_single_shard_jittable` -- the new
+  production-shaped forward pass -- matches the naive unsharded
+  `latent_moe_forward` reference, BOTH called eagerly AND wrapped in a
+  single `jax.jit`, at a toy scale where `local_num_experts == num_experts`
+  (one shard covers the whole model, so there's no cross-shard combine to
+  model -- see the function's own docstring for that limitation). Default
+  `implementations=("xla",)` for the same reason `check_correctness()` and
+  `check_sharded_ragged_dot_correctness()` default to xla-only: this toy
+  scale's dims are below Mosaic's confirmed 128 tiling floor.
+
+  Checks TWO things a passing `check_sharded_ragged_dot_correctness` does
+  NOT already guarantee: (1) that composing WP5's jittable dispatch with
+  the ragged_dot FFN and combine produces the same numerical result as the
+  eager-dispatch composition (parts being individually correct doesn't
+  prove the composition is), and (2) that the WHOLE function -- router
+  through shared-expert combine -- actually compiles under one `jax.jit`
+  call, which is the entire point of wiring WP5 into production rather
+  than leaving dispatch eager.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  config = LatentMoEConfig(
+      hidden_size=64,
+      latent_size=32,
+      intermediate_size=48,
+      num_experts=num_experts,
+      top_k=top_k,
+      num_shared_experts=1,
+      moe_renormalize=True,
+      routed_scaling_factor=1.0,
+      rms_norm_eps=1e-5,
+      activation_situ_beta=4.0,
+      activation_situ_linear_beta=25.0,
+  )
+
+  key = jax.random.key(seed)
+  key_w, key_x = jax.random.split(key)
+  weights = init_weights(config, key_w)
+  hidden_states = jax.random.normal(key_x, (num_tokens, config.hidden_size))
+
+  reference_out = latent_moe_forward(hidden_states, weights, config)
+
+  # One shard covers every expert -- append the usual trailing
+  # padding-bucket row of zero weights, same convention as
+  # check_sharded_ragged_dot_correctness.
+  shard_expert_gate = jnp.concatenate([weights.expert_gate, jnp.zeros_like(weights.expert_gate[:1])], axis=0)
+  shard_expert_up = jnp.concatenate([weights.expert_up, jnp.zeros_like(weights.expert_up[:1])], axis=0)
+  shard_expert_down = jnp.concatenate([weights.expert_down, jnp.zeros_like(weights.expert_down[:1])], axis=0)
+
+  all_ok = True
+  for impl in implementations:
+    fn = functools.partial(
+        latent_moe_forward_ragged_dot_single_shard_jittable,
+        config=config, local_expert_start=0, local_num_experts=num_experts,
+        capacity_factor=capacity_factor, implementation=impl,
+    )
+    call_args = (
+        hidden_states, weights.router_weight, weights.e_score_correction_bias, weights.down_proj,
+        shard_expert_gate, shard_expert_up, shard_expert_down,
+        weights.norm_scale, weights.up_proj, weights.shared_gate, weights.shared_up, weights.shared_down,
+    )
+    try:
+      eager_out = fn(*call_args)
+      jit_out = jax.jit(fn)(*call_args)
+    except NotImplementedError as e:
+      print(f"[single-shard-forward-jittable-check] implementation={impl!r}: SKIPPED ({e}) -- counted as FAIL")
+      all_ok = False
+      continue
+
+    eager_max_err = float(jnp.max(jnp.abs(eager_out - reference_out)))
+    jit_max_err = float(jnp.max(jnp.abs(jit_out - reference_out)))
+    # Same tolerance as every other ragged_dot-vs-reference check in this
+    # project: ragged_dot's own tiling can introduce small reduction-order
+    # differences.
+    ok = eager_max_err < 1e-3 and jit_max_err < 1e-3
+    print(
+        f"[single-shard-forward-jittable-check] implementation={impl!r} "
+        f"eager_max_err={eager_max_err:.2e} jit_max_err={jit_max_err:.2e} {'OK' if ok else 'FAIL'}"
+    )
+    all_ok = all_ok and ok
+
+  return all_ok
 
 
 def check_sharded_ragged_dot_correctness(
@@ -1231,6 +1431,165 @@ def profile_dispatch_jit_vs_eager_latency(
         pathlib.Path(output_dir) / "wp5_dispatch_jit_vs_eager.csv",
         results,
         ["num_tokens", "eager_dispatch_ms", "jit_dispatch_ms", "speedup_x"],
+    )
+  return results
+
+
+def profile_production_forward_jit_vs_eager(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    num_tokens_list: tuple[int, ...] = (128, 2048, 4096),
+    capacity_factor: float = 2.0,
+    implementation: str | None = "mosaic_tpu_v2",
+    num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """Closes the loop on `profile_dispatch_jit_vs_eager_latency`'s isolated
+  dispatch-only benchmark (2026-09-13, wiring WP5 into production): that
+  benchmark proved dispatch itself is 23-106x faster jitted, but never
+  measured whether that win survives once dispatch is embedded in an
+  actual forward-pass call alongside the ragged_dot expert FFN and the
+  rest of the model -- an outer `jax.jit` around a composition that still
+  calls the EAGER `route_and_filter_to_local_shard` internally gets no
+  benefit from jit at all at that boundary (WP4's finding: the eager
+  version forces a host/device sync partway through, which cannot be
+  hidden inside a jit trace). This function measures the REAL end-to-end
+  difference: the SAME full forward pass (router through shared-expert
+  combine), timed once with the OLD eager-dispatch composition and once
+  with `latent_moe_forward_ragged_dot_single_shard_jittable` (WP5's
+  dispatch wired in, whole function wrapped in one `jax.jit`).
+
+  Refuses to report a comparison from a production path that hasn't been
+  proven correct: guarded by `check_single_shard_forward_jittable_correctness`.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  if not check_single_shard_forward_jittable_correctness():
+    raise AssertionError(
+        "latent_moe_forward_ragged_dot_single_shard_jittable does not match the naive "
+        "reference -- refusing to report a latency comparison against a production path "
+        "that isn't proven correct."
+    )
+
+  global_config = kimi_k3_config()
+  results = []
+
+  def _time_eager(f, *args, num_repeats=num_repeats):
+    out = f(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  def _eager_dispatch_forward(
+      hidden_states, router_weight, e_score_correction_bias, down_proj,
+      shard_expert_gate, shard_expert_up, shard_expert_down,
+      norm_scale, up_proj, shared_gate, shared_up, shared_down,
+  ):
+    """Same 8 steps as latent_moe_forward_ragged_dot_single_shard_jittable,
+    but via the OLD eager route_and_filter_to_local_shard -- the "before"
+    side of this comparison, not itself a new supported entry point.
+    """
+    identity = hidden_states
+    compute_dtype = hidden_states.dtype
+    x = hidden_states @ down_proj
+    num_tokens = hidden_states.shape[0]
+    (
+        sorted_tokens, group_sizes, _valid_mask, _per_expert_counts,
+        padded_token_idx, padded_combine_weight,
+    ) = route_and_filter_to_local_shard(
+        hidden_states, x, router_weight, e_score_correction_bias, global_config,
+        local_expert_start=0, local_num_experts=local_num_experts, capacity_factor=capacity_factor,
+    )
+    shard_out = _local_shard_expert_ffn_ragged_dot(
+        sorted_tokens, shard_expert_gate, shard_expert_up, shard_expert_down,
+        group_sizes, global_config, implementation=implementation,
+    )
+    routed_out = jnp.zeros((num_tokens, global_config.latent_size), dtype=compute_dtype)
+    routed_out = _combine_shard_contribution(routed_out, shard_out, padded_token_idx, padded_combine_weight)
+    normed = _rms_norm(routed_out, norm_scale, global_config.rms_norm_eps)
+    up = normed @ up_proj
+    shared_out = _situ_glu_mlp(
+        identity, shared_gate, shared_up, shared_down,
+        global_config.activation_situ_beta, global_config.activation_situ_linear_beta,
+    )
+    return up + shared_out
+
+  for num_tokens in num_tokens_list:
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, 10)
+    scale = 0.02
+
+    def normal(k, shape):
+      return jax.random.normal(k, shape, dtype=jnp.bfloat16) * jnp.bfloat16(scale)
+
+    router_weight = normal(keys[0], (global_config.hidden_size, global_config.num_experts))
+    e_score_correction_bias = jnp.zeros((global_config.num_experts,), dtype=jnp.bfloat16)
+    down_proj = normal(keys[1], (global_config.hidden_size, global_config.latent_size))
+    shard_expert_gate = normal(
+        keys[2], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+    )
+    shard_expert_up = normal(
+        keys[3], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+    )
+    shard_expert_down = normal(
+        keys[4], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+    )
+    norm_scale = normal(keys[5], (global_config.latent_size,))
+    up_proj = normal(keys[6], (global_config.latent_size, global_config.hidden_size))
+    shared_intermediate = global_config.intermediate_size * global_config.num_shared_experts
+    shared_gate = normal(keys[7], (global_config.hidden_size, shared_intermediate))
+    shared_up = normal(keys[8], (global_config.hidden_size, shared_intermediate))
+    shared_down = normal(keys[9], (shared_intermediate, global_config.hidden_size))
+    hidden_states = jax.random.normal(
+        jax.random.fold_in(key, num_tokens), (num_tokens, global_config.hidden_size), dtype=jnp.bfloat16
+    )
+
+    call_args = (
+        hidden_states, router_weight, e_score_correction_bias, down_proj,
+        shard_expert_gate, shard_expert_up, shard_expert_down,
+        norm_scale, up_proj, shared_gate, shared_up, shared_down,
+    )
+
+    eager_ms = _time_eager(_eager_dispatch_forward, *call_args)
+    jit_fn = functools.partial(
+        latent_moe_forward_ragged_dot_single_shard_jittable,
+        config=global_config, local_expert_start=0, local_num_experts=local_num_experts,
+        capacity_factor=capacity_factor, implementation=implementation,
+    )
+    jit_ms = _time_jit(jit_fn, *call_args)
+    speedup = eager_ms / jit_ms if jit_ms > 0 else float("nan")
+
+    result = {
+        "num_tokens": num_tokens,
+        "eager_forward_ms": eager_ms,
+        "jit_forward_ms": jit_ms,
+        "speedup_x": speedup,
+    }
+    results.append(result)
+    print(
+        f"[production-forward-jit-vs-eager] num_tokens={num_tokens} "
+        f"eager={eager_ms:.3f}ms jit={jit_ms:.3f}ms speedup={speedup:.2f}x"
+    )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp5_production_forward_jit_vs_eager.csv",
+        results,
+        ["num_tokens", "eager_forward_ms", "jit_forward_ms", "speedup_x"],
     )
   return results
 
@@ -2377,6 +2736,23 @@ if __name__ == "__main__":
       "anywhere. See check_route_and_filter_correctness's docstring (WP-Kimi step 2b, part 2)",
   )
   parser.add_argument(
+      "--single-shard-forward-jittable-correctness",
+      action="store_true",
+      help="wires WP5's jittable dispatch into a full production forward pass (2026-09-13): "
+      "proves latent_moe_forward_ragged_dot_single_shard_jittable matches the naive reference, "
+      "both eagerly and wrapped in one jax.jit call. See "
+      "check_single_shard_forward_jittable_correctness's docstring.",
+  )
+  parser.add_argument(
+      "--wp5-production-forward-jit-vs-eager",
+      action="store_true",
+      help="the real end-to-end payoff of wiring WP5 into production: the SAME full forward "
+      "pass, timed once with the old eager-dispatch composition and once with "
+      "latent_moe_forward_ragged_dot_single_shard_jittable (whole function under one jax.jit) "
+      "-- see profile_production_forward_jit_vs_eager's docstring. Requires "
+      "--single-shard-forward-jittable-correctness to pass first (checked internally).",
+  )
+  parser.add_argument(
       "--autotune",
       action="store_true",
       help="also run the exhaustive autotune search in --fair-baseline (confirmed VERY slow "
@@ -2518,6 +2894,8 @@ if __name__ == "__main__":
       and not args.wp6_stage_c_local_num_experts_scan
       and not args.wp6_quantized_ragged_dot_correctness
       and not args.wp6_quantized_vs_bf16_active_expert_scan
+      and not args.single_shard_forward_jittable_correctness
+      and not args.wp5_production_forward_jit_vs_eager
   ):
     args.correctness = True  # default to the cheap check
 
@@ -2595,3 +2973,13 @@ if __name__ == "__main__":
 
   if args.wp6_quantized_vs_bf16_active_expert_scan:
     profile_stage_c_quantized_vs_bf16_active_expert_scan(output_dir=args.output_dir)
+
+  if args.single_shard_forward_jittable_correctness:
+    ok_single_shard = check_single_shard_forward_jittable_correctness()
+    assert ok_single_shard, (
+        "latent_moe_forward_ragged_dot_single_shard_jittable diverges from the naive reference "
+        "-- do not wire this into any real deployment or trust its latency numbers until fixed"
+    )
+
+  if args.wp5_production_forward_jit_vs_eager:
+    profile_production_forward_jit_vs_eager(output_dir=args.output_dir)

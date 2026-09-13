@@ -1379,6 +1379,110 @@ def check_route_and_filter_correctness(
   return all_ok
 
 
+def route_and_filter_to_local_shard_jittable(
+    hidden_states: jax.Array,
+    x: jax.Array,
+    router_weight: jax.Array,
+    e_score_correction_bias: jax.Array,
+    config: LatentMoEConfig,
+    local_expert_start: int,
+    local_num_experts: int,
+    capacity_factor: float = 2.0,
+    tile_size: int = _MOSAIC_TILE_SIZE,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """WP5's jittable dispatch, wired one level up: the `jax.jit`-compatible
+  analog of `route_and_filter_to_local_shard`, i.e. `_router_gate` (already
+  jit-compatible -- regular router matmul/sigmoid/top-k, no data-dependent
+  shapes) composed with `filter_and_pad_to_shard_jittable` instead of the
+  eager `filter_and_pad_to_shard`. Same signature, same return value
+  meaning -- see `route_and_filter_to_local_shard`'s docstring.
+
+  This is a thin composition of two already-individually-verified pieces
+  (`_router_gate` is used identically by both the eager and jittable
+  callers; `filter_and_pad_to_shard_jittable`'s own correctness is proven by
+  `check_jittable_dispatch_matches_baseline`), but the COMPOSITION itself
+  -- and specifically whether wrapping BOTH stages together in one
+  `jax.jit` actually compiles -- is not automatically guaranteed by that
+  and is checked separately by
+  `check_route_and_filter_jittable_matches_baseline` below, following this
+  project's standing discipline of not assuming a composition is correct
+  just because its parts are (see `_filter_and_pad_to_shard_instrumented`'s
+  docstring for the same discipline applied elsewhere).
+  """
+  topk_idx, topk_weight = _router_gate(hidden_states, router_weight, e_score_correction_bias, config)
+  return filter_and_pad_to_shard_jittable(
+      topk_idx, topk_weight, x, config, local_expert_start, local_num_experts,
+      capacity_factor=capacity_factor, tile_size=tile_size,
+  )
+
+
+def check_route_and_filter_jittable_matches_baseline(seed: int = 0) -> bool:
+  """Proves `route_and_filter_to_local_shard_jittable` is bit-for-bit
+  identical to the real, eager `route_and_filter_to_local_shard` -- across
+  the same standard/overflow/decode-scale cases
+  `check_jittable_dispatch_matches_baseline` already covers for the
+  dispatch piece alone -- AND that the WHOLE router+filter composition
+  actually compiles under a SINGLE `jax.jit` (not just that
+  `filter_and_pad_to_shard_jittable` does in isolation, which is all the
+  existing check proves). CPU-only, no tokamax/TPU needed, runs anywhere.
+  """
+  config = kimi_k3_config()  # real hidden_size=7168, num_experts=896, top_k=16
+  all_ok = True
+
+  cases = [
+      ("standard", 64, 137, 64, 2.0),
+      ("overflow", 64, 137, 64, 0.05),
+      ("decode_scale", 1, 137, 64, 2.0),
+  ]
+  for name, num_tokens, local_expert_start, local_num_experts, capacity_factor in cases:
+    key = jax.random.key(hash(name) % (2**31))
+    keys = jax.random.split(key, 4)
+    hidden_states = jax.random.normal(keys[0], (num_tokens, config.hidden_size), dtype=jnp.bfloat16)
+    router_weight = jax.random.normal(keys[1], (config.hidden_size, config.num_experts)) * 0.02
+    e_score_correction_bias = jax.random.normal(keys[2], (config.num_experts,)) * 0.02
+    x = jax.random.normal(keys[3], (num_tokens, config.latent_size), dtype=jnp.bfloat16)
+
+    kwargs = dict(
+        config=config, local_expert_start=local_expert_start,
+        local_num_experts=local_num_experts, capacity_factor=capacity_factor,
+    )
+    baseline = route_and_filter_to_local_shard(
+        hidden_states, x, router_weight, e_score_correction_bias, **kwargs
+    )
+    eager_new = route_and_filter_to_local_shard_jittable(
+        hidden_states, x, router_weight, e_score_correction_bias, **kwargs
+    )
+
+    try:
+      jitted_fn = jax.jit(
+          functools.partial(route_and_filter_to_local_shard_jittable, **kwargs)
+      )
+      jit_new = jitted_fn(hidden_states, x, router_weight, e_score_correction_bias)
+      jit_compiles = True
+    except Exception as e:  # noqa: BLE001 -- recording the failure itself is the point
+      jit_new = None
+      jit_compiles = False
+      print(f"[route-filter-jittable-check] case={name}: JIT COMPILATION FAILED: {e}")
+
+    case_ok = jit_compiles
+    for i, arr_name in enumerate(
+        ("sorted_tokens", "group_sizes", "valid_mask", "per_expert_counts",
+         "padded_token_idx", "padded_combine_weight")
+    ):
+      eager_match = bool(jnp.array_equal(baseline[i], eager_new[i]))
+      jit_match = bool(jnp.array_equal(baseline[i], jit_new[i])) if jit_compiles else False
+      print(
+          f"[route-filter-jittable-check] case={name} {arr_name}: "
+          f"eager_match={eager_match} jit_match={jit_match}"
+      )
+      case_ok = case_ok and eager_match and jit_match
+    print(f"[route-filter-jittable-check] case={name}: {'OK' if case_ok else 'MISMATCH'}")
+    all_ok = all_ok and case_ok
+
+  print(f"[route-filter-jittable-check] {'ALL CASES MATCH, JIT COMPILES' if all_ok else 'FAILED'}")
+  return all_ok
+
+
 def _local_shard_expert_ffn(
     sorted_tokens: jax.Array,
     expert_gate: jax.Array,
@@ -1619,3 +1723,11 @@ if __name__ == "__main__":
       "from the real filter_and_pad_to_shard, or fails to jax.jit-compile -- do not use it until fixed"
   )
   print("OK: jittable dispatch restructuring matches the real dispatch function and compiles under jax.jit")
+
+  route_filter_jittable_ok = check_route_and_filter_jittable_matches_baseline()
+  assert route_filter_jittable_ok, (
+      "route_and_filter_to_local_shard_jittable (WP5 wired one level up, router+filter together) "
+      "diverges from the real route_and_filter_to_local_shard, or fails to jax.jit-compile as a "
+      "whole -- do not wire this into any forward pass until fixed"
+  )
+  print("OK: jittable route+filter composition matches the real function and compiles under jax.jit")

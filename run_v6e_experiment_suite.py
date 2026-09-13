@@ -473,6 +473,31 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Step 8j: wiring WP5's jittable dispatch into a production forward pass
+  # (2026-09-13) -- correctness proof for
+  # latent_moe_forward_ragged_dot_single_shard_jittable (router+filter+
+  # ragged_dot FFN+combine+shared experts, the whole thing under one
+  # jax.jit) against the naive unsharded reference.
+  results.append(_run_step(
+      "single_shard_forward_jittable_correctness", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py",
+       "--single-shard-forward-jittable-correctness"],
+      output_dir,
+  ))
+
+  # Step 8k: the real end-to-end payoff of step 8j -- full forward pass
+  # latency, eager-dispatch composition vs. the new fully-jittable one.
+  # This step's own subprocess re-checks 8j's correctness internally
+  # (profile_production_forward_jit_vs_eager refuses to run otherwise), but
+  # if 8j itself failed, do not trust this step's numbers either.
+  results.append(_run_step(
+      "wp5_production_forward_jit_vs_eager", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py",
+       "--wp5-production-forward-jit-vs-eager",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]
