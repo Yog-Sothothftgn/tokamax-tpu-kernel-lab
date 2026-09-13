@@ -1282,6 +1282,12 @@ def profile_stage_c_active_expert_scan(
   on the v6e TPU VM. Do not trust its output until it has actually
   executed on hardware.
   """
+  assert m_padded % _MOSAIC_TILE_SIZE == 0, (
+      f"m_padded={m_padded} is not a multiple of {_MOSAIC_TILE_SIZE} -- Mosaic requires this "
+      "(confirmed the hard way: an unaligned m_padded in a sibling scan function crashed with a "
+      "ValueError from an internal kernel reshape). The default (4736) is already aligned; if "
+      "you're passing a different value, round it via _round_up_to_tile first."
+  )
   global_config = kimi_k3_config()
   key = jax.random.key(seed)
   keys = jax.random.split(key, 4)
