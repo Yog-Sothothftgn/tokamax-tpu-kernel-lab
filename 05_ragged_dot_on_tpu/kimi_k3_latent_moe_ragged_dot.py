@@ -1581,6 +1581,121 @@ def profile_stage_c_active_expert_scan_fixed_tpe(
   return results
 
 
+def profile_stage_c_local_num_experts_scan(
+    seed: int = 0,
+    num_active_experts: int = 8,
+    tokens_per_expert: int = 74,
+    local_num_experts_list: tuple[int, ...] = (8, 16, 32, 64, 128, 256),
+    implementation: str = "mosaic_tpu_v2",
+    num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """WP6 decomposition follow-up B (`wp4_summary.md` section 11, per the
+  user's 2026-09-13 execution plan): holds the number of ACTIVE experts
+  and tokens-per-expert FIXED while varying `local_num_experts` -- the
+  TOTAL number of expert slots in the weight array and `group_sizes`, most
+  of which stay at exactly 0 tokens throughout. Tests whether Stage C's
+  cost depends on the size of the WHOLE weight array (even the
+  never-touched, always-zero slots), or purely on the active portion,
+  regardless of how many total (mostly-empty) slots surround it.
+
+  If latency stays FLAT as `local_num_experts` grows (active-expert count
+  and `m_padded` both held fixed), that supports "cost depends only on the
+  active groups" cleanly -- ruling out one more alternative explanation
+  (total weight-array size, not just active-group count, driving cost)
+  before attempting the harder weight-BYTES-scaling experiment (which
+  needs quantized weights and a real correctness check, see the
+  `rhs_scale`-based experiments planned in `wp4_summary.md` section 11).
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  global_config = kimi_k3_config()
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  raw_total = num_active_experts * tokens_per_expert
+  m_padded = _round_up_to_tile(raw_total)
+  pad_size = m_padded - raw_total
+
+  results = []
+  for local_num_experts in local_num_experts_list:
+    if num_active_experts > local_num_experts:
+      raise ValueError(
+          f"num_active_experts={num_active_experts} exceeds local_num_experts={local_num_experts}"
+      )
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, 4)
+    scale = 0.02
+
+    def normal(k, shape):
+      return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+    shard_gate = normal(
+        keys[0], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+    )
+    shard_up = normal(
+        keys[1], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+    )
+    shard_down = normal(
+        keys[2], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+    )
+    sorted_tokens = normal(keys[3], (m_padded, global_config.latent_size))
+
+    group_counts = (
+        [tokens_per_expert] * num_active_experts
+        + [0] * (local_num_experts - num_active_experts)
+        + [pad_size]
+    )
+    group_sizes = jnp.array(group_counts, dtype=jnp.int32)
+    assert int(jnp.sum(group_sizes)) == m_padded, "group_sizes must sum to m_padded"
+
+    stage_c_fn = functools.partial(
+        _local_shard_expert_ffn_ragged_dot, group_sizes=group_sizes, config=global_config,
+        implementation=implementation,
+    )
+    stage_c_ms = _time_jit(stage_c_fn, sorted_tokens, shard_gate, shard_up, shard_down)
+
+    result = {
+        "local_num_experts": local_num_experts,
+        "num_active_experts": num_active_experts,
+        "tokens_per_expert": tokens_per_expert,
+        "m_padded": m_padded,
+        "implementation": implementation,
+        "stage_c_ms": stage_c_ms,
+    }
+    results.append(result)
+    print(
+        f"[stage-c-local-num-experts-scan] local_num_experts={local_num_experts} "
+        f"num_active_experts={num_active_experts} m_padded={m_padded} "
+        f"implementation={implementation!r} stage_c_ms={stage_c_ms:.4f}ms"
+    )
+
+  print(
+      "\n[stage-c-local-num-experts-scan] If stage_c_ms stays FLAT as local_num_experts grows "
+      "(active experts and m_padded held fixed), cost depends only on the ACTIVE portion of the "
+      "weight array, not its total size -- rules out one more alternative explanation before "
+      "attempting the harder weight-bytes-scaling experiment."
+  )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp6_stage_c_local_num_experts_scan.csv",
+        results,
+        ["local_num_experts", "num_active_experts", "tokens_per_expert", "m_padded",
+         "implementation", "stage_c_ms"],
+    )
+  return results
+
+
 def run_shard_workload_benchmark(
     seed: int = 0, num_experts: int = 64, num_tokens: int = 2048
 ) -> None:
@@ -2060,6 +2175,14 @@ if __name__ == "__main__":
       "profile_stage_c_active_expert_scan_fixed_tpe's docstring.",
   )
   parser.add_argument(
+      "--wp6-stage-c-local-num-experts-scan",
+      action="store_true",
+      help="WP6 decomposition follow-up B (user's 2026-09-13 plan): holds active-expert count "
+      "and tokens-per-expert fixed while varying local_num_experts (total weight-array slots, "
+      "most always zero) -- tests whether cost depends on total array size or just the active "
+      "portion. See profile_stage_c_local_num_experts_scan's docstring.",
+  )
+  parser.add_argument(
       "--wp4-dispatch-trace-dir",
       type=pathlib.Path,
       default=None,
@@ -2091,6 +2214,7 @@ if __name__ == "__main__":
       and not args.wp6_stage_c_active_expert_scan
       and not args.wp6_stage_c_tokens_per_expert_scan
       and not args.wp6_active_expert_scan_fixed_tpe
+      and not args.wp6_stage_c_local_num_experts_scan
   ):
     args.correctness = True  # default to the cheap check
 
@@ -2154,3 +2278,6 @@ if __name__ == "__main__":
 
   if args.wp6_active_expert_scan_fixed_tpe:
     profile_stage_c_active_expert_scan_fixed_tpe(output_dir=args.output_dir)
+
+  if args.wp6_stage_c_local_num_experts_scan:
+    profile_stage_c_local_num_experts_scan(output_dir=args.output_dir)

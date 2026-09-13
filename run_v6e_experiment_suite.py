@@ -438,6 +438,16 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Step 8g: WP6 decomposition follow-up B (user's 2026-09-13 plan) -- does
+  # cost depend on the TOTAL weight-array size (including never-touched
+  # zero-count slots), or purely the active portion?
+  results.append(_run_step(
+      "wp6_stage_c_local_num_experts_scan", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp6-stage-c-local-num-experts-scan",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]
