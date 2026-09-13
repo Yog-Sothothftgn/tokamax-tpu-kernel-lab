@@ -1696,6 +1696,110 @@ def profile_stage_c_local_num_experts_scan(
   return results
 
 
+def check_quantized_ragged_dot_matches_dequantized(
+    seed: int = 0,
+    tokens_per_expert: int = 74,
+    implementation: str = "mosaic_tpu_v2",
+) -> bool:
+  """WP6 decomposition follow-up A0 (`wp4_summary.md` section 11, per the
+  user's 2026-09-13 execution plan): a MINIMAL correctness check for the
+  `rhs`+`rhs_scale` quantized-weight API on `mosaic_tpu_v2`, required
+  BEFORE trusting any A1/A2 timing comparison between bf16 and quantized
+  weights -- a "the numbers look nice" timing-only result would be
+  worthless if the quantization call itself is silently wrong (e.g. a
+  mismatched broadcast shape for `rhs_scale`).
+
+  Uses `jnp.float8_e4m3fn` (NOT int8) -- confirmed via tokamax's own test
+  suite (`pallas_mosaic_tpu_v2_test.py`'s `test_gmm_weight_quantized_pipes`
+  and friends) to be the dtype `mosaic_tpu_v2` is actually tested with for
+  this API; `int8` may hit a different, unvalidated code path. The
+  quantization scheme (per-group, whole-K-axis single scale, i.e.
+  `block_size` equal to the full K dimension -- the simplest case, not
+  tokamax's more general sub-block quantization) and the
+  `rhs_scale = jnp.expand_dims(scale, axis=2)` shape convention are copied
+  directly from that same real, tested example, not guessed.
+
+  Method: quantize one small expert-shaped weight tensor to fp8, then
+  compare two independently-computed outputs for the SAME logical matmul:
+  (a) the quantized path -- `tokamax.ragged_dot(lhs, rhs_q, group_sizes,
+  rhs_scale=rhs_scale, ...)`, letting the kernel dequantize internally;
+  (b) a manually-dequantized reference -- `rhs_q.astype(float32) *
+  rhs_scale_raw` computed in plain JAX (not through the kernel at all),
+  fed into the SAME `tokamax.ragged_dot` call but as plain bf16 weights,
+  no scale. These should agree closely (bounded by fp8's real quantization
+  error, not by how carefully the API was called) -- a large, non-fp8-
+  shaped discrepancy would mean the scale's shape/broadcast is wrong, not
+  that fp8 is imprecise.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM. Do NOT trust any A1/A2 timing result if this check
+  fails.
+  """
+  global_config = kimi_k3_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 2)
+  scale = 0.02
+
+  latent_size = global_config.latent_size
+  intermediate_size = global_config.intermediate_size
+
+  # Minimal 2-group array: 1 real expert + 1 padding-bucket group (unused).
+  local_num_experts = 1
+  raw_total = tokens_per_expert
+  m_padded = _round_up_to_tile(raw_total)
+  pad_size = m_padded - raw_total
+  group_sizes = jnp.array([tokens_per_expert, pad_size], dtype=jnp.int32)
+
+  rhs_bf16 = (
+      jax.random.normal(keys[0], (local_num_experts + 1, latent_size, intermediate_size)) * scale
+  ).astype(jnp.bfloat16)
+  sorted_tokens = (
+      jax.random.normal(keys[1], (m_padded, latent_size)) * scale
+  ).astype(jnp.bfloat16)
+
+  # Quantize with ONE scale per (group, output-channel) -- block_size equal
+  # to the full K axis, the simplest case of tokamax's own quantize_tensor
+  # helper (reimplemented here rather than imported, since that helper
+  # lives under a test-only path not meant for import from production code).
+  abs_max = jnp.max(jnp.abs(rhs_bf16), axis=1, keepdims=True)  # (G, 1, N)
+  fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+  rhs_scale_raw = (abs_max / fp8_max).astype(jnp.float32)  # (G, 1, N)
+  rhs_q = jnp.clip(rhs_bf16.astype(jnp.float32) / rhs_scale_raw, -fp8_max, fp8_max).astype(
+      jnp.float8_e4m3fn
+  )
+  rhs_scale = jnp.expand_dims(rhs_scale_raw, axis=2)  # (G, 1, 1, N), matches the real test's shape
+
+  quantized_fn = jax.jit(
+      functools.partial(
+          tokamax.ragged_dot, group_sizes=group_sizes, rhs_scale=rhs_scale,
+          maybe_quantize_lhs=False, implementation=implementation,
+      )
+  )
+  quantized_out = quantized_fn(sorted_tokens, rhs_q)
+
+  # Reference: dequantize manually in plain JAX, then run the SAME
+  # ragged_dot call as an ordinary bf16 matmul (no scale at all).
+  rhs_dequantized = (rhs_q.astype(jnp.float32) * rhs_scale_raw).astype(jnp.bfloat16)
+  reference_fn = jax.jit(
+      functools.partial(
+          tokamax.ragged_dot, group_sizes=group_sizes, implementation=implementation,
+      )
+  )
+  reference_out = reference_fn(sorted_tokens, rhs_dequantized)
+
+  max_abs_diff = float(jnp.max(jnp.abs(quantized_out.astype(jnp.float32) - reference_out.astype(jnp.float32))))
+  # fp8 e4m3's mantissa is 3 bits (~1/8 relative precision per element); a
+  # generous but still meaningful tolerance for a K=3584-deep reduction.
+  tolerance = 0.05
+  ok = max_abs_diff < tolerance
+  print(
+      f"[quantized-ragged-dot-check] implementation={implementation!r} "
+      f"max_abs_diff={max_abs_diff:.6f} tolerance={tolerance} "
+      f"{'OK' if ok else 'FAIL -- rhs_scale API likely used incorrectly, do not trust A1/A2'}"
+  )
+  return ok
+
+
 def run_shard_workload_benchmark(
     seed: int = 0, num_experts: int = 64, num_tokens: int = 2048
 ) -> None:
@@ -2183,6 +2287,14 @@ if __name__ == "__main__":
       "portion. See profile_stage_c_local_num_experts_scan's docstring.",
   )
   parser.add_argument(
+      "--wp6-quantized-ragged-dot-correctness",
+      action="store_true",
+      help="WP6 decomposition follow-up A0 (user's 2026-09-13 plan): minimal correctness check "
+      "for the rhs+rhs_scale quantized-weight API (fp8 e4m3) on mosaic_tpu_v2, comparing against "
+      "a manually-dequantized bf16 reference. MUST pass before any A1/A2 quantized-vs-bf16 timing "
+      "comparison is trusted. See check_quantized_ragged_dot_matches_dequantized's docstring.",
+  )
+  parser.add_argument(
       "--wp4-dispatch-trace-dir",
       type=pathlib.Path,
       default=None,
@@ -2215,6 +2327,7 @@ if __name__ == "__main__":
       and not args.wp6_stage_c_tokens_per_expert_scan
       and not args.wp6_active_expert_scan_fixed_tpe
       and not args.wp6_stage_c_local_num_experts_scan
+      and not args.wp6_quantized_ragged_dot_correctness
   ):
     args.correctness = True  # default to the cheap check
 
@@ -2281,3 +2394,11 @@ if __name__ == "__main__":
 
   if args.wp6_stage_c_local_num_experts_scan:
     profile_stage_c_local_num_experts_scan(output_dir=args.output_dir)
+
+  if args.wp6_quantized_ragged_dot_correctness:
+    ok_quantized = check_quantized_ragged_dot_matches_dequantized()
+    assert ok_quantized, (
+        "quantized ragged_dot (rhs+rhs_scale) diverges from the manually-dequantized bf16 "
+        "reference by more than fp8 quantization error should allow -- do not run A1/A2 timing "
+        "experiments until this is fixed"
+    )

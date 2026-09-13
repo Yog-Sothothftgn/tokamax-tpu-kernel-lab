@@ -448,6 +448,17 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Step 8h: WP6 decomposition follow-up A0 (user's 2026-09-13 plan) -- a
+  # minimal correctness check for the rhs+rhs_scale quantized-weight API
+  # (fp8 e4m3) on mosaic_tpu_v2, required to pass BEFORE trusting any A1/A2
+  # bf16-vs-quantized timing comparison.
+  results.append(_run_step(
+      "wp6_quantized_ragged_dot_correctness", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--wp6-quantized-ragged-dot-correctness",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]
