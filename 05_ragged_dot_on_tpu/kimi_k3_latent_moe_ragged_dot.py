@@ -1833,6 +1833,152 @@ def check_quantized_ragged_dot_matches_dequantized(
   return ok
 
 
+def profile_stage_c_quantized_vs_bf16_active_expert_scan(
+    seed: int = 0,
+    tokens_per_expert: int = 74,
+    num_active_experts_list: tuple[int, ...] = (16, 32, 64),
+    implementation: str = "mosaic_tpu_v2",
+    num_repeats: int = 20,
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """WP6 decomposition follow-up A1+A2 combined (per the user's 2026-09-13
+  execution plan) -- ONLY meaningful if `check_quantized_ragged_dot_matches_dequantized`
+  (A0) has already passed on this same hardware/tokamax version; this
+  function does not re-verify correctness itself, only measures latency.
+
+  A1 (bf16-vs-quantized performance comparison) and A2 (multi-scale check,
+  observing whether the per-expert latency SLOPE drops after quantization)
+  are combined into ONE scan rather than built separately: measuring both
+  the bf16 and fp8-quantized paths at the SAME `num_active_experts` points,
+  in the SAME run, with the SAME `_time_jit` method, is what actually makes
+  a valid apples-to-apples comparison -- this project already learned the
+  hard way (section 5's checklist correction, `wp4_summary.md`) that
+  comparing numbers from two different scripts/runs/timing-methods is not
+  safe even when the shapes look the same. Reusing the OLD bf16 numbers
+  from `profile_stage_c_active_expert_scan_fixed_tpe` (a different run) for
+  this comparison would repeat that exact mistake.
+
+  Default `num_active_experts_list=(16, 32, 64)` at `tokens_per_expert=74`
+  intentionally reproduces the exact `m_padded`/`pad_size` configurations
+  already confirmed in `profile_stage_c_active_expert_scan_fixed_tpe`'s
+  bf16-only run (16->m_padded=1280, 32->2432, 64->4736) -- so this run's own
+  bf16 column can ALSO be cross-checked against that prior, independently-
+  run result as a sanity check, without being the thing the A1/A2
+  conclusion is actually based on.
+
+  The user's own framing of what matters here: the key observation is not
+  any single latency value, but the per-expert SLOPE -- a lower quantized-
+  path slope, with A0 already passing, is what would make a real
+  weight-bytes-scaling case; a single point being faster is not enough on
+  its own to distinguish "less HBM traffic" from "coincidence at this one
+  scale."
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  if implementation != "mosaic_tpu_v2":
+    raise NotImplementedError(
+        "the quantized path calls PallasMosaicTpuV2RaggedDot directly (see "
+        "check_quantized_ragged_dot_matches_dequantized's docstring); "
+        f"implementation={implementation!r} is not supported here."
+    )
+
+  global_config = kimi_k3_config()
+  latent_size = global_config.latent_size
+  intermediate_size = global_config.intermediate_size
+  fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) * 1000 / num_repeats
+
+  results = []
+  for num_active_experts in num_active_experts_list:
+    raw_total = num_active_experts * tokens_per_expert
+    m_padded = _round_up_to_tile(raw_total)
+    pad_size = m_padded - raw_total
+    group_sizes = jnp.array(
+        [tokens_per_expert] * num_active_experts + [pad_size], dtype=jnp.int32
+    )
+    assert int(jnp.sum(group_sizes)) == m_padded, "group_sizes must sum to m_padded"
+
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, 2)
+    scale = 0.02
+    rhs_bf16 = jax.random.normal(
+        keys[0], (num_active_experts + 1, latent_size, intermediate_size), dtype=jnp.bfloat16
+    ) * jnp.bfloat16(scale)
+    sorted_tokens = jax.random.normal(
+        keys[1], (m_padded, latent_size), dtype=jnp.bfloat16
+    ) * jnp.bfloat16(scale)
+
+    bf16_fn = functools.partial(
+        tokamax.ragged_dot, group_sizes=group_sizes, implementation=implementation
+    )
+    bf16_ms = _time_jit(bf16_fn, sorted_tokens, rhs_bf16)
+
+    # Same quantization scheme as A0: per-group, whole-K-axis single scale.
+    abs_max = jnp.max(jnp.abs(rhs_bf16.astype(jnp.float32)), axis=1, keepdims=True)
+    rhs_scale_raw = (abs_max / fp8_max).astype(jnp.float32)
+    rhs_q = jnp.clip(
+        rhs_bf16.astype(jnp.float32) / rhs_scale_raw, -fp8_max, fp8_max
+    ).astype(jnp.float8_e4m3fn)
+    rhs_scale = jnp.expand_dims(rhs_scale_raw, axis=2)
+
+    quantized_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+    quantized_fn = functools.partial(
+        quantized_op, group_sizes=group_sizes, rhs_scale=rhs_scale, maybe_quantize_lhs=False
+    )
+    quantized_ms = _time_jit(quantized_fn, sorted_tokens, rhs_q)
+
+    result = {
+        "num_active_experts": num_active_experts,
+        "tokens_per_expert": tokens_per_expert,
+        "m_padded": m_padded,
+        "implementation": implementation,
+        "bf16_ms": bf16_ms,
+        "quantized_ms": quantized_ms,
+        "speedup": bf16_ms / quantized_ms,
+    }
+    results.append(result)
+    print(
+        f"[quantized-vs-bf16-scan] num_active_experts={num_active_experts} "
+        f"m_padded={m_padded} bf16_ms={bf16_ms:.4f} quantized_ms={quantized_ms:.4f} "
+        f"speedup={result['speedup']:.3f}x"
+    )
+
+  if len(results) >= 2:
+    r_lo, r_hi = results[0], results[-1]
+    d_active = r_hi["num_active_experts"] - r_lo["num_active_experts"]
+    bf16_slope = (r_hi["bf16_ms"] - r_lo["bf16_ms"]) / d_active
+    quantized_slope = (r_hi["quantized_ms"] - r_lo["quantized_ms"]) / d_active
+    print(
+        f"\n[quantized-vs-bf16-scan] per-active-expert SLOPE from "
+        f"{r_lo['num_active_experts']}->{r_hi['num_active_experts']} active experts: "
+        f"bf16={bf16_slope:.4f} ms/expert, quantized={quantized_slope:.4f} ms/expert "
+        f"(ratio={quantized_slope / bf16_slope:.3f}). This ratio, not any single point's "
+        "speedup, is the load-bearing number for the weight-bytes-scaling question -- a "
+        "ratio well below 1.0 (with A0 already passing) is real evidence for HBM "
+        "bandwidth as the binding constraint; a ratio near 1.0 would mean per-group "
+        "overhead dominates over weight-read cost, regardless of dtype."
+    )
+
+  if output_dir is not None:
+    _write_csv(
+        pathlib.Path(output_dir) / "wp6_quantized_vs_bf16_active_expert_scan.csv",
+        results,
+        ["num_active_experts", "tokens_per_expert", "m_padded", "implementation",
+         "bf16_ms", "quantized_ms", "speedup"],
+    )
+  return results
+
+
 def run_shard_workload_benchmark(
     seed: int = 0, num_experts: int = 64, num_tokens: int = 2048
 ) -> None:
@@ -2328,6 +2474,16 @@ if __name__ == "__main__":
       "comparison is trusted. See check_quantized_ragged_dot_matches_dequantized's docstring.",
   )
   parser.add_argument(
+      "--wp6-quantized-vs-bf16-active-expert-scan",
+      action="store_true",
+      help="WP6 decomposition follow-up A1+A2 combined (user's 2026-09-13 plan): measures "
+      "bf16 and fp8-quantized (rhs_scale) Stage C latency at the SAME num_active_experts "
+      "points in the same run, reporting the per-expert latency SLOPE for each -- a lower "
+      "quantized slope is evidence for HBM bandwidth as the binding constraint. Only "
+      "meaningful if --wp6-quantized-ragged-dot-correctness (A0) has already passed. See "
+      "profile_stage_c_quantized_vs_bf16_active_expert_scan's docstring.",
+  )
+  parser.add_argument(
       "--wp4-dispatch-trace-dir",
       type=pathlib.Path,
       default=None,
@@ -2361,6 +2517,7 @@ if __name__ == "__main__":
       and not args.wp6_active_expert_scan_fixed_tpe
       and not args.wp6_stage_c_local_num_experts_scan
       and not args.wp6_quantized_ragged_dot_correctness
+      and not args.wp6_quantized_vs_bf16_active_expert_scan
   ):
     args.correctness = True  # default to the cheap check
 
@@ -2435,3 +2592,6 @@ if __name__ == "__main__":
         "reference by more than fp8 quantization error should allow -- do not run A1/A2 timing "
         "experiments until this is fixed"
     )
+
+  if args.wp6_quantized_vs_bf16_active_expert_scan:
+    profile_stage_c_quantized_vs_bf16_active_expert_scan(output_dir=args.output_dir)

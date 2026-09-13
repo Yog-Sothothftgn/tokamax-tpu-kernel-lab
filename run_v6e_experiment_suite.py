@@ -459,6 +459,20 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Step 8i: WP6 decomposition follow-up A1+A2 combined (user's 2026-09-13
+  # plan) -- bf16-vs-fp8-quantized Stage C latency SLOPE comparison across
+  # active-expert counts. This step's own subprocess does NOT check that
+  # step 8h (A0) passed -- each orchestrator step runs and is classified
+  # independently -- so if A0 has not already passed on this exact
+  # hardware/tokamax version, do not trust this step's numbers.
+  results.append(_run_step(
+      "wp6_quantized_vs_bf16_active_expert_scan", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py",
+       "--wp6-quantized-vs-bf16-active-expert-scan",
+       "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
   # Save JSON + CSV summaries.
   (output_dir / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
   fieldnames = ["name", "status", "returncode", "elapsed_s", "log_file", "note"]
