@@ -137,6 +137,12 @@ if not hasattr(_hijax, "MutableHiType"):
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import tokamax  # noqa: E402
+# The public `tokamax.ragged_dot(...)` API does not forward `rhs_scale`/
+# `rhs_bias`/`maybe_quantize_lhs` (confirmed by reading api.py's signature,
+# and the hard way via a real TypeError on hardware) -- the only tested way
+# to exercise the quantization path is to call this op class directly, as
+# tokamax's own pallas_mosaic_tpu_v2_test.py does.
+from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2  # noqa: E402
 
 from kimi_k3_latent_moe_reference import (  # noqa: E402
     LatentMoEConfig,
@@ -1637,7 +1643,16 @@ def profile_stage_c_local_num_experts_scan(
     scale = 0.02
 
     def normal(k, shape):
-      return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+      # Generate directly in bf16 (NOT the `normal(...) * scale).astype(bf16)`
+      # pattern used elsewhere in this file) -- confirmed the hard way on
+      # hardware: at local_num_experts=256, that pattern's transient float32
+      # intermediate for a (257, 3584, 3072) tensor needs ~10.54GiB, which
+      # OOM'd (`RESOURCE_EXHAUSTED`) with only ~10.13GiB free at that point
+      # in the sweep. Every other `normal()` helper in this file stays at the
+      # smaller local_num_experts=64 scale used throughout the rest of this
+      # project, where the float32 intermediate never gets large enough to
+      # matter -- this fix is scoped to this function, not applied broadly.
+      return jax.random.normal(k, shape, dtype=jnp.bfloat16) * jnp.bfloat16(scale)
 
     shard_gate = normal(
         keys[0], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
@@ -1721,15 +1736,25 @@ def check_quantized_ragged_dot_matches_dequantized(
 
   Method: quantize one small expert-shaped weight tensor to fp8, then
   compare two independently-computed outputs for the SAME logical matmul:
-  (a) the quantized path -- `tokamax.ragged_dot(lhs, rhs_q, group_sizes,
-  rhs_scale=rhs_scale, ...)`, letting the kernel dequantize internally;
-  (b) a manually-dequantized reference -- `rhs_q.astype(float32) *
-  rhs_scale_raw` computed in plain JAX (not through the kernel at all),
-  fed into the SAME `tokamax.ragged_dot` call but as plain bf16 weights,
-  no scale. These should agree closely (bounded by fp8's real quantization
-  error, not by how carefully the API was called) -- a large, non-fp8-
-  shaped discrepancy would mean the scale's shape/broadcast is wrong, not
-  that fp8 is imprecise.
+  (a) the quantized path -- calling the `PallasMosaicTpuV2RaggedDot` op
+  instance DIRECTLY with `rhs_scale=...`, letting the kernel dequantize
+  internally; (b) a manually-dequantized reference -- `rhs_q.astype(float32)
+  * rhs_scale_raw` computed in plain JAX (not through the kernel at all),
+  fed into the ordinary top-level `tokamax.ragged_dot` call as plain bf16
+  weights, no scale. These should agree closely (bounded by fp8's real
+  quantization error, not by how carefully the API was called) -- a large,
+  non-fp8-shaped discrepancy would mean the scale's shape/broadcast is
+  wrong, not that fp8 is imprecise.
+
+  **Important, confirmed the hard way by a real `TypeError` on hardware**:
+  the top-level `tokamax.ragged_dot(...)` function's public signature does
+  NOT accept `rhs_scale`/`rhs_bias`/`maybe_quantize_lhs` at all -- those are
+  keyword-only params of `PallasMosaicTpuV2RaggedDot._fwd`, reachable only
+  by instantiating that op class and calling the INSTANCE directly (exactly
+  how `pallas_mosaic_tpu_v2_test.py`'s own `_assert_gmm_api_matches_kernel`
+  helper does it: `op = PallasMosaicTpuV2RaggedDot(); op(lhs, rhs,
+  group_sizes=..., rhs_scale=...)`), not via `implementation="mosaic_tpu_v2"`
+  on the public API, which never forwards these extra kwargs.
 
   Has a real tokamax dependency and CANNOT be verified locally -- must run
   on the v6e TPU VM. Do NOT trust any A1/A2 timing result if this check
@@ -1769,10 +1794,18 @@ def check_quantized_ragged_dot_matches_dequantized(
   )
   rhs_scale = jnp.expand_dims(rhs_scale_raw, axis=2)  # (G, 1, 1, N), matches the real test's shape
 
+  if implementation != "mosaic_tpu_v2":
+    raise NotImplementedError(
+        "this check calls PallasMosaicTpuV2RaggedDot directly (the only "
+        "implementation whose rhs_scale-based quantization path this "
+        "project has verified against tokamax's own tests); "
+        f"implementation={implementation!r} is not supported here."
+    )
+  quantized_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
   quantized_fn = jax.jit(
       functools.partial(
-          tokamax.ragged_dot, group_sizes=group_sizes, rhs_scale=rhs_scale,
-          maybe_quantize_lhs=False, implementation=implementation,
+          quantized_op, group_sizes=group_sizes, rhs_scale=rhs_scale,
+          maybe_quantize_lhs=False,
       )
   )
   quantized_out = quantized_fn(sorted_tokens, rhs_q)
