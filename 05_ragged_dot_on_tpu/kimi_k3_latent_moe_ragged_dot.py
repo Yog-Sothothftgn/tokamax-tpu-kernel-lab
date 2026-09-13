@@ -141,9 +141,11 @@ import tokamax  # noqa: E402
 from kimi_k3_latent_moe_reference import (  # noqa: E402
     LatentMoEConfig,
     LatentMoEWeights,
+    _MOSAIC_TILE_SIZE,
     _combine_shard_contribution,
     _filter_and_pad_to_shard_instrumented,
     _rms_norm,
+    _round_up_to_tile,
     _router_gate,
     _situ_and_mul,
     _situ_glu_mlp,
@@ -1419,12 +1421,15 @@ def profile_stage_c_tokens_per_expert_scan(
 
   results = []
   for tokens_per_expert in tokens_per_expert_list:
-    m_padded = num_active_experts * tokens_per_expert
+    raw_total = num_active_experts * tokens_per_expert
+    m_padded = _round_up_to_tile(raw_total)  # Mosaic requires M to be a multiple of 128 --
+    pad_size = m_padded - raw_total          # confirmed the hard way (ValueError from an
+                                              # internal reshape) when raw_total itself wasn't.
     sorted_tokens = normal(keys[3], (m_padded, global_config.latent_size))
     group_counts = (
         [tokens_per_expert] * num_active_experts
         + [0] * (local_num_experts - num_active_experts)
-        + [0]
+        + [pad_size]
     )
     group_sizes = jnp.array(group_counts, dtype=jnp.int32)
     assert int(jnp.sum(group_sizes)) == m_padded, "group_sizes must sum to m_padded"
@@ -1523,10 +1528,13 @@ def profile_stage_c_active_expert_scan_fixed_tpe(
   for num_active in num_active_experts_list:
     if num_active > local_num_experts:
       raise ValueError(f"num_active={num_active} exceeds local_num_experts={local_num_experts}")
-    m_padded = num_active * tokens_per_expert
+    raw_total = num_active * tokens_per_expert
+    m_padded = _round_up_to_tile(raw_total)  # Mosaic requires M to be a multiple of 128 --
+    pad_size = m_padded - raw_total          # confirmed the hard way (ValueError from an
+                                              # internal reshape) when raw_total itself wasn't.
     sorted_tokens = normal(keys[3], (m_padded, global_config.latent_size))
     group_counts = (
-        [tokens_per_expert] * num_active + [0] * (local_num_experts - num_active) + [0]
+        [tokens_per_expert] * num_active + [0] * (local_num_experts - num_active) + [pad_size]
     )
     group_sizes = jnp.array(group_counts, dtype=jnp.int32)
     assert int(jnp.sum(group_sizes)) == m_padded, "group_sizes must sum to m_padded"
