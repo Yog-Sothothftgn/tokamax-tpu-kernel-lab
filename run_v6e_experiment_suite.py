@@ -51,15 +51,22 @@ Runs, in order:
      uses reduced scale (`num_experts=8`, `top_k=2`), not the real
      `num_experts=896`/`top_k=16`/`hidden=7168`/`latent=3584`/
      `intermediate=3072` -- a literal full-dimension run is infeasible on
-     one chip anyway (confirmed OOM elsewhere in this project, ~59GB) and
-     remains a separate, not-yet-done item. Each combination's structured
-     per-stage results are written to its own correctness.json.
+     one chip anyway (confirmed OOM elsewhere in this project, ~59GB); a
+     genuine (smoke-only, no reference to diff against) full-dimension run
+     is step 8l below (added 2026-09-14, WP-KV5). Each combination's
+     structured per-stage results are written to its own correctness.json.
   8. WP4's real 4-stage profiling breakdown (router+projection / dispatch
      indexing / REAL tokamax.ragged_dot / combine) -- see
      `profile_four_stages_wp4`'s docstring for an important caveat: Stage B
      is timed eagerly, not on the same jitted-device basis as A/C/D, so the
      resulting irregular-share ratio is not yet a clean device-only
      SparseCore-decision number.
+  8l. WP-KV5: the full-dimension smoke test itself (real hidden_size=7168/
+      num_experts=896/top_k=16, one shard's real per-expert weights, run
+      through the hardware-confirmed production forward pass). Checks
+      output shape and NaN/Inf-freedom only -- see
+      `run_full_dimension_smoke_test`'s docstring for why no reference
+      exists at this scale to check correctness against.
 
 Each step runs as its own subprocess (not an in-process function call) so
 that one step's crash, OOM, or compile error can never take down the
@@ -324,6 +331,16 @@ def main(output_dir: pathlib.Path) -> bool:
       [sys.executable, "verify_official_snapshot.py"], output_dir,
   ))
 
+  # Step 3b: WP-KV5 prep (2026-09-14) -- kimi_k3_config() (the hand-typed
+  # LatentMoEConfig used everywhere in 05_ragged_dot_on_tpu) cross-checked
+  # against the official snapshot, closing a previously-unaddressed gap
+  # (this hand-typed config had never been automatically verified against
+  # the real model). CPU-only, no tokamax needed.
+  results.append(_run_step(
+      "kimi_k3_config_matches_official", _GOLDEN_DIR,
+      [sys.executable, "verify_kimi_k3_config_matches_official.py"], output_dir,
+  ))
+
   # Step 4: sharded ragged_dot correctness.
   results.append(_run_step(
       "sharded_ragged_dot_correctness", _RAGGED_DOT_DIR,
@@ -495,6 +512,18 @@ def main(output_dir: pathlib.Path) -> bool:
       [sys.executable, "kimi_k3_latent_moe_ragged_dot.py",
        "--wp5-production-forward-jit-vs-eager",
        "--output-dir", str(output_dir.resolve())],
+      output_dir,
+  ))
+
+  # Step 8l: WP-KV5 -- this project's first genuine full-dimension smoke
+  # test (real hidden_size=7168/num_experts=896/top_k=16, one shard's real
+  # per-expert weights, through the hardware-confirmed
+  # latent_moe_forward_ragged_dot_single_shard_jittable). Checks output
+  # shape and NaN/Inf-freedom only -- no reference exists at this scale to
+  # check correctness against.
+  results.append(_run_step(
+      "full_dimension_smoke_test", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py", "--full-dimension-smoke-test"],
       output_dir,
   ))
 

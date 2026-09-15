@@ -687,6 +687,104 @@ def check_single_shard_forward_jittable_correctness(
   return all_ok
 
 
+def run_full_dimension_smoke_test(
+    seed: int = 0,
+    local_num_experts: int = 64,
+    num_tokens: int = 2048,
+    capacity_factor: float = 2.0,
+    implementation: str | None = "mosaic_tpu_v2",
+) -> bool:
+  """WP-KV5: this project's first genuine FULL-DIMENSION smoke test --
+  real Kimi K3 dims from `kimi_k3_config()` (`hidden_size=7168`,
+  `num_experts=896`, `top_k=16`, ..., cross-checked against the official
+  snapshot by `06_kimi_k3_golden_validation/verify_kimi_k3_config_matches_official.py`,
+  not a second hand-typed config with drift risk), run end to end through
+  `latent_moe_forward_ragged_dot_single_shard_jittable` (2026-09-13/14's
+  hardware-confirmed production wiring), with only ONE shard's real
+  per-expert weights materialized (`local_num_experts + 1` rows, the same
+  convention every other shard-scale benchmark in this project already
+  uses) -- the full 896-expert weight set would OOM (~59GB, confirmed
+  elsewhere in this project), so a true "all 896 experts" run is not
+  possible on one chip regardless of what this function does.
+
+  **This is deliberately a SMOKE test, not a correctness proof**: no
+  reference exists at this scale to diff against -- the naive Python-loop
+  reference (`latent_moe_forward`) would itself need to materialize all
+  896 experts' weights via `init_weights`, the exact same OOM. What this
+  checks instead: the real full-dimension router (`hidden_size=7168` x
+  `num_experts=896`) actually runs, `jax.jit`-compiles, and produces a
+  correctly-shaped, NaN/Inf-free output when combined with one shard's
+  real-shaped expert weights -- confirming nothing about full-dimension
+  scale (as opposed to the `local_num_experts=64`-only shapes exercised
+  everywhere else in this project) silently breaks the router/dispatch/
+  combine machinery.
+
+  Uses SYNTHETIC random weights, same convention as every other WP4/5/6
+  benchmark in this project -- validating against a REAL MXFP4 checkpoint
+  is WP-KV6's separate, not-yet-started job (this function's `hidden_act`
+  and per-expert weight SHAPES match the real model; its WEIGHT VALUES do
+  not).
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM. Do not trust its output until it has actually
+  executed on hardware.
+  """
+  global_config = kimi_k3_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 10)
+  scale = 0.02
+
+  def normal(k, shape):
+    return jax.random.normal(k, shape, dtype=jnp.bfloat16) * jnp.bfloat16(scale)
+
+  router_weight = normal(keys[0], (global_config.hidden_size, global_config.num_experts))
+  e_score_correction_bias = jnp.zeros((global_config.num_experts,), dtype=jnp.bfloat16)
+  down_proj = normal(keys[1], (global_config.hidden_size, global_config.latent_size))
+  shard_expert_gate = normal(
+      keys[2], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_expert_up = normal(
+      keys[3], (local_num_experts + 1, global_config.latent_size, global_config.intermediate_size)
+  )
+  shard_expert_down = normal(
+      keys[4], (local_num_experts + 1, global_config.intermediate_size, global_config.latent_size)
+  )
+  norm_scale = normal(keys[5], (global_config.latent_size,))
+  up_proj = normal(keys[6], (global_config.latent_size, global_config.hidden_size))
+  shared_intermediate = global_config.intermediate_size * global_config.num_shared_experts
+  shared_gate = normal(keys[7], (global_config.hidden_size, shared_intermediate))
+  shared_up = normal(keys[8], (global_config.hidden_size, shared_intermediate))
+  shared_down = normal(keys[9], (shared_intermediate, global_config.hidden_size))
+  hidden_states = jax.random.normal(
+      jax.random.fold_in(key, num_tokens), (num_tokens, global_config.hidden_size), dtype=jnp.bfloat16
+  )
+
+  fn = functools.partial(
+      latent_moe_forward_ragged_dot_single_shard_jittable,
+      config=global_config, local_expert_start=0, local_num_experts=local_num_experts,
+      capacity_factor=capacity_factor, implementation=implementation,
+  )
+  out = jax.jit(fn)(
+      hidden_states, router_weight, e_score_correction_bias, down_proj,
+      shard_expert_gate, shard_expert_up, shard_expert_down,
+      norm_scale, up_proj, shared_gate, shared_up, shared_down,
+  )
+  jax.block_until_ready(out)
+
+  expected_shape = (num_tokens, global_config.hidden_size)
+  shape_ok = out.shape == expected_shape
+  has_nan = bool(jnp.any(jnp.isnan(out)))
+  has_inf = bool(jnp.any(jnp.isinf(out)))
+  ok = shape_ok and not has_nan and not has_inf
+  print(
+      f"[full-dimension-smoke-test] hidden_size={global_config.hidden_size} "
+      f"num_experts={global_config.num_experts} local_num_experts={local_num_experts} "
+      f"num_tokens={num_tokens} output_shape={out.shape} (expected {expected_shape}) "
+      f"has_nan={has_nan} has_inf={has_inf} {'OK' if ok else 'FAIL'}"
+  )
+  return ok
+
+
 def check_sharded_ragged_dot_correctness(
     seed: int = 0,
     num_tokens: int = 96,
@@ -2753,6 +2851,15 @@ if __name__ == "__main__":
       "--single-shard-forward-jittable-correctness to pass first (checked internally).",
   )
   parser.add_argument(
+      "--full-dimension-smoke-test",
+      action="store_true",
+      help="WP-KV5: the first genuine full-dimension smoke test (real hidden_size=7168/"
+      "num_experts=896/top_k=16 from kimi_k3_config(), one shard's real per-expert weights, "
+      "run through the hardware-confirmed latent_moe_forward_ragged_dot_single_shard_jittable) "
+      "-- checks output shape and NaN/Inf-freedom, NOT correctness against a reference (none "
+      "exists at this scale). See run_full_dimension_smoke_test's docstring.",
+  )
+  parser.add_argument(
       "--autotune",
       action="store_true",
       help="also run the exhaustive autotune search in --fair-baseline (confirmed VERY slow "
@@ -2896,6 +3003,7 @@ if __name__ == "__main__":
       and not args.wp6_quantized_vs_bf16_active_expert_scan
       and not args.single_shard_forward_jittable_correctness
       and not args.wp5_production_forward_jit_vs_eager
+      and not args.full_dimension_smoke_test
   ):
     args.correctness = True  # default to the cheap check
 
@@ -2983,3 +3091,10 @@ if __name__ == "__main__":
 
   if args.wp5_production_forward_jit_vs_eager:
     profile_production_forward_jit_vs_eager(output_dir=args.output_dir)
+
+  if args.full_dimension_smoke_test:
+    ok_smoke = run_full_dimension_smoke_test()
+    assert ok_smoke, (
+        "full-dimension smoke test failed (wrong output shape or NaN/Inf) -- investigate before "
+        "treating this project's real-scale pipeline as working"
+    )
