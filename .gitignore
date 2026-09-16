@@ -11,3 +11,9 @@ __pycache__/
 # to redistribute). Fetched by validate_official_config.py /
 # generate_pytorch_golden.py; re-download locally if needed, don't publish.
 06_kimi_k3_golden_validation/official_kimi_k3/
+
+# Real Kimi K3 checkpoint weight bytes (WP-KV6), fetched via targeted HTTP
+# range requests against the official HF repo -- same "not ours to
+# redistribute" reasoning as official_kimi_k3/ above. Re-fetch locally if
+# needed, don't publish.
+05_ragged_dot_on_tpu/wp_kv6_real_weights/
