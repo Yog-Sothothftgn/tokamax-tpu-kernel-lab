@@ -476,6 +476,18 @@ def main(output_dir: pathlib.Path) -> bool:
       output_dir,
   ))
 
+  # Step 8h2: WP-KV6 prep A0b (2026-09-15 offline research) -- A0 above only
+  # tested block_size=K (one scale per whole row); the REAL Kimi K3 MXFP4
+  # checkpoint uses group_size=32 (confirmed from compressed-tensors' own
+  # source and real HTTP range-fetched tensor shapes), a genuinely
+  # different case A0's pass does not cover.
+  results.append(_run_step(
+      "wp_kv6_quantized_ragged_dot_subblock_correctness", _RAGGED_DOT_DIR,
+      [sys.executable, "kimi_k3_latent_moe_ragged_dot.py",
+       "--wp-kv6-quantized-ragged-dot-subblock-correctness"],
+      output_dir,
+  ))
+
   # Step 8i: WP6 decomposition follow-up A1+A2 combined (user's 2026-09-13
   # plan) -- bf16-vs-fp8-quantized Stage C latency SLOPE comparison across
   # active-expert counts. This step's own subprocess does NOT check that

@@ -2290,6 +2290,126 @@ def check_quantized_ragged_dot_matches_dequantized(
   return ok
 
 
+def check_quantized_ragged_dot_matches_dequantized_subblock(
+    seed: int = 0,
+    tokens_per_expert: int = 74,
+    block_size: int = 32,
+    implementation: str = "mosaic_tpu_v2",
+) -> bool:
+  """WP-KV6 prep, A0b (2026-09-15 offline research): A0 above only exercised
+  the SIMPLEST case of tokamax's `rhs_scale` API -- `block_size` equal to
+  the FULL `K` axis (one scale per whole row, no sub-block grouping). The
+  REAL Kimi K3 checkpoint's MXFP4 quantization does NOT work that way: this
+  session confirmed from `compressed-tensors`' own source
+  (`compressors/mx_utils.py`, `compressors/nvfp4/helpers.py`) and from real
+  HTTP range-fetched tensor shapes against the actual HF repo
+  (`moonshotai/Kimi-K3`'s `model.safetensors.index.json` and
+  `model-00002-of-000096.safetensors`) that the real format uses
+  `group_size=32` -- MANY scales per row (`latent_size=3584` / `32` = 112
+  groups), not one. A0 passing does NOT prove this finer-grained case works;
+  this check exercises it directly, using the exact real group size, before
+  any real-checkpoint dequant work is trusted.
+
+  `block_size=32` (default) matches the real checkpoint exactly. This is
+  also a genuinely tokamax-TESTED case, not a guess: `pallas_mosaic_tpu_v2_kernel_test.py`'s
+  own `test_gmm_weight_quantized_pipes` uses `in_size=512, block_size=256`
+  (2 sub-blocks per row) -- sub-`K` blocking is a real, supported path for
+  this kernel, not something this project is trying for the first time
+  unsupported by tokamax; only the SPECIFIC group size (32, not 256) is new
+  to this project's own testing.
+
+  Method: identical to A0 (`check_quantized_ragged_dot_matches_dequantized`)
+  -- quantize, run the quantized path via `PallasMosaicTpuV2RaggedDot`
+  directly with `rhs_scale`, and compare against a manually-dequantized
+  plain-bf16 reference -- except the quantization itself is done PER BLOCK
+  of `block_size` elements along `K`, not per whole row.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM. Do NOT trust any real-MXFP4-checkpoint dequant result
+  until this passes.
+  """
+  global_config = kimi_k3_config()
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 2)
+  scale = 0.02
+
+  latent_size = global_config.latent_size
+  intermediate_size = global_config.intermediate_size
+  if latent_size % block_size != 0:
+    raise ValueError(f"latent_size={latent_size} must divide evenly by block_size={block_size}")
+  num_blocks = latent_size // block_size
+
+  # Minimal 2-group array: 1 real expert + 1 padding-bucket group (unused).
+  local_num_experts = 1
+  raw_total = tokens_per_expert
+  m_padded = _round_up_to_tile(raw_total)
+  pad_size = m_padded - raw_total
+  group_sizes = jnp.array([tokens_per_expert, pad_size], dtype=jnp.int32)
+
+  rhs_bf16 = (
+      jax.random.normal(keys[0], (local_num_experts + 1, latent_size, intermediate_size)) * scale
+  ).astype(jnp.bfloat16)
+  sorted_tokens = (
+      jax.random.normal(keys[1], (m_padded, latent_size)) * scale
+  ).astype(jnp.bfloat16)
+
+  # Sub-block quantization: reshape K into (num_blocks, block_size), one
+  # abs-max scale per (group, block, output-channel) -- generalizes A0's
+  # whole-row quantization (there, num_blocks was implicitly 1). Same
+  # reimplement-rather-than-import reasoning as A0 (quantize_tensor lives
+  # under a test-only path).
+  G = local_num_experts + 1
+  rhs_blocks = rhs_bf16.reshape(G, num_blocks, block_size, intermediate_size)
+  abs_max = jnp.max(jnp.abs(rhs_blocks), axis=2)  # (G, num_blocks, N)
+  fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+  rhs_scale_raw = (abs_max / fp8_max).astype(jnp.float32)  # (G, num_blocks, N)
+  rhs_q_blocks = jnp.clip(
+      rhs_blocks.astype(jnp.float32) / rhs_scale_raw[:, :, None, :], -fp8_max, fp8_max
+  ).astype(jnp.float8_e4m3fn)
+  rhs_q = rhs_q_blocks.reshape(G, latent_size, intermediate_size)
+  # (G, num_blocks, 1, N) -- same expand_dims convention A0 already confirmed
+  # matches tokamax's own test's real shape, generalized to num_blocks>1.
+  rhs_scale = jnp.expand_dims(rhs_scale_raw, axis=2)
+
+  if implementation != "mosaic_tpu_v2":
+    raise NotImplementedError(
+        "this check calls PallasMosaicTpuV2RaggedDot directly (see "
+        "check_quantized_ragged_dot_matches_dequantized's docstring); "
+        f"implementation={implementation!r} is not supported here."
+    )
+  quantized_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+  quantized_fn = jax.jit(
+      functools.partial(
+          quantized_op, group_sizes=group_sizes, rhs_scale=rhs_scale,
+          maybe_quantize_lhs=False,
+      )
+  )
+  quantized_out = quantized_fn(sorted_tokens, rhs_q)
+
+  # Reference: dequantize manually per block, then run the SAME ragged_dot
+  # call as an ordinary bf16 matmul (no scale at all).
+  rhs_dequantized_blocks = rhs_q_blocks.astype(jnp.float32) * rhs_scale_raw[:, :, None, :]
+  rhs_dequantized = rhs_dequantized_blocks.reshape(G, latent_size, intermediate_size).astype(jnp.bfloat16)
+  reference_fn = jax.jit(
+      functools.partial(
+          tokamax.ragged_dot, group_sizes=group_sizes, implementation=implementation,
+      )
+  )
+  reference_out = reference_fn(sorted_tokens, rhs_dequantized)
+
+  max_abs_diff = float(jnp.max(jnp.abs(quantized_out.astype(jnp.float32) - reference_out.astype(jnp.float32))))
+  # Same fp8-appropriate tolerance as A0.
+  tolerance = 0.05
+  ok = max_abs_diff < tolerance
+  print(
+      f"[quantized-ragged-dot-subblock-check] implementation={implementation!r} "
+      f"block_size={block_size} num_blocks={num_blocks} max_abs_diff={max_abs_diff:.6f} "
+      f"tolerance={tolerance} "
+      f"{'OK' if ok else 'FAIL -- sub-block rhs_scale API likely used incorrectly, do not trust WP-KV6'}"
+  )
+  return ok
+
+
 def profile_stage_c_quantized_vs_bf16_active_expert_scan(
     seed: int = 0,
     tokens_per_expert: int = 74,
@@ -2957,6 +3077,15 @@ if __name__ == "__main__":
       "comparison is trusted. See check_quantized_ragged_dot_matches_dequantized's docstring.",
   )
   parser.add_argument(
+      "--wp-kv6-quantized-ragged-dot-subblock-correctness",
+      action="store_true",
+      help="WP-KV6 prep A0b (2026-09-15 offline research): A0 only tested block_size=K (one "
+      "scale per whole row); the REAL Kimi K3 MXFP4 checkpoint uses group_size=32 (many scales "
+      "per row), confirmed from compressed-tensors' own source and real HTTP range-fetched "
+      "tensor shapes. This exercises that exact sub-block case before trusting any real-"
+      "checkpoint dequant. See check_quantized_ragged_dot_matches_dequantized_subblock's docstring.",
+  )
+  parser.add_argument(
       "--wp6-quantized-vs-bf16-active-expert-scan",
       action="store_true",
       help="WP6 decomposition follow-up A1+A2 combined (user's 2026-09-13 plan): measures "
@@ -3004,6 +3133,7 @@ if __name__ == "__main__":
       and not args.single_shard_forward_jittable_correctness
       and not args.wp5_production_forward_jit_vs_eager
       and not args.full_dimension_smoke_test
+      and not args.wp_kv6_quantized_ragged_dot_subblock_correctness
   ):
     args.correctness = True  # default to the cheap check
 
@@ -3077,6 +3207,14 @@ if __name__ == "__main__":
         "quantized ragged_dot (rhs+rhs_scale) diverges from the manually-dequantized bf16 "
         "reference by more than fp8 quantization error should allow -- do not run A1/A2 timing "
         "experiments until this is fixed"
+    )
+
+  if args.wp_kv6_quantized_ragged_dot_subblock_correctness:
+    ok_subblock = check_quantized_ragged_dot_matches_dequantized_subblock()
+    assert ok_subblock, (
+        "quantized ragged_dot (rhs+rhs_scale) with real MXFP4 group_size=32 diverges from the "
+        "manually-dequantized bf16 reference -- do not trust any real-checkpoint dequant work "
+        "until this is fixed"
     )
 
   if args.wp6_quantized_vs_bf16_active_expert_scan:
