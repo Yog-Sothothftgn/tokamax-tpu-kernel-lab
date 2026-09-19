@@ -200,6 +200,37 @@ from upstream instead of using this local copy at all) -- worth treating
 "the local tokamax clone" as a reference/reading copy only, never as a
 source of truth for what a fresh VM will actually run, and re-fetching it
 before trusting any patch plan built by reading it.
+
+**⚠️ 2026-09-19, SECOND correction, same day -- the fix above was itself
+wrong about `interleave_lane`.** Running `--fused-gateup-correctness` on
+real hardware with `prefuse_gateup_weights` calling `interleave_lane` on
+the INPUT weights produced garbage, not a small rounding gap
+(`relative_max_diff` of 20.8 at the activation-only stage, 6.9 for the
+full FFN -- both far larger than the signal itself, not a precision
+issue). Root cause, found by fetching and reading tokamax's OWN test
+(`tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py::test_gmm_fused_activation`)
+rather than guessing further from `apply_act_fn`'s source alone: the test
+calls `gmm_v2.gmm_v2(lhs, rhs, ..., fuse_act=fuse_act)` with `rhs` passed
+PLAIN, never interleaved -- `interleave_lane` only appears on the side, to
+transform a SEPARATELY-computed non-fused reference output (naturally
+contiguous `[gate_out|up_out]`) into the layout the real kernel's OWN
+internal tile-scheduling happens to produce, purely so the test has a
+correctly-shaped baseline to diff the real kernel's output against. In
+other words, `deinterleave_lane` inside `apply_act_fn` undoes an INTERNAL
+kernel implementation detail (however the Mosaic tile loop pipelines
+gate/up N-tiles), not a contract the caller must satisfy on its input
+weights. **The real, caller-facing contract is exactly the ORIGINAL,
+naive one**: `rhs = jnp.concatenate([gate_weight, up_weight], axis=-1)`,
+plain and contiguous -- `prefuse_gateup_weights` reverted to this.
+
+**Lesson, sharper version of the one above**: reading a kernel's own
+internal helper functions (`apply_act_fn`, `deinterleave_lane`) is not the
+same as reading its CALLING CONVENTION -- an internal function's presence
+doesn't mean the caller must replicate its inverse. When the real
+authoritative source (the library's own test file, showing an actual
+correct call site) is available, prefer reading THAT over inferring a
+contract from kernel-internals source reading alone, especially before
+spending a real hardware run on the inferred version.
 """
 
 import argparse
@@ -577,34 +608,25 @@ def _local_shard_expert_ffn_ragged_dot(
 
 
 def prefuse_gateup_weights(expert_gate: jax.Array, expert_up: jax.Array) -> jax.Array:
-  """INTERLEAVES gate/up expert weights along the last (N) axis in
-  `num_lanes`-sized chunks (gate chunk, up chunk, gate chunk, up chunk...),
-  the layout tokamax's real, CURRENT Mosaic v2 `fuse_act` path expects.
+  """Concatenates gate/up expert weights along the last (N) axis -- plain,
+  contiguous `[gate | up]`, NOT interleaved.
 
-  **2026-09-19 correction, found the hard way on real hardware**: an
-  earlier version of this function did a plain `jnp.concatenate(...,
-  axis=-1)` (contiguous gate-half/up-half), based on reading this
-  project's own LOCAL tokamax clone -- which turned out to be pinned at a
-  commit from 2026-08-02, seven weeks stale. On a fresh VM (which always
-  `git clone`s tokamax's real current `main`), that clone's
-  `pallas_mosaic_tpu_v2_gmm_kernel.py` file doesn't even exist anymore --
-  tokamax's GMM/TGMM kernels were refactored into
-  `tokamax._src.ops.experimental.gmm_v2.gmm_v2`, and while doing so,
-  **upstream ALSO independently added SiTU-GLU support** (`apply_act_fn`'s
-  `case str() if fuse_act.startswith("situ:"):` branch) -- no local patch
-  is needed anymore, but its accumulator-splitting convention changed from
-  a plain `jnp.split(acc, 2, -1)` to `deinterleave_lane` (alternating
-  `num_lanes`-wide chunks, not two contiguous halves). This function must
-  produce the matching `interleave_lane` layout on the RHS weight side, or
-  the kernel would silently read a jumbled mix of gate/up columns.
-  Confirms a ChatGPT-relayed review's caution ("don't assume contiguous
-  concat without checking how the kernel actually splits it") was right to
-  raise, even though the specific old code it was reviewing happened to be
-  correct for the (now-obsolete) version it was written against.
-
-  Uses tokamax's own `interleave_lane` directly (not a local
-  reimplementation) so this stays correct if the exact chunking convention
-  ever changes again.
+  **2026-09-19, second correction, found by reading tokamax's OWN test
+  (`gmm_v2_test.py::test_gmm_fused_activation`) after the first "fix"
+  (interleaving the INPUT weights) produced garbage on real hardware
+  (`relative_max_diff` of 20.8/6.9, not a small rounding gap).** The
+  test's own calling code passes `rhs` PLAIN, un-interleaved, straight
+  into `gmm_v2.gmm_v2(lhs, rhs, ..., fuse_act=fuse_act)` -- it only calls
+  `interleave_lane` on the SIDE, to transform a separately-computed,
+  NON-fused reference output (naturally in contiguous `[gate_out|up_out]`
+  order) into the layout the real kernel's OWN internal accumulator
+  happens to produce, purely so the test has something to diff the real
+  kernel's output against. In other words: `deinterleave_lane` inside
+  `apply_act_fn` undoes an INTERNAL kernel scheduling detail (however the
+  Mosaic kernel's own tile loop naturally interleaves gate/up N-tiles
+  while pipelining the fused matmul), not a layout the CALLER is supposed
+  to pre-arrange. The caller-facing contract is exactly what it looks
+  like from the outside: a plain concatenated weight tensor.
 
   Split out as its own function (2026-09-18) specifically so callers can
   do this ONCE per weight set and reuse the result across many forward
@@ -616,7 +638,7 @@ def prefuse_gateup_weights(expert_gate: jax.Array, expert_up: jax.Array) -> jax.
   shape outside its timing loop and reports the concat cost separately
   from the timed kernel latency.
   """
-  return gmm_v2_kernel.interleave_lane(expert_gate, expert_up)
+  return jnp.concatenate([expert_gate, expert_up], axis=-1)
 
 
 def _fused_gateup_expert_ffn_from_prefused_weights(
@@ -629,8 +651,8 @@ def _fused_gateup_expert_ffn_from_prefused_weights(
     implementation: str | None = None,
 ) -> jax.Array:
   """Low-level half of `_local_shard_expert_ffn_ragged_dot_fused_gateup`:
-  takes an ALREADY-INTERLEAVED `fused_expert_gate_up` (see
-  `prefuse_gateup_weights`) instead of interleaving on every call -- the
+  takes an ALREADY-CONCATENATED `fused_expert_gate_up` (see
+  `prefuse_gateup_weights`) instead of concatenating on every call -- the
   form that should be used in any latency-sensitive context, since a real
   deployment would fuse weights once at load time, not on every forward
   pass.
@@ -640,9 +662,13 @@ def _fused_gateup_expert_ffn_from_prefused_weights(
   as of 2026-09-19, previously a separate `pallas_mosaic_tpu_v2_gmm_kernel.py`
   module before an upstream refactor -- see `prefuse_gateup_weights`'s
   docstring for the full story) has a `fuse_act` fusion path -- one grouped
-  matmul against the interleaved gate/up weights, split the in-kernel fp32
-  accumulator back apart, apply the activation right there, and only ever
-  write the ACTIVATED result to HBM. Upstream ALREADY supports Kimi-style
+  matmul against the concatenated gate/up weights, split the in-kernel fp32
+  accumulator back apart (internally, via an interleaved intermediate
+  layout that's purely a kernel scheduling detail -- NOT something the
+  caller needs to replicate on the input weights, see
+  `prefuse_gateup_weights`), apply the activation right there, and only
+  ever write the ACTIVATED result to HBM. Upstream ALREADY supports
+  Kimi-style
   SiTU-GLU (`apply_act_fn`'s `"situ:<beta>:<linear_beta>"`-prefixed case,
   calling its own `situ_and_mul(gate, up, beta, linear_beta)` -- same
   formula as this project's `_situ_and_mul`) -- no local tokamax patch
@@ -675,7 +701,7 @@ def _fused_gateup_expert_ffn_from_prefused_weights(
   public `tokamax.ragged_dot`.
 
   Has a real tokamax dependency and CANNOT be verified locally -- the
-  actual kernel plumbing (grid, block specs, interleaved-rhs tiling,
+  actual kernel plumbing (grid, block specs, concatenated-rhs tiling,
   bf16/uneven-group-boundary behavior) must run on the v6e TPU VM. Do not
   trust its output until it has actually executed on hardware.
   """
@@ -708,7 +734,7 @@ def _local_shard_expert_ffn_ragged_dot_fused_gateup(
 ) -> jax.Array:
   """Convenience wrapper for correctness checking: same signature as
   `_local_shard_expert_ffn_ragged_dot` (separate `expert_gate`/`expert_up`),
-  interleaving them on every call via `prefuse_gateup_weights`. Fine for a
+  concatenating them on every call via `prefuse_gateup_weights`. Fine for a
   correctness check, where prep cost doesn't matter -- do NOT use this in
   a latency benchmark (see `_fused_gateup_expert_ffn_from_prefused_weights`
   and `profile_fused_gateup_vs_unfused_latency`, which hoist the prep out
@@ -940,8 +966,8 @@ def profile_fused_gateup_vs_unfused_latency(
     jax.block_until_ready(out)
     return (time.perf_counter() - t0) / num_repeats * 1000
 
-  # One-time prep cost: interleave gate/up weights ONCE, outside every
-  # per-shape timing loop below (weight interleaving doesn't depend on
+  # One-time prep cost: concatenate gate/up weights ONCE, outside every
+  # per-shape timing loop below (weight concatenation doesn't depend on
   # num_tokens, so this genuinely only needs to happen once per weight set,
   # matching how a real deployment would fuse weights at load time).
   prefuse_fn = jax.jit(prefuse_gateup_weights)
@@ -950,7 +976,7 @@ def profile_fused_gateup_vs_unfused_latency(
     fused_expert_gate_up = prefuse_fn(expert_gate, expert_up)
   jax.block_until_ready(fused_expert_gate_up)
   prefuse_ms = (time.perf_counter() - t0) / num_repeats * 1000
-  print(f"[fused-gateup-vs-unfused] one-time weight-interleave prep cost: {prefuse_ms:.4f} ms")
+  print(f"[fused-gateup-vs-unfused] one-time weight-concat prep cost: {prefuse_ms:.4f} ms")
 
   results = []
   for batch_size, seq_len in shapes:
