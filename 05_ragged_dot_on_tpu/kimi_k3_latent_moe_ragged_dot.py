@@ -114,6 +114,56 @@ tokamax unconditionally at module level, which blocked them from being
 run/tested on a machine without a working tokamax install (this Windows dev
 machine). They're re-exported here via the import above for backward
 compatibility with `run_shard_workload_benchmark`/the CLI below.
+
+**2026-09-18: raw-Pallas-kernel-fusion work started, per Zifan's explicit
+request** ("push to use raw pallas and do kernel fusion, and use SparseCore
+as much as possible" -- the WP4-WP6/WP-KV1-6 arc reported the prior week
+was accepted, but he wants this project to go beyond calling tokamax's
+off-the-shelf kernels). First target, per the user's own reply to Zifan:
+fuse the gate/up projections with Kimi K3's SiTU-GLU activation. Found
+that tokamax's Mosaic v2 GMM kernel (`pallas_mosaic_tpu_v2_gmm_kernel.py`
+in the local tokamax clone) already has a `fuse_act` fusion mechanism
+(concatenate gate/up weights along N, one matmul, split the in-kernel fp32
+accumulator, apply the activation there) wired up for "silu"/"gelu"/
+"swigluoai" -- added a "situ" case reproducing Kimi's exact formula.
+`_local_shard_expert_ffn_ragged_dot_fused_gateup` /
+`_fused_gateup_expert_ffn_from_prefused_weights` /
+`prefuse_gateup_weights` / `check_fused_gateup_expert_ffn_matches_unfused` /
+`profile_fused_gateup_vs_unfused_latency` below implement and test this.
+
+A ChatGPT-relayed review the user brought back caught 3 real issues in the
+first draft, all fixed same-session: (1) the fused kernel's fp32
+accumulator would have computed SiTU-GLU MORE precisely than the unfused
+reference (which rounds gate/up to bf16, then upcasts) -- `situ_and_mul`
+now explicitly reproduces that bf16 round-trip first, so this fusion's
+first version is a pure scheduling optimization, not a silent precision
+change; (2) the correctness check originally gave every active expert an
+IDENTICAL token count, exercising none of the ragged/uneven-group-boundary
+handling real routing produces -- now uses random per-expert counts with
+one forced to exactly 0; (3) the gate/up weight concatenation was being
+redone inside the timed function on every latency-benchmark call, folding
+a real HBM copy into the "fused kernel" number -- split into
+`prefuse_gateup_weights` (done ONCE, outside the timing loop, cost
+reported separately as `prefuse_ms`) and
+`_fused_gateup_expert_ffn_from_prefused_weights` (takes the already-fused
+weight). The review's output-width concern (does fuse_act's kernel output
+`intermediate_size` or `2*intermediate_size`?) was independently checked
+against the actual `GmmConfigs.out_size_n` property in the kernel source
+(`dims.size_n // 2` when `fuse_act` is set) -- confirmed correct, no code
+change needed there.
+
+Verified LOCALLY (no TPU, no tokamax install needed): loaded the edited
+kernel file directly via `importlib` (bypassing tokamax's own
+`__init__.py`, which pulls in a dependency chain blocked by this Windows
+machine's long-path pip issue) and confirmed the new "situ" activation
+branch is bit-identical (`max_abs_diff=0.0`) to this project's own
+`_situ_and_mul`, given the SAME simulated bf16-rounded gate/up inputs the
+real unfused reference path would produce; also confirmed the pre-existing
+"silu" branch is unaffected by this edit. This only validates the
+plain-JAX activation-fusion FORMULA -- the real kernel plumbing (grid,
+block specs, concatenated-rhs tiling, bf16/uneven-group-boundary behavior)
+still needs the real v6e TPU VM and has NOT been run there yet as of this
+note.
 """
 
 import argparse
@@ -487,6 +537,394 @@ def _local_shard_expert_ffn_ragged_dot(
   up = tokamax.ragged_dot(sorted_tokens, expert_up, group_sizes, implementation=implementation)
   activated = _situ_and_mul(gate, up, config.activation_situ_beta, config.activation_situ_linear_beta)
   return tokamax.ragged_dot(activated, expert_down, group_sizes, implementation=implementation)
+
+
+def prefuse_gateup_weights(expert_gate: jax.Array, expert_up: jax.Array) -> jax.Array:
+  """Concatenates gate/up expert weights along the last (N) axis, the layout
+  tokamax's Mosaic v2 `fuse_act` path expects (`jnp.split(acc, 2, -1)` inside
+  the kernel splits back into gate-first/up-second halves, matching how a
+  matmul against a concatenated rhs naturally distributes over columns).
+
+  Split out as its own function (2026-09-18, per a ChatGPT-relayed review
+  the user brought back) specifically so callers can do this ONCE per
+  weight set and reuse the result across many forward calls -- doing it
+  inside the timed function on every call would fold a real HBM copy of
+  the (large) expert weight tensors into the "fused kernel" latency number,
+  which would then no longer be comparable to the unfused baseline's
+  steady-state cost. See `profile_fused_gateup_vs_unfused_latency`, which
+  calls this once per shape outside its timing loop and reports the concat
+  cost separately from the timed kernel latency.
+  """
+  return jnp.concatenate([expert_gate, expert_up], axis=-1)
+
+
+def _fused_gateup_expert_ffn_from_prefused_weights(
+    sorted_tokens: jax.Array,
+    fused_expert_gate_up: jax.Array,
+    expert_down: jax.Array,
+    group_sizes: jax.Array,
+    implementation: str | None = None,
+) -> jax.Array:
+  """Low-level half of `_local_shard_expert_ffn_ragged_dot_fused_gateup`:
+  takes an ALREADY-CONCATENATED `fused_expert_gate_up` (see
+  `prefuse_gateup_weights`) instead of concatenating on every call -- the
+  form that should be used in any latency-sensitive context, since a real
+  deployment would fuse weights once at load time, not on every forward
+  pass.
+
+  Mechanism (2026-09-18, per Zifan's raw-Pallas-kernel-fusion request):
+  tokamax's Mosaic v2 GMM kernel (`pallas_mosaic_tpu_v2_gmm_kernel.py`)
+  already has a `fuse_act` fusion path -- one grouped matmul against the
+  concatenated gate/up weights, split the in-kernel accumulator back in
+  half, apply the activation right there, and only ever write the
+  ACTIVATED result to HBM. This was previously wired up only for
+  "silu"/"gelu"/"swigluoai". Added a "situ" case to `apply_act_fn` in the
+  local tokamax clone -- this project's own `_situ_and_mul` formula
+  (`beta=4.0`/`linear_beta=25.0`). Deliberately reproduces the UNFUSED
+  reference's exact rounding order (round gate/up to bf16 first, THEN
+  upcast to compute the tanh/sigmoid combination) rather than using the
+  fused kernel's fp32 accumulator directly -- a ChatGPT-relayed review
+  (2026-09-18) correctly flagged that skipping that intermediate rounding
+  would silently make this a MORE precise (not just faster) implementation,
+  confounding a fused-vs-unfused comparison. See `situ_and_mul`'s
+  docstring in the edited tokamax file for the full reasoning; verified
+  bit-identical to `_situ_and_mul` (given the SAME bf16-rounded gate/up
+  inputs) locally via a standalone script loading the edited kernel file
+  directly with `importlib` (tokamax itself can't be pip-installed on this
+  Windows machine, but the activation-fusion code itself has no Pallas/TPU
+  dependency, only plain jax.numpy). A true-fp32-accumulator variant (skip
+  the round-trip, trade a behavior change for possibly better accuracy) is
+  a deliberately separate, not-yet-built follow-up.
+
+  Reusing tokamax's own tuned GMM tiling/VMEM/pipelining machinery this way
+  is far lower-risk than writing an independent grouped-matmul kernel from
+  scratch, while still being real Mosaic-kernel-level code -- `apply_act_fn`
+  runs on the in-kernel accumulator, not in plain JAX outside the kernel.
+
+  `fuse_gateup_activation` is NOT reachable via the public
+  `tokamax.ragged_dot()` API (same constraint already hit for `rhs_scale`
+  in WP6's A0/A0b) -- must instantiate `PallasMosaicTpuV2RaggedDot`
+  directly. Only `implementation="mosaic_tpu_v2"` supports this; the down
+  projection (not part of the fusion) still goes through the ordinary
+  public `tokamax.ragged_dot`.
+
+  Has a real tokamax dependency and CANNOT be verified locally beyond the
+  activation-formula check above -- the actual kernel plumbing (grid,
+  block specs, concatenated-rhs tiling, bf16/uneven-group-boundary
+  behavior) must run on the v6e TPU VM. Do not trust its output until it
+  has actually executed on hardware.
+  """
+  if implementation not in (None, "mosaic_tpu_v2"):
+    raise NotImplementedError(
+        "fused gate/up activation is only implemented in mosaic_tpu_v2's GMM "
+        f"kernel; implementation={implementation!r} is not supported here."
+    )
+  fused_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+  activated = fused_op(
+      sorted_tokens,
+      fused_expert_gate_up,
+      group_sizes=group_sizes,
+      fuse_gateup_activation="situ",
+      maybe_quantize_lhs=False,
+  )
+  return tokamax.ragged_dot(
+      activated, expert_down, group_sizes, implementation="mosaic_tpu_v2"
+  )
+
+
+def _local_shard_expert_ffn_ragged_dot_fused_gateup(
+    sorted_tokens: jax.Array,
+    expert_gate: jax.Array,
+    expert_up: jax.Array,
+    expert_down: jax.Array,
+    group_sizes: jax.Array,
+    config: LatentMoEConfig,
+    implementation: str | None = None,
+) -> jax.Array:
+  """Convenience wrapper for correctness checking: same signature as
+  `_local_shard_expert_ffn_ragged_dot` (separate `expert_gate`/`expert_up`),
+  concatenating them on every call via `prefuse_gateup_weights`. Fine for a
+  correctness check, where concat cost doesn't matter -- do NOT use this in
+  a latency benchmark (see `_fused_gateup_expert_ffn_from_prefused_weights`
+  and `profile_fused_gateup_vs_unfused_latency`, which hoist the concat out
+  of the timed region on purpose).
+  """
+  fused_expert_gate_up = prefuse_gateup_weights(expert_gate, expert_up)
+  return _fused_gateup_expert_ffn_from_prefused_weights(
+      sorted_tokens, fused_expert_gate_up, expert_down, group_sizes,
+      implementation=implementation,
+  )
+
+
+def check_fused_gateup_expert_ffn_matches_unfused(
+    seed: int = 0,
+    num_active_experts: int = 8,
+    tokens_per_expert: int = 74,
+    implementation: str = "mosaic_tpu_v2",
+) -> bool:
+  """Compares `_local_shard_expert_ffn_ragged_dot_fused_gateup` (one fused
+  Mosaic kernel for gate+up+SiTU-GLU) against `_local_shard_expert_ffn_ragged_dot`
+  (three separate ragged_dot calls, this project's existing,
+  already-hardware-confirmed baseline) on IDENTICAL random inputs/weights --
+  proves the fusion is a pure kernel-level optimization, not a behavior
+  change.
+
+  Per-expert group sizes are deliberately UNEVEN (random, `0` to
+  `2*tokens_per_expert` tokens each), with one active expert forced to
+  exactly `0` tokens -- a ChatGPT-relayed review (2026-09-18) correctly
+  pointed out that an earlier version of this check used identical
+  `tokens_per_expert` for every active expert, which exercises none of the
+  ragged/uneven-group-boundary handling the real routing distribution
+  actually produces, nor the empty-expert edge case. `num_active_experts=8`/
+  `tokens_per_expert=74` matches WP6's established isolated-expert-kernel
+  test scale (average, not exact per-expert count now).
+
+  Tolerance is RELATIVE to the unfused baseline's own output scale, not a
+  fixed absolute bar -- same lesson WP-KV6 already learned the hard way
+  (an absolute tolerance calibrated at one magnitude is meaningless at
+  another; a real logic bug shows a far larger, far more uniform
+  discrepancy than a few-ULP rounding tail from two different matmul
+  tilings computing "the same" reduction).
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  if implementation != "mosaic_tpu_v2":
+    raise NotImplementedError(
+        "fused gate/up activation is only implemented in mosaic_tpu_v2's GMM "
+        f"kernel; implementation={implementation!r} is not supported here."
+    )
+  global_config = kimi_k3_config()
+  latent_size = global_config.latent_size
+  intermediate_size = global_config.intermediate_size
+
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 5)
+  scale = 0.02
+
+  def normal(k, shape):
+    return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+  # Uneven per-expert counts, one forced to zero -- see docstring.
+  per_expert_counts = jax.random.randint(
+      keys[4], (num_active_experts,), 0, 2 * tokens_per_expert + 1
+  )
+  per_expert_counts = per_expert_counts.at[0].set(0)
+  raw_total = int(jnp.sum(per_expert_counts))
+  m_padded = _round_up_to_tile(raw_total)
+  pad_size = m_padded - raw_total
+  group_sizes = jnp.concatenate(
+      [per_expert_counts, jnp.array([pad_size], dtype=jnp.int32)]
+  ).astype(jnp.int32)
+
+  num_groups = num_active_experts + 1  # +1 trailing padding-bucket group
+  expert_gate = normal(keys[0], (num_groups, latent_size, intermediate_size))
+  expert_up = normal(keys[1], (num_groups, latent_size, intermediate_size))
+  expert_down = normal(keys[2], (num_groups, intermediate_size, latent_size))
+  sorted_tokens = normal(keys[3], (m_padded, latent_size))
+
+  # Stage 1: compare the fused activation ALONE (gate+up+SiTU-GLU, before
+  # the down projection either path shares) against the unfused reference's
+  # own gate/up ragged_dot calls + _situ_and_mul -- isolates a fusion bug
+  # from a down-projection bug, per the ChatGPT-relayed review's suggestion,
+  # before spending a real hardware run on the harder-to-debug full-FFN
+  # comparison below.
+  fused_expert_gate_up = prefuse_gateup_weights(expert_gate, expert_up)
+  fused_activation_fn = jax.jit(
+      functools.partial(
+          pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot(),
+          group_sizes=group_sizes, fuse_gateup_activation="situ",
+          maybe_quantize_lhs=False,
+      )
+  )
+  fused_activated = fused_activation_fn(sorted_tokens, fused_expert_gate_up)
+
+  unfused_gate_fn = jax.jit(functools.partial(
+      tokamax.ragged_dot, group_sizes=group_sizes, implementation=implementation
+  ))
+  unfused_gate_out = unfused_gate_fn(sorted_tokens, expert_gate)
+  unfused_up_out = unfused_gate_fn(sorted_tokens, expert_up)
+  unfused_activated = _situ_and_mul(
+      unfused_gate_out, unfused_up_out,
+      global_config.activation_situ_beta, global_config.activation_situ_linear_beta,
+  )
+  jax.block_until_ready((fused_activated, unfused_activated))
+
+  activation_diff = jnp.abs(
+      fused_activated.astype(jnp.float32) - unfused_activated.astype(jnp.float32)
+  )
+  activation_max_abs_diff = float(jnp.max(activation_diff))
+  activation_out_scale = float(jnp.std(unfused_activated.astype(jnp.float32))) + 1e-8
+  activation_relative_max_diff = activation_max_abs_diff / activation_out_scale
+  print(
+      f"[fused-gateup-correctness] STAGE 1 (activation only, pre-down): "
+      f"max_abs_diff={activation_max_abs_diff:.4e} out_scale={activation_out_scale:.4f} "
+      f"relative_max_diff={activation_relative_max_diff:.3f}"
+  )
+
+  # Stage 2: full expert FFN (through down) -- the end-to-end comparison
+  # that actually matters for trusting this fusion in the production path.
+  unfused_fn = jax.jit(
+      functools.partial(
+          _local_shard_expert_ffn_ragged_dot, group_sizes=group_sizes,
+          config=global_config, implementation=implementation,
+      )
+  )
+  fused_fn = jax.jit(
+      functools.partial(
+          _fused_gateup_expert_ffn_from_prefused_weights, group_sizes=group_sizes,
+          implementation=implementation,
+      )
+  )
+  unfused_out = unfused_fn(sorted_tokens, expert_gate, expert_up, expert_down)
+  fused_out = fused_fn(sorted_tokens, fused_expert_gate_up, expert_down)
+  jax.block_until_ready((unfused_out, fused_out))
+
+  diff = jnp.abs(unfused_out.astype(jnp.float32) - fused_out.astype(jnp.float32))
+  max_abs_diff = float(jnp.max(diff))
+  mean_abs_diff = float(jnp.mean(diff))
+  has_nan = bool(jnp.any(jnp.isnan(fused_out)))
+  has_inf = bool(jnp.any(jnp.isinf(fused_out)))
+  out_scale = float(jnp.std(unfused_out.astype(jnp.float32))) + 1e-8
+  relative_max_diff = max_abs_diff / out_scale
+  tolerance = 0.15
+  ok = relative_max_diff < tolerance and not has_nan and not has_inf
+  print(
+      f"[fused-gateup-correctness] STAGE 2 (full FFN through down): "
+      f"num_active_experts={num_active_experts} tokens_per_expert={tokens_per_expert} "
+      f"max_abs_diff={max_abs_diff:.4e} mean_abs_diff={mean_abs_diff:.4e} "
+      f"out_scale={out_scale:.4f} relative_max_diff={relative_max_diff:.3f} "
+      f"tolerance={tolerance} has_nan={has_nan} has_inf={has_inf} "
+      f"{'OK' if ok else 'FAIL'}"
+  )
+  return ok
+
+
+def profile_fused_gateup_vs_unfused_latency(
+    num_active_experts: int = 64,
+    seed: int = 0,
+    num_repeats: int = 20,
+    shapes: tuple[tuple[int, int], ...] = _DEFAULT_LATENCY_SWEEP_SHAPES,
+    implementation: str = "mosaic_tpu_v2",
+    output_dir: pathlib.Path | None = None,
+) -> list[dict]:
+  """Latency comparison: the fused gate/up/SiTU-GLU kernel vs. the existing
+  3-separate-ragged_dot-calls baseline, across (batch_size, seq_len) pairs
+  -- the reporting granularity committed to Zifan (2026-09-18 email) for
+  every kernel-fusion change.
+
+  Isolated expert-FFN-only timing (same scope as WP6's profiling
+  functions): times `_local_shard_expert_ffn_ragged_dot`/
+  `_fused_gateup_expert_ffn_from_prefused_weights` directly, not a full
+  forward pass, so this measures the fusion's effect in isolation from
+  router/dispatch/combine cost. `num_tokens * top_k` dispatch slots are
+  split EVENLY across `num_active_experts` (same simplification WP6's own
+  profiling functions use) -- real routing skew is exercised elsewhere,
+  not this isolated-kernel timing.
+
+  **Weight concatenation is done ONCE, outside the timed region** (a
+  ChatGPT-relayed review, 2026-09-18, correctly flagged that folding a real
+  HBM copy of the (large) expert weight tensors into a per-call timing loop
+  would make the "fused kernel" number include a cost a real deployment
+  would only ever pay once, at weight-load time) -- reported separately as
+  `prefuse_ms` in each result row, alongside the steady-state `fused_ms`.
+
+  Has a real tokamax dependency and CANNOT be verified locally -- must run
+  on the v6e TPU VM.
+  """
+  if implementation != "mosaic_tpu_v2":
+    raise NotImplementedError(
+        "fused gate/up activation is only implemented in mosaic_tpu_v2's GMM "
+        f"kernel; implementation={implementation!r} is not supported here."
+    )
+  global_config = kimi_k3_config()
+  latent_size = global_config.latent_size
+  intermediate_size = global_config.intermediate_size
+
+  key = jax.random.key(seed)
+  keys = jax.random.split(key, 3)
+  scale = 0.02
+
+  def normal(k, shape):
+    return (jax.random.normal(k, shape) * scale).astype(jnp.bfloat16)
+
+  num_groups = num_active_experts + 1
+  expert_gate = normal(keys[0], (num_groups, latent_size, intermediate_size))
+  expert_up = normal(keys[1], (num_groups, latent_size, intermediate_size))
+  expert_down = normal(keys[2], (num_groups, intermediate_size, latent_size))
+
+  def _time_jit(f, *args, num_repeats=num_repeats):
+    f_jit = jax.jit(f)
+    out = f_jit(*args)
+    jax.block_until_ready(out)
+    t0 = time.perf_counter()
+    for _ in range(num_repeats):
+      out = f_jit(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) / num_repeats * 1000
+
+  # One-time prep cost: concatenate gate/up weights ONCE, outside every
+  # per-shape timing loop below (weight concatenation doesn't depend on
+  # num_tokens, so this genuinely only needs to happen once per weight set,
+  # matching how a real deployment would fuse weights at load time).
+  prefuse_fn = jax.jit(prefuse_gateup_weights)
+  t0 = time.perf_counter()
+  for _ in range(num_repeats):
+    fused_expert_gate_up = prefuse_fn(expert_gate, expert_up)
+  jax.block_until_ready(fused_expert_gate_up)
+  prefuse_ms = (time.perf_counter() - t0) / num_repeats * 1000
+  print(f"[fused-gateup-vs-unfused] one-time weight-concat prep cost: {prefuse_ms:.4f} ms")
+
+  results = []
+  for batch_size, seq_len in shapes:
+    num_tokens = batch_size * seq_len
+    raw_total = num_tokens * global_config.top_k
+    tokens_per_expert = max(1, raw_total // num_active_experts)
+    real_total = tokens_per_expert * num_active_experts
+    m_padded = _round_up_to_tile(real_total)
+    pad_size = m_padded - real_total
+    group_sizes = jnp.array(
+        [tokens_per_expert] * num_active_experts + [pad_size], dtype=jnp.int32
+    )
+    sorted_tokens = normal(jax.random.fold_in(keys[0], num_tokens), (m_padded, latent_size))
+
+    unfused_fn = functools.partial(
+        _local_shard_expert_ffn_ragged_dot, group_sizes=group_sizes,
+        config=global_config, implementation=implementation,
+    )
+    fused_fn = functools.partial(
+        _fused_gateup_expert_ffn_from_prefused_weights, group_sizes=group_sizes,
+        implementation=implementation,
+    )
+    unfused_ms = _time_jit(unfused_fn, sorted_tokens, expert_gate, expert_up, expert_down)
+    fused_ms = _time_jit(fused_fn, sorted_tokens, fused_expert_gate_up, expert_down)
+
+    result = {
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "num_tokens": num_tokens,
+        "num_active_experts": num_active_experts,
+        "m_padded": m_padded,
+        "prefuse_ms": prefuse_ms,
+        "unfused_ms": unfused_ms,
+        "fused_ms": fused_ms,
+        "speedup": unfused_ms / fused_ms,
+    }
+    results.append(result)
+    print(
+        f"[fused-gateup-vs-unfused] batch_size={batch_size} seq_len={seq_len} "
+        f"num_tokens={num_tokens} unfused_ms={unfused_ms:.4f} fused_ms={fused_ms:.4f} "
+        f"speedup={result['speedup']:.3f}x (excludes one-time prep, see above)"
+    )
+
+  if output_dir is not None:
+    _write_csv(
+        output_dir / "fused_gateup_vs_unfused_latency.csv",
+        results,
+        ["batch_size", "seq_len", "num_tokens", "num_active_experts", "m_padded",
+         "prefuse_ms", "unfused_ms", "fused_ms", "speedup"],
+    )
+  return results
 
 
 def latent_moe_forward_ragged_dot_single_shard_jittable(
@@ -3096,6 +3534,23 @@ if __name__ == "__main__":
       "profile_stage_c_quantized_vs_bf16_active_expert_scan's docstring.",
   )
   parser.add_argument(
+      "--fused-gateup-correctness",
+      action="store_true",
+      help="Raw-Pallas-kernel-fusion step 1 (Zifan's 2026-09-18 request): compares the fused "
+      "gate+up+SiTU-GLU Mosaic v2 kernel (new 'situ' case added to tokamax's own apply_act_fn) "
+      "against the existing 3-separate-ragged_dot-calls baseline on identical inputs. MUST pass "
+      "before trusting --fused-gateup-vs-unfused-latency. See "
+      "check_fused_gateup_expert_ffn_matches_unfused's docstring.",
+  )
+  parser.add_argument(
+      "--fused-gateup-vs-unfused-latency",
+      action="store_true",
+      help="Raw-Pallas-kernel-fusion step 1 latency: fused gate/up/SiTU-GLU kernel vs. the "
+      "unfused baseline, across (batch_size, seq_len) pairs -- the reporting granularity "
+      "committed to Zifan for every kernel-fusion change. See "
+      "profile_fused_gateup_vs_unfused_latency's docstring.",
+  )
+  parser.add_argument(
       "--wp4-dispatch-trace-dir",
       type=pathlib.Path,
       default=None,
@@ -3134,6 +3589,8 @@ if __name__ == "__main__":
       and not args.wp5_production_forward_jit_vs_eager
       and not args.full_dimension_smoke_test
       and not args.wp_kv6_quantized_ragged_dot_subblock_correctness
+      and not args.fused_gateup_correctness
+      and not args.fused_gateup_vs_unfused_latency
   ):
     args.correctness = True  # default to the cheap check
 
@@ -3236,3 +3693,13 @@ if __name__ == "__main__":
         "full-dimension smoke test failed (wrong output shape or NaN/Inf) -- investigate before "
         "treating this project's real-scale pipeline as working"
     )
+
+  if args.fused_gateup_correctness:
+    ok_fused = check_fused_gateup_expert_ffn_matches_unfused()
+    assert ok_fused, (
+        "fused gate/up/SiTU-GLU Mosaic kernel diverges from the unfused 3-ragged_dot-calls "
+        "baseline -- do not trust --fused-gateup-vs-unfused-latency until this is fixed"
+    )
+
+  if args.fused_gateup_vs_unfused_latency:
+    profile_fused_gateup_vs_unfused_latency(output_dir=args.output_dir)
