@@ -305,6 +305,18 @@ if __name__ == "__main__":
       # entirely; testing whether that alone closes the gap.
       (2048, 128, 512, INTERMEDIATE_SIZE),
       (2048, 256, 512, INTERMEDIATE_SIZE),
+      # 2026-09-21, second round: bn=INTERMEDIATE_SIZE improved things
+      # (0.299x -> 0.474x) but still lost to unfused -- second suspected
+      # redundant-reload source: w_gate/w_up's index_map depends on (k, j)
+      # only, not i (the m-tile index), which is OUTERMOST/slowest-varying
+      # in the grid -- so for m_tiles>1, the ENTIRE K-sweep of weight tiles
+      # gets re-fetched once per m-tile, and weights (22MB each, full size)
+      # are far more expensive to reload than x. Fewer, bigger bm ->
+      # fewer m_tiles -> less redundant weight reload, at the cost of a
+      # bigger VMEM accumulator (bm*bn*4bytes*2, two accumulators) -- testing
+      # where that tradeoff actually lands on real hardware, not guessing.
+      (2048, 512, 512, INTERMEDIATE_SIZE),
+      (2048, 1024, 512, INTERMEDIATE_SIZE),
   ]
   results = [check(*c) for c in configs]
   assert all(results), (
