@@ -334,17 +334,18 @@ if __name__ == "__main__":
       (2048, 2048, 512, 1024),  # m_tiles=1 (!), n_tiles=3 -- est. ~29MB
       (2048, 2048, 512, 768),   # m_tiles=1, n_tiles=4 -- est. ~23MB, safety margin if 1024 above is too tight
       # 2026-09-21, fourth round: bm=2048/bn=1024 (m_tiles=1, n_tiles=3) is
-      # the best so far (0.888x, up from an initial 0.07x-0.73x -- real
-      # progress, still short of actually beating unfused). m_tiles is
-      # already at its floor (1); the remaining lever is n_tiles. Testing
-      # n_tiles=2 (bn=1536) at the now-full bm=2048 -- the rough VMEM
-      # estimate says this likely exceeds the confirmed 32MB ceiling, but
-      # that estimate was calibrated on only 2 real data points, so this is
-      # a real test, not a re-derivation. Also testing a bigger bk=896 (4
-      # K-tiles instead of 7) at the current-best bn=1024, to see whether
+      # the best so far (0.879x-0.888x across runs, up from an initial
+      # 0.07x-0.73x -- real progress, still short of actually beating
+      # unfused). m_tiles is already at its floor (1); the remaining lever
+      # is n_tiles.
+      #
+      # bm=2048/bn=1536 (n_tiles=2) CONFIRMED OOM on real hardware: "Scoped
+      # allocation with size 46.00M and limit 32.00M exceeded... by 14.00M"
+      # -- close to the ~42MB the rough estimate predicted, removed from
+      # this list rather than re-run. Testing a bigger bk=896 (4 K-tiles
+      # instead of 7) at the current-best bn=1024 instead, to see whether
       # fewer K-grid-steps reduces pipeline overhead independent of the
       # reload-traffic argument above.
-      (2048, 2048, 512, 1536),  # m_tiles=1, n_tiles=2 -- may OOM, real test
       (2048, 2048, 896, 1024),  # same m/n as the current best, bigger K-tile
   ]
   results = [check(*c) for c in configs]
