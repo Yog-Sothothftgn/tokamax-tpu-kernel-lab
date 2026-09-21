@@ -316,7 +316,23 @@ if __name__ == "__main__":
       # bigger VMEM accumulator (bm*bn*4bytes*2, two accumulators) -- testing
       # where that tradeoff actually lands on real hardware, not guessing.
       (2048, 512, 512, INTERMEDIATE_SIZE),
-      (2048, 1024, 512, INTERMEDIATE_SIZE),
+      # 2026-09-21, third round: bm=1024/bn=INTERMEDIATE_SIZE(3072) OOM'd on
+      # real hardware -- "Scoped allocation with size 50.00M and limit 32.00M
+      # exceeded scoped vmem limit by 18.00M." A REAL, confirmed scoped-VMEM
+      # ceiling of 32MB for this kernel (not a guess). bm=512/bn=3072 (this
+      # file's best working config so far, 0.771x) fits comfortably under
+      # that. Total redundant-reload HBM traffic, given weight data (2 x
+      # 3584x3072x2 bytes = 44.04MB) is reloaded once per m_tile and x data
+      # (2048x3584x2 bytes = 14.68MB) is reloaded once per n_tile: minimizing
+      # m_tiles matters far more than minimizing n_tiles, since weight reload
+      # is ~3x more expensive per tile than x reload. These three configs
+      # trade a bit more n_tiles for far fewer m_tiles, while staying under
+      # the confirmed 32MB scoped-VMEM ceiling (rough estimate:
+      # 10*bm*bn + 8*bk*bn + 4*bm*bk bytes, calibrated against the two data
+      # points above -- not exact, real hardware will confirm or refute it).
+      (2048, 1024, 512, 1536),  # m_tiles=2, n_tiles=2 -- est. ~24MB
+      (2048, 2048, 512, 1024),  # m_tiles=1 (!), n_tiles=3 -- est. ~29MB
+      (2048, 2048, 512, 768),   # m_tiles=1, n_tiles=4 -- est. ~23MB, safety margin if 1024 above is too tight
   ]
   results = [check(*c) for c in configs]
   assert all(results), (
