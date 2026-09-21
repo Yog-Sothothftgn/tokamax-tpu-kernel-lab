@@ -87,6 +87,16 @@ def fused_gateup_situ_kernel(
     linear_beta: float,
     round_dtype: jnp.dtype,
 ):
+  """`gate_acc_ref`/`up_acc_ref`'s dtype controls accumulation precision --
+  fp32 (this file's default) accumulates every K step in full precision;
+  bf16 (see `fused_gateup_situ`'s `acc_dtype`) rounds the accumulator down
+  to bf16 after EVERY K step, halving accumulator VMEM at the cost of
+  compounding rounding error across `num_k_tiles` steps instead of once at
+  the end -- a real precision-vs-memory tradeoff, not free, added
+  2026-09-21 specifically to test whether it reopens tile-size options
+  that hit the 32MB scoped-VMEM ceiling with fp32 accumulators (see this
+  file's `__main__` config comments for the real OOMs that motivated this).
+  """
   k_id = pl.program_id(2)
 
   @pl.when(k_id == 0)
@@ -94,18 +104,17 @@ def fused_gateup_situ_kernel(
     gate_acc_ref[...] = jnp.zeros_like(gate_acc_ref)
     up_acc_ref[...] = jnp.zeros_like(up_acc_ref)
 
-  gate_acc_ref[...] += jnp.dot(
-      x_ref[...], wgate_ref[...], preferred_element_type=jnp.float32
-  )
-  up_acc_ref[...] += jnp.dot(
-      x_ref[...], wup_ref[...], preferred_element_type=jnp.float32
-  )
+  partial_gate = jnp.dot(x_ref[...], wgate_ref[...], preferred_element_type=jnp.float32)
+  partial_up = jnp.dot(x_ref[...], wup_ref[...], preferred_element_type=jnp.float32)
+  gate_acc_ref[...] += partial_gate.astype(gate_acc_ref.dtype)
+  up_acc_ref[...] += partial_up.astype(up_acc_ref.dtype)
 
   @pl.when(k_id == num_k_tiles - 1)
   def _():
     # Deliberately round to bf16 THEN upcast, matching this project's
     # established _situ_and_mul convention (see kimi_k3_latent_moe_reference.py)
-    # -- not the raw fp32 accumulator directly.
+    # -- not the raw fp32 accumulator directly. A no-op cast when
+    # gate_acc_ref/up_acc_ref are already bf16 (round_dtype == acc_dtype).
     gate = gate_acc_ref[...].astype(round_dtype).astype(jnp.float32)
     up = up_acc_ref[...].astype(round_dtype).astype(jnp.float32)
     situ_gate = beta * jnp.tanh(gate / beta) * jax.nn.sigmoid(gate)
@@ -122,6 +131,7 @@ def fused_gateup_situ(
     beta: float = SITU_BETA,
     linear_beta: float = SITU_LINEAR_BETA,
     round_dtype: jnp.dtype = jnp.bfloat16,
+    acc_dtype: jnp.dtype = jnp.float32,
     bm: int = 128,
     bk: int = 512,
     bn: int = 512,
@@ -129,6 +139,12 @@ def fused_gateup_situ(
   """One expert's gate/up projection + SiTU-GLU, fused into a single
   hand-written Pallas kernel. `x`: (M, K). `w_gate`/`w_up`: (K, N). Returns
   (M, N) -- the ACTIVATED result only; gate/up never leave VMEM.
+
+  `acc_dtype`: dtype of the two VMEM scratch accumulators. `float32`
+  (default) matches the rest of this project's precision conventions;
+  `bfloat16` halves accumulator VMEM (`bm*bn*2bytes*2` instead of
+  `bm*bn*4bytes*2`) at the cost of rounding after every K step instead of
+  only at the very end -- see `fused_gateup_situ_kernel`'s docstring.
   """
   m, k = x.shape
   k2, n = w_gate.shape
@@ -167,8 +183,8 @@ def fused_gateup_situ(
       out_specs=pl.BlockSpec((bm, bn), lambda i, j, kk: (i, j)),
       out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
       scratch_shapes=[
-          pltpu.VMEM((bm, bn), jnp.float32),  # gate_acc
-          pltpu.VMEM((bm, bn), jnp.float32),  # up_acc
+          pltpu.VMEM((bm, bn), acc_dtype),  # gate_acc
+          pltpu.VMEM((bm, bn), acc_dtype),  # up_acc
       ],
       compiler_params=(
           pltpu.CompilerParams(
@@ -219,7 +235,14 @@ def _time_jit(f, *args, num_repeats: int = 20) -> float:
   return (time.perf_counter() - t0) / num_repeats * 1000
 
 
-def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
+def check(
+    m: int,
+    bm: int,
+    bk: int,
+    bn: int,
+    dtype=jnp.bfloat16,
+    acc_dtype: jnp.dtype = jnp.float32,
+) -> bool:
   """Correctness check + fused-vs-unfused latency comparison. Correctness
   runs fine in interpret mode with no TPU -- mirrors 03_matmul_k_tiled.py's
   own check() structure. Uses real Kimi K3 per-expert dimensions
@@ -237,6 +260,12 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
   even a plain XLA-compiled unfused version at this dense (single-expert)
   scale, before ever bringing tokamax's own kernels or ragged dispatch
   into the picture at all.
+
+  `acc_dtype=jnp.bfloat16` (2026-09-21 addition) uses a wider tolerance
+  than the fp32-accumulator default -- accumulating in bf16 across
+  `k // bk` K-steps genuinely compounds rounding error beyond the single
+  round-at-the-end the fp32-accumulator kernel does, this is not just a
+  test-calibration choice.
   """
   key = jax.random.key(hash((m, bm, bk, bn)) % (2**31))
   kx, kg, ku = jax.random.split(key, 3)
@@ -245,7 +274,7 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
   w_gate = (jax.random.normal(kg, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
   w_up = (jax.random.normal(ku, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
 
-  fused_fn = functools.partial(fused_gateup_situ, bm=bm, bk=bk, bn=bn)
+  fused_fn = functools.partial(fused_gateup_situ, bm=bm, bk=bk, bn=bn, acc_dtype=acc_dtype)
   out = jax.jit(fused_fn)(x, w_gate, w_up)
   jax.block_until_ready(out)  # first call excluded from correctness check too, compile-only
 
@@ -258,7 +287,7 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
   relative_max_diff = max_abs_diff / out_scale
   has_nan = bool(jnp.any(jnp.isnan(out)))
   has_inf = bool(jnp.any(jnp.isinf(out)))
-  tolerance = 0.05
+  tolerance = 0.05 if acc_dtype == jnp.float32 else 0.15
   ok = relative_max_diff < tolerance and not has_nan and not has_inf
   status = "OK" if ok else "FAIL"
 
@@ -272,9 +301,9 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
 
   print(
       f"[{status}] m={m} k={LATENT_SIZE} n={INTERMEDIATE_SIZE}"
-      f" tile=(bm={bm},bk={bk},bn={bn})"
+      f" tile=(bm={bm},bk={bk},bn={bn}) acc_dtype={acc_dtype.__name__}"
       f" max_abs_diff={max_abs_diff:.4e} relative_max_diff={relative_max_diff:.4f}"
-      f" has_nan={has_nan} has_inf={has_inf}"
+      f" tolerance={tolerance} has_nan={has_nan} has_inf={has_inf}"
       f" fused_ms={fused_ms:.4f} unfused_ms={unfused_ms:.4f} speedup={speedup:.3f}x"
   )
   return ok
@@ -365,3 +394,24 @@ if __name__ == "__main__":
       "K-tiling logic / pl.when boundary conditions / bf16-round-then-upcast order"
   )
   print(f"all {len(results)} shape/tile configs passed")
+
+  # 2026-09-21, fifth round: bf16 accumulators (see fused_gateup_situ_kernel's
+  # docstring) halve accumulator VMEM -- testing whether that reopens the two
+  # configs that OOM'd with fp32 accumulators (bn=1536, bk=896), plus the
+  # current-best config as a same-shape sanity check (does bf16 accumulation
+  # cost real speed/precision even where fp32 already fit?). If neither OOM'd
+  # config now fits, or fits but doesn't beat the fp32-accumulator best
+  # (0.879x-0.888x), this tuning approach has genuinely hit its ceiling and
+  # the honest conclusion is "close but not a clean win," not something to
+  # keep chasing.
+  print("\n--- bf16-accumulator experiment ---")
+  bf16acc_configs = [
+      (2048, 2048, 512, 1024),  # current best, fp32-acc baseline for comparison
+      (2048, 2048, 512, 1536),  # OOM'd with fp32 acc (46MB) -- does bf16 acc fit now?
+      (2048, 2048, 896, 1024),  # OOM'd with fp32 acc (38MB) -- does bf16 acc fit now?
+  ]
+  bf16acc_results = [check(*c, acc_dtype=jnp.bfloat16) for c in bf16acc_configs]
+  print(
+      f"{sum(bf16acc_results)}/{len(bf16acc_results)} bf16-accumulator configs passed "
+      "correctness (see speedup numbers above for whether any of this actually helped)"
+  )
