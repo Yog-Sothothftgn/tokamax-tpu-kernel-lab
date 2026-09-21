@@ -341,12 +341,23 @@ if __name__ == "__main__":
       #
       # bm=2048/bn=1536 (n_tiles=2) CONFIRMED OOM on real hardware: "Scoped
       # allocation with size 46.00M and limit 32.00M exceeded... by 14.00M"
-      # -- close to the ~42MB the rough estimate predicted, removed from
-      # this list rather than re-run. Testing a bigger bk=896 (4 K-tiles
-      # instead of 7) at the current-best bn=1024 instead, to see whether
-      # fewer K-grid-steps reduces pipeline overhead independent of the
-      # reload-traffic argument above.
-      (2048, 2048, 896, 1024),  # same m/n as the current best, bigger K-tile
+      # -- close to the ~42MB the rough estimate predicted.
+      #
+      # bm=2048/bk=896/bn=1024 (bigger K-tile at the current-best n config)
+      # ALSO confirmed OOM: "Scoped allocation with size 38.00M and limit
+      # 32.00M exceeded... by 6.00M". Together these two real OOMs show the
+      # two fp32 accumulators alone (bm*bn*4bytes*2 = 2048*1024*4*2 = 16MB
+      # at the current best config) already occupy roughly half the 32MB
+      # ceiling -- there's little headroom left for a bigger bn OR a
+      # bigger bk at bm=2048, regardless of which one is grown. Both
+      # removed from this list rather than re-run; (2048, 2048, 512, 1024)
+      # above is the practical ceiling this simple (one fixed tile size per
+      # dimension, fp32 accumulators) tuning approach reaches -- 0.879x-
+      # 0.888x across runs, up from an initial 0.07x-0.73x. Going further
+      # would need a different lever (e.g. bf16 accumulators, at some
+      # precision cost, to roughly halve accumulator VMEM and see if that
+      # reopens the bn=1536/bk=896 options) rather than more of the same
+      # fixed-tile-size search.
   ]
   results = [check(*c) for c in configs]
   assert all(results), (
