@@ -203,11 +203,40 @@ def _reference_gateup_situ(
   return (situ_gate * bounded_up).astype(x.dtype)
 
 
+def _time_jit(f, *args, num_repeats: int = 20) -> float:
+  """Median-free mean-of-repeats timing, matching this project's own
+  established convention elsewhere (kimi_k3_latent_moe_ragged_dot.py's
+  profiling functions) -- one warmup call (excludes compile time), then
+  `num_repeats` timed calls, averaged.
+  """
+  f_jit = jax.jit(f)
+  out = f_jit(*args)
+  jax.block_until_ready(out)
+  t0 = time.perf_counter()
+  for _ in range(num_repeats):
+    out = f_jit(*args)
+  jax.block_until_ready(out)
+  return (time.perf_counter() - t0) / num_repeats * 1000
+
+
 def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
-  """Correctness check, runnable in interpret mode with no TPU -- mirrors
-  03_matmul_k_tiled.py's own check() structure. Uses real Kimi K3 per-expert
-  dimensions (LATENT_SIZE=3584, INTERMEDIATE_SIZE=3072), only `m` (token
-  count) and tile sizes vary across configs.
+  """Correctness check + fused-vs-unfused latency comparison. Correctness
+  runs fine in interpret mode with no TPU -- mirrors 03_matmul_k_tiled.py's
+  own check() structure. Uses real Kimi K3 per-expert dimensions
+  (LATENT_SIZE=3584, INTERMEDIATE_SIZE=3072), only `m` (token count) and
+  tile sizes vary across configs.
+
+  The "unfused" baseline (`_reference_gateup_situ`) is plain, ordinary
+  jax.jit-compiled XLA (two separate `x @ w` matmuls + a plain-JAX
+  SiTU-GLU elementwise op) -- NOT tokamax's `ragged_dot`, since this
+  kernel targets a single dense expert, not the ragged/grouped case
+  `_local_shard_expert_ffn_ragged_dot`/`_local_shard_expert_ffn_ragged_dot_fused_gateup`
+  in `kimi_k3_latent_moe_ragged_dot.py` already benchmark. Answers a
+  narrower, more basic question than that file's comparison: does OUR
+  hand-written kernel's fusion (no intermediate gate/up write to HBM) beat
+  even a plain XLA-compiled unfused version at this dense (single-expert)
+  scale, before ever bringing tokamax's own kernels or ragged dispatch
+  into the picture at all.
   """
   key = jax.random.key(hash((m, bm, bk, bn)) % (2**31))
   kx, kg, ku = jax.random.split(key, 3)
@@ -216,14 +245,9 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
   w_gate = (jax.random.normal(kg, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
   w_up = (jax.random.normal(ku, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
 
-  fused_jit = jax.jit(functools.partial(fused_gateup_situ, bm=bm, bk=bk, bn=bn))
-  out = fused_jit(x, w_gate, w_up)
-  jax.block_until_ready(out)  # run once first, exclude compile overhead from timing
-
-  t0 = time.perf_counter()
-  out = fused_jit(x, w_gate, w_up)
-  jax.block_until_ready(out)
-  elapsed_ms = (time.perf_counter() - t0) * 1000
+  fused_fn = functools.partial(fused_gateup_situ, bm=bm, bk=bk, bn=bn)
+  out = jax.jit(fused_fn)(x, w_gate, w_up)
+  jax.block_until_ready(out)  # first call excluded from correctness check too, compile-only
 
   expected = _reference_gateup_situ(
       x, w_gate, w_up, SITU_BETA, SITU_LINEAR_BETA, jnp.bfloat16
@@ -237,11 +261,21 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
   tolerance = 0.05
   ok = relative_max_diff < tolerance and not has_nan and not has_inf
   status = "OK" if ok else "FAIL"
+
+  fused_ms = _time_jit(fused_fn, x, w_gate, w_up)
+  unfused_fn = functools.partial(
+      _reference_gateup_situ,
+      beta=SITU_BETA, linear_beta=SITU_LINEAR_BETA, round_dtype=jnp.bfloat16,
+  )
+  unfused_ms = _time_jit(unfused_fn, x, w_gate, w_up)
+  speedup = unfused_ms / fused_ms
+
   print(
       f"[{status}] m={m} k={LATENT_SIZE} n={INTERMEDIATE_SIZE}"
       f" tile=(bm={bm},bk={bk},bn={bn})"
       f" max_abs_diff={max_abs_diff:.4e} relative_max_diff={relative_max_diff:.4f}"
-      f" has_nan={has_nan} has_inf={has_inf} time={elapsed_ms:.3f}ms"
+      f" has_nan={has_nan} has_inf={has_inf}"
+      f" fused_ms={fused_ms:.4f} unfused_ms={unfused_ms:.4f} speedup={speedup:.3f}x"
   )
   return ok
 
@@ -249,11 +283,14 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
 if __name__ == "__main__":
   print("devices:", jax.devices())
   print("jax version:", jax.__version__)
-  print(
-      "Note: interpret-mode timing (no real TPU here) only confirms the "
-      "kernel runs correctly -- it says nothing about real TPU performance; "
-      "real timing needs the v6e TPU VM."
-  )
+  if any(d.platform == "tpu" for d in jax.devices()):
+    print("Real TPU detected -- fused/unfused timing below reflects actual hardware.")
+  else:
+    print(
+        "No TPU detected -- running in interpret mode. Correctness numbers "
+        "are still meaningful (genuine Pallas semantics), but timing/speedup "
+        "numbers below are interpreter overhead, not real hardware performance."
+    )
   configs = [
       # (m, bm, bk, bn) -- 3584 = 512*7 = 256*14 = 128*28; 3072 = 512*6 = 256*12 = 128*24
       (128, 128, 512, 512),
