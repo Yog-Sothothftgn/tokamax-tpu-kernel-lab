@@ -296,6 +296,15 @@ if __name__ == "__main__":
       (128, 128, 512, 512),
       (2048, 256, 512, 512),
       (2048, 128, 256, 256),
+      # 2026-09-21, real hardware showed the above are ALL slower than the
+      # unfused XLA baseline (0.07x-0.73x, not a speedup) -- suspected cause:
+      # bn < INTERMEDIATE_SIZE means n_tiles > 1, and the grid's (i, j, k)
+      # iteration order re-fetches the SAME x tile (which only depends on
+      # (i, k), not j) once per j value -- pure redundant HBM traffic that
+      # grows with n_tiles. bn=INTERMEDIATE_SIZE (n_tiles=1) eliminates this
+      # entirely; testing whether that alone closes the gap.
+      (2048, 128, 512, INTERMEDIATE_SIZE),
+      (2048, 256, 512, INTERMEDIATE_SIZE),
   ]
   results = [check(*c) for c in configs]
   assert all(results), (
