@@ -173,6 +173,149 @@ def check(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> bool:
   return ok
 
 
+_TPU_V6E_PEAK_BF16_TFLOPS = 918.0  # same public spec expert_ffn_roofline.py already uses
+_TPU_V6E_HBM_BANDWIDTH_GBPS = 1638.0
+
+
+def single_matmul_roofline(m: int, k: int = LATENT_SIZE, n: int = INTERMEDIATE_SIZE) -> dict:
+  """Theoretical compute-bound and memory-bandwidth-bound floors for ONE
+  `(m,k) @ (k,n)` matmul, same methodology as `expert_ffn_roofline.py`'s
+  `stage_c_roofline` (public TPU v6e specs, not independently verified
+  hardware queries -- see that file's own caveat). Added 2026-09-26,
+  per a ChatGPT-relayed request to answer "is the gap from waiting on
+  data, or from compute/scheduling itself" with a real calculation
+  instead of continuing to guess.
+  """
+  bf16_bytes = 2
+  flops = 2 * m * k * n  # multiply-add counted as 2 ops
+  bytes_moved = (m * k + k * n + m * n) * bf16_bytes  # read X, read W, write Y
+
+  compute_bound_ms = flops / (_TPU_V6E_PEAK_BF16_TFLOPS * 1e12) * 1000
+  memory_bound_ms = bytes_moved / (_TPU_V6E_HBM_BANDWIDTH_GBPS * 1e9) * 1000
+  roofline_ms = max(compute_bound_ms, memory_bound_ms)
+  return {
+      "m": m, "k": k, "n": n,
+      "flops": flops, "bytes_moved": bytes_moved,
+      "compute_bound_ms": compute_bound_ms,
+      "memory_bound_ms": memory_bound_ms,
+      "roofline_ms": roofline_ms,
+      "bound_type": "memory" if memory_bound_ms >= compute_bound_ms else "compute",
+  }
+
+
+def report_roofline_efficiency(
+    m: int, pallas_ms: float, xla_ms: float, label: str = ""
+) -> None:
+  """Prints roofline efficiency for a REAL measured (pallas_ms, xla_ms)
+  pair -- pass in real numbers from `check()`'s printed output (this
+  function does no measuring itself, it only interprets numbers already
+  measured on real hardware). Answers, with an actual calculation: is
+  either implementation memory-bandwidth-bound at this shape (expect
+  measured time close to memory_bound_ms if so), and how much of the
+  pallas-vs-xla gap is a real efficiency difference vs. shared overhead
+  both pay equally.
+  """
+  r = single_matmul_roofline(m)
+  pallas_eff = r["roofline_ms"] / pallas_ms
+  xla_eff = r["roofline_ms"] / xla_ms
+  gap_us = (pallas_ms - xla_ms) * 1000
+  print(
+      f"[roofline{f' ({label})' if label else ''}] m={m} bound={r['bound_type']} "
+      f"compute_floor={r['compute_bound_ms']:.4f}ms memory_floor={r['memory_bound_ms']:.4f}ms "
+      f"xla_efficiency={xla_eff:.1%} pallas_efficiency={pallas_eff:.1%} "
+      f"pallas_minus_xla_gap={gap_us:.1f}us "
+      f"pallas_gap_from_ideal={(pallas_ms - r['roofline_ms']) * 1000:.1f}us "
+      f"xla_gap_from_ideal={(xla_ms - r['roofline_ms']) * 1000:.1f}us"
+  )
+
+
+def inspect_pallas_matmul_hlo(m: int, bm: int, bk: int, bn: int, dtype=jnp.bfloat16) -> str:
+  """Compiled HLO for our OWN pallas_matmul, mirroring
+  own_gateup_situ_pallas_kernel.py's inspect_unfused_hlo -- but a Pallas
+  kernel appears in the OUTER HLO graph as a single opaque
+  `custom-call(..., custom_call_target="tpu_custom_call")`; this will NOT
+  reveal the accumulator/K-loop structure INSIDE the kernel (that's
+  compiled by Mosaic into its own lower-level representation, not part of
+  the surrounding XLA HLO). What it DOES reveal: input/output layouts,
+  any surrounding copy/bitcast ops XLA inserts around the custom-call, and
+  (in the backend_config, same as the earlier OOM error messages) the
+  actual scoped-VMEM size XLA/Mosaic allocated for this exact tile config.
+  """
+  key = jax.random.key(hash(m) % (2**31))
+  kx, kw = jax.random.split(key, 2)
+  scale = 0.02
+  x = (jax.random.normal(kx, (m, LATENT_SIZE)) * scale).astype(dtype)
+  w = (jax.random.normal(kw, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
+
+  pallas_fn = functools.partial(pallas_matmul, bm=bm, bk=bk, bn=bn)
+  backend = jax.devices()[0].platform
+  compiled = jax.jit(pallas_fn).lower(x, w).compile()
+  hlo_text = compiled.as_text()
+  print(f"=== compiled HLO for pallas_matmul, backend={backend}, m={m}, tile=(bm={bm},bk={bk},bn={bn}) ===")
+  print(hlo_text)
+  return hlo_text
+
+
+def profile_best_tile_device_trace(
+    m: int = 2048,
+    bm: int = 2048,
+    bk: int = 512,
+    bn: int = 1024,
+    trace_dir: str = "/tmp/single_matmul_trace",
+    num_repeats: int = 20,
+    dtype=jnp.bfloat16,
+) -> None:
+  """Captures a real `jax.profiler` device trace for BOTH pallas_matmul
+  and the XLA baseline at the SAME fixed (best) tile config -- step 3 of
+  the ChatGPT-relayed plan (2026-09-26): "fix the best tile, compare
+  compiled results AND device timeline; locate where it's slow before
+  changing any more tile parameters."
+
+  This does NOT parse the trace itself (XLA's trace format is a
+  protobuf-based xplane, not simple text) -- it writes a real trace to
+  `trace_dir`, viewable via:
+    tensorboard --logdir=<trace_dir>
+  then open the "Trace Viewer" tab (needs port-forwarding from the VM, or
+  copying trace_dir back via gcloud compute scp, same as this project's
+  established WP4 dispatch-attribution trace workflow --
+  profile_dispatch_host_device_attribution in kimi_k3_latent_moe_ragged_dot.py
+  already does exactly this pattern). Look for: how much of the total
+  wall-clock is inside the `tpu_custom_call`/fusion op itself (device
+  compute+DMA) vs. host-side dispatch, and whether DMA-copy ops show
+  meaningful duration next to the matmul op (would indicate real data-
+  movement cost, not just scheduling).
+  """
+  key = jax.random.key(hash(m) % (2**31))
+  kx, kw = jax.random.split(key, 2)
+  scale = 0.02
+  x = (jax.random.normal(kx, (m, LATENT_SIZE)) * scale).astype(dtype)
+  w = (jax.random.normal(kw, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
+
+  pallas_fn = jax.jit(functools.partial(pallas_matmul, bm=bm, bk=bk, bn=bn))
+  xla_fn = jax.jit(lambda xx, ww: (xx @ ww).astype(dtype))
+
+  # Warm up (excludes compile time from the trace) before tracing either.
+  jax.block_until_ready(pallas_fn(x, w))
+  jax.block_until_ready(xla_fn(x, w))
+
+  print(f"Writing device trace to {trace_dir} ...")
+  with jax.profiler.trace(trace_dir):
+    with jax.profiler.TraceAnnotation("pallas_matmul_repeats"):
+      for _ in range(num_repeats):
+        out = pallas_fn(x, w)
+      jax.block_until_ready(out)
+    with jax.profiler.TraceAnnotation("xla_matmul_repeats"):
+      for _ in range(num_repeats):
+        out = xla_fn(x, w)
+      jax.block_until_ready(out)
+  print(
+      f"Trace written to {trace_dir} -- view with `tensorboard --logdir={trace_dir}` "
+      "(Trace Viewer tab), or copy the whole directory back via gcloud compute scp. "
+      "Look for the pallas_matmul_repeats vs xla_matmul_repeats annotated regions and "
+      "how much of each is device compute/DMA vs host dispatch gaps."
+  )
+
+
 if __name__ == "__main__":
   print("devices:", jax.devices())
   print("jax version:", jax.__version__)
