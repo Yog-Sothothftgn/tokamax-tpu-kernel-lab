@@ -219,11 +219,67 @@ def _reference_gateup_situ(
   return (situ_gate * bounded_up).astype(x.dtype)
 
 
-def _time_jit(f, *args, num_repeats: int = 20) -> float:
-  """Median-free mean-of-repeats timing, matching this project's own
-  established convention elsewhere (kimi_k3_latent_moe_ragged_dot.py's
-  profiling functions) -- one warmup call (excludes compile time), then
-  `num_repeats` timed calls, averaged.
+def inspect_unfused_hlo(m: int = 2048, dtype=jnp.bfloat16) -> str:
+  """Prints and returns the compiled HLO for `_reference_gateup_situ` (the
+  "unfused" baseline) at real Kimi K3 dimensions -- step 2 of the
+  ChatGPT-relayed debugging plan (2026-09-25): understand what the
+  opponent actually does before assuming it's a naive two-separate-
+  matmuls-plus-elementwise graph.
+
+  Uses `.lower(...).compile().as_text()`, which compiles for whatever
+  backend is actually active in this process (CPU here if no TPU is
+  present, XLA:TPU on the real v6e VM) -- the FUSION DECISIONS shown here
+  are for the ACTIVE backend, and CPU vs TPU's XLA backends can make
+  genuinely different fusion/tiling choices for the same program. Read the
+  printed text for: (a) how many `fusion` computations exist and what they
+  contain (does the compiler group the two matmuls with the SiTU-GLU
+  elementwise math into one fused kernel, or keep them as 3 separate
+  ops?), (b) whether `gate`/`up` intermediates appear as materialized
+  buffers between the matmul and the activation, or only inside a fusion
+  region (never separately materialized). Re-run this on the real v6e VM
+  for the TPU-specific answer -- this CPU-backend answer is a real, useful
+  first look, not a substitute for it.
+  """
+  key = jax.random.key(hash(m) % (2**31))
+  kx, kg, ku = jax.random.split(key, 3)
+  scale = 0.02
+  x = (jax.random.normal(kx, (m, LATENT_SIZE)) * scale).astype(dtype)
+  w_gate = (jax.random.normal(kg, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
+  w_up = (jax.random.normal(ku, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
+
+  unfused_fn = functools.partial(
+      _reference_gateup_situ,
+      beta=SITU_BETA, linear_beta=SITU_LINEAR_BETA, round_dtype=jnp.bfloat16,
+  )
+  backend = jax.devices()[0].platform
+  compiled = jax.jit(unfused_fn).lower(x, w_gate, w_up).compile()
+  hlo_text = compiled.as_text()
+  print(f"=== compiled HLO for _reference_gateup_situ, backend={backend}, m={m} ===")
+  print(hlo_text)
+  num_fusions = hlo_text.count("fusion(")
+  num_dots = hlo_text.count(" dot(")
+  print(
+      f"=== summary: backend={backend} num_fusion_ops={num_fusions} "
+      f"num_dot_ops={num_dots} ==="
+  )
+  return hlo_text
+
+
+def _time_jit_pipelined(f, *args, num_repeats: int = 20) -> float:
+  """Throughput-style timing (this project's established convention
+  elsewhere, e.g. kimi_k3_latent_moe_ragged_dot.py's profiling functions):
+  one warmup call (excludes compile time), then `num_repeats` calls
+  submitted back-to-back with NO synchronization between them, one
+  `block_until_ready` at the very end, total time / num_repeats.
+
+  **2026-09-25, per a ChatGPT-relayed review the user brought back**: this
+  measures pipelined THROUGHPUT, not per-call latency -- consecutive
+  dispatches can overlap (the host issues call N+1 before call N's device
+  work has finished), so the reported "ms" is not what a single, isolated,
+  synchronous invocation would take. Kept alongside
+  `_time_jit_blocking` (below) specifically so both conventions are
+  reported and the difference between them is itself a measurement, not
+  assumed away.
   """
   f_jit = jax.jit(f)
   out = f_jit(*args)
@@ -232,6 +288,25 @@ def _time_jit(f, *args, num_repeats: int = 20) -> float:
   for _ in range(num_repeats):
     out = f_jit(*args)
   jax.block_until_ready(out)
+  return (time.perf_counter() - t0) / num_repeats * 1000
+
+
+def _time_jit_blocking(f, *args, num_repeats: int = 20) -> float:
+  """Per-call latency timing: blocks on `block_until_ready` after EVERY
+  call, so each timed iteration genuinely waits for the previous one to
+  finish before issuing the next -- the number a single synchronous
+  request would actually see, unlike `_time_jit_pipelined`'s throughput
+  number. Added 2026-09-25 alongside the pipelined version specifically to
+  quantify how much of the previously-reported speedup gap was a
+  measurement-methodology artifact vs. a real kernel difference.
+  """
+  f_jit = jax.jit(f)
+  out = f_jit(*args)
+  jax.block_until_ready(out)
+  t0 = time.perf_counter()
+  for _ in range(num_repeats):
+    out = f_jit(*args)
+    jax.block_until_ready(out)
   return (time.perf_counter() - t0) / num_repeats * 1000
 
 
@@ -266,8 +341,18 @@ def check(
   `k // bk` K-steps genuinely compounds rounding error beyond the single
   round-at-the-end the fp32-accumulator kernel does, this is not just a
   test-calibration choice.
+
+  **2026-09-25 fix, per a ChatGPT-relayed review**: the random key used to
+  now depend on `hash((m, bm, bk, bn))` -- meaning every DIFFERENT tile
+  config got DIFFERENT random `x`/`w_gate`/`w_up` data. The fused-vs-
+  unfused comparison WITHIN one call was still apples-to-apples (both see
+  the same data), but comparing SPEEDUP NUMBERS ACROSS different tile
+  configs was comparing results on different underlying problems, not
+  isolating the effect of tile choice alone. Fixed: the key now depends
+  only on `m`, so every tile config at the same `m` sees byte-identical
+  inputs.
   """
-  key = jax.random.key(hash((m, bm, bk, bn)) % (2**31))
+  key = jax.random.key(hash(m) % (2**31))
   kx, kg, ku = jax.random.split(key, 3)
   scale = 0.02
   x = (jax.random.normal(kx, (m, LATENT_SIZE)) * scale).astype(dtype)
@@ -291,20 +376,26 @@ def check(
   ok = relative_max_diff < tolerance and not has_nan and not has_inf
   status = "OK" if ok else "FAIL"
 
-  fused_ms = _time_jit(fused_fn, x, w_gate, w_up)
   unfused_fn = functools.partial(
       _reference_gateup_situ,
       beta=SITU_BETA, linear_beta=SITU_LINEAR_BETA, round_dtype=jnp.bfloat16,
   )
-  unfused_ms = _time_jit(unfused_fn, x, w_gate, w_up)
-  speedup = unfused_ms / fused_ms
+
+  fused_ms_pipe = _time_jit_pipelined(fused_fn, x, w_gate, w_up)
+  unfused_ms_pipe = _time_jit_pipelined(unfused_fn, x, w_gate, w_up)
+  speedup_pipe = unfused_ms_pipe / fused_ms_pipe
+
+  fused_ms_block = _time_jit_blocking(fused_fn, x, w_gate, w_up)
+  unfused_ms_block = _time_jit_blocking(unfused_fn, x, w_gate, w_up)
+  speedup_block = unfused_ms_block / fused_ms_block
 
   print(
       f"[{status}] m={m} k={LATENT_SIZE} n={INTERMEDIATE_SIZE}"
       f" tile=(bm={bm},bk={bk},bn={bn}) acc_dtype={acc_dtype.__name__}"
       f" max_abs_diff={max_abs_diff:.4e} relative_max_diff={relative_max_diff:.4f}"
-      f" tolerance={tolerance} has_nan={has_nan} has_inf={has_inf}"
-      f" fused_ms={fused_ms:.4f} unfused_ms={unfused_ms:.4f} speedup={speedup:.3f}x"
+      f" tolerance={tolerance} has_nan={has_nan} has_inf={has_inf}\n"
+      f"    [pipelined]  fused_ms={fused_ms_pipe:.4f} unfused_ms={unfused_ms_pipe:.4f} speedup={speedup_pipe:.3f}x\n"
+      f"    [per-call]   fused_ms={fused_ms_block:.4f} unfused_ms={unfused_ms_block:.4f} speedup={speedup_block:.3f}x"
   )
   return ok
 
