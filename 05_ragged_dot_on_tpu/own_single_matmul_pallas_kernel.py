@@ -349,10 +349,12 @@ if __name__ == "__main__":
       #
       # bn=1024 OOM'd here: "Scoped allocation with size 36.00M and limit
       # 32.00M exceeded... by 4.00M" (a single-accumulator kernel, so this
-      # is a tighter miss than the fused kernel's analogous OOMs). Dropping
-      # to bn=768 to fit under the confirmed 32MB ceiling while keeping
-      # bk=LATENT_SIZE (the actual thing being tested) unchanged.
-      (2048, 2048, LATENT_SIZE, 768),
+      # is a tighter miss than the fused kernel's analogous OOMs). bn=768
+      # ALSO OOM'd, by only 348KB this time -- close enough that another
+      # small step down risks a third near-miss. Jumping to bn=512 for
+      # comfortable margin (~24.6MB estimated) instead of nickel-and-diming
+      # further; bk=LATENT_SIZE (the actual thing being tested) unchanged.
+      (2048, 2048, LATENT_SIZE, 512),
   ]
   results = [check(*c) for c in configs]
   assert all(results), (
