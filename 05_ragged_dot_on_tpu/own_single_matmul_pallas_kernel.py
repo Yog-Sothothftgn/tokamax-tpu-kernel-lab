@@ -336,6 +336,17 @@ if __name__ == "__main__":
       (2048, 256, 512, 512),     # the fused kernel's early, badly-losing config
       (2048, 512, 512, INTERMEDIATE_SIZE),   # fused kernel's 0.77x-0.81x point
       (2048, 2048, 512, 1024),   # fused kernel's best point (0.88x)
+      # 2026-09-26: device trace confirmed a real ~12.58us device-only gap
+      # at the best config above, with DMA/copy time confirmed negligible
+      # (~0.74us) -- ruling out data movement, but NOT yet ruling out the
+      # K-loop (7 steps at bk=512) itself as the source. bk=LATENT_SIZE
+      # (num_k_tiles=1, no accumulator loop at all -- the whole K reduction
+      # happens in a single step) isolates that specific hypothesis
+      # directly: if the device-only gap shrinks or disappears here, the
+      # K-loop structure was a real contributor; if it doesn't change,
+      # something else (single-shot MXU utilization, output write pattern)
+      # is the cause.
+      (2048, 2048, LATENT_SIZE, 1024),
   ]
   results = [check(*c) for c in configs]
   assert all(results), (
