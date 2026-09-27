@@ -506,3 +506,22 @@ if __name__ == "__main__":
       f"{sum(bf16acc_results)}/{len(bf16acc_results)} bf16-accumulator configs passed "
       "correctness (see speedup numbers above for whether any of this actually helped)"
   )
+
+  # 2026-09-27, sixth round: back to the actual goal (the fused kernel, not
+  # the single-matmul control experiment) -- own_single_matmul_pallas_kernel.py's
+  # controlled bk comparison (10 alternating rounds, same bm/bn, only bk
+  # varied) found a real, consistent ~32.6us device-side saving from
+  # bk=LATENT_SIZE (no K-loop) over bk=512 (7 K-steps). Testing whether that
+  # carries over to the TWO-accumulator fused kernel -- it has roughly 2x
+  # the accumulator VMEM footprint of the single-matmul kernel at the same
+  # (bm, bn), so the same bn=512 that worked there may not fit here at all;
+  # bn=256 chosen as a conservative first attempt (est. ~23.6MB) rather than
+  # re-discovering the ceiling one OOM at a time again.
+  print("\n--- full-K (no K-tiling) fused-kernel experiment ---")
+  fullk_ok = check(2048, 2048, LATENT_SIZE, 256)
+  print(
+      f"full-K fused-kernel config {'PASSED' if fullk_ok else 'FAILED'} -- "
+      "see speedup numbers above; if this OOM'd instead, the single-matmul "
+      "improvement does NOT carry over as-is to the two-accumulator case, "
+      "and VMEM headroom (not the K-loop itself) is the next problem to solve."
+  )
