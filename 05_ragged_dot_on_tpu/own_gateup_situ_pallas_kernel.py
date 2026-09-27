@@ -439,11 +439,30 @@ def compare_fused_configs_alternating(
       _reference_gateup_situ, beta=SITU_BETA, linear_beta=SITU_LINEAR_BETA, round_dtype=jnp.bfloat16,
   ))
 
-  # Warm up (compile) all three before any timed round or correctness check.
+  # Warm up (compile) all three before any timed round.
   old_out = old_fn(x, w_gate, w_up)
   new_out = new_fn(x, w_gate, w_up)
   xla_out = xla_fn(x, w_gate, w_up)
   jax.block_until_ready((old_out, new_out, xla_out))
+
+  # Correctness reference: EAGER (not jax.jit-wrapped), matching check()'s
+  # own established convention exactly -- 2026-09-27 fix, found by comparing
+  # against check()'s own numbers for the identical (m, old_bm, old_bk,
+  # old_bn) config: check() gets relative_max_diff~0.013 there (comfortably
+  # under tolerance), but comparing against the JIT-compiled xla_fn instead
+  # (as this function originally did) gave 0.0532 (just over 0.05) for BOTH
+  # old and new configs -- identically, which is itself the tell that this
+  # was a reference-computation artifact, not a real per-config numeric bug
+  # (two genuinely different fused kernels landing on the exact same error
+  # against a real ground truth would be an unlikely coincidence). jit vs.
+  # eager execution of the same reference function can make different
+  # internal fusion/precision decisions on real TPU hardware -- comparing
+  # against the jitted version was comparing against a slightly different
+  # (though not more "correct") computation than check()'s validated eager
+  # baseline.
+  expected = _reference_gateup_situ(
+      x, w_gate, w_up, SITU_BETA, SITU_LINEAR_BETA, jnp.bfloat16
+  )
 
   def _correctness(out, expected, label):
     diff = jnp.abs(out.astype(jnp.float32) - expected.astype(jnp.float32))
@@ -460,8 +479,8 @@ def compare_fused_configs_alternating(
     )
     return ok
 
-  old_ok = _correctness(old_out, xla_out, f"old (bk={old_bk},bn={old_bn})")
-  new_ok = _correctness(new_out, xla_out, f"new (bk={new_bk},bn={new_bn})")
+  old_ok = _correctness(old_out, expected, f"old (bk={old_bk},bn={old_bn})")
+  new_ok = _correctness(new_out, expected, f"new (bk={new_bk},bn={new_bn})")
 
   fns = {"old": old_fn, "new": new_fn, "xla": xla_fn}
   times = {"old": [], "new": [], "xla": []}
