@@ -58,7 +58,9 @@ To run (local, interpret mode, no TPU needed):
   python own_gateup_situ_pallas_kernel.py
 """
 
+import csv as _csv
 import functools
+import pathlib
 import time
 
 import jax
@@ -533,11 +535,28 @@ def compare_fused_configs_alternating(
 _TOKEN_COUNT_SWEEP: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 512, 2048, 4096)
 
 
+def _write_csv(path: pathlib.Path, rows: list[dict], fieldnames: list[str]) -> None:
+  """Same convention as kimi_k3_latent_moe_ragged_dot.py's own `_write_csv`
+  -- kept as a local copy here rather than imported, so this file stays
+  self-contained (no tokamax/project-file dependency, matching its
+  existing "run standalone, no other project imports" design).
+  """
+  path = pathlib.Path(path)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with path.open("w", newline="", encoding="utf-8") as f:
+    writer = _csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+      writer.writerow(row)
+  print(f"  (structured data written to {path})")
+
+
 def sweep_new_config_across_token_counts(
     bk: int = LATENT_SIZE,
     bn: int = 256,
     token_counts: tuple[int, ...] = _TOKEN_COUNT_SWEEP,
     dtype=jnp.bfloat16,
+    output_path: pathlib.Path | str | None = "gateup_situ_token_sweep.csv",
 ) -> list[dict]:
   """Answers the question actually worth reporting to Zifan, per the
   user's explicit 2026-09-27 point: the ~4.9% win over XLA was only ever
@@ -551,10 +570,21 @@ def sweep_new_config_across_token_counts(
   VMEM comfortably at M=2048, so it should fit at any M<=2048 too, since
   the weight tiles' VMEM cost is independent of M and the M-dependent
   terms only shrink) across both decode-scale and prefill-scale token
-  counts, with `bm=min(m, 2048)` (falls back to `bm=m` -- a single m-tile
-  -- for every decode-scale point, matching the "m_tiles=1" pattern this
-  whole investigation converged on; stays at 2048 for m=4096, giving 2
-  m-tiles there).
+  counts.
+
+  **2026-09-27 fix**: M=4096 OOM'd with `bm=min(m,2048)=2048` (the SAME
+  tile size that worked fine at M=2048 itself). Root cause hypothesis: at
+  M=2048 there's exactly ONE m-tile, so Mosaic has nothing to pipeline
+  across that dimension and doesn't need to double-buffer the x tile
+  (14.68MB at bm=2048); at M=4096 (2 m-tiles), it likely DOES double-buffer
+  x to prefetch the next m-tile while the current one computes, adding a
+  second ~14.68MB copy -- pushing well past the 32MB ceiling even though
+  the PER-TILE size never changed. Rather than guess the exact threshold,
+  this tries a descending list of `bm` candidates per `m` (largest first,
+  for best performance) and uses the first one that actually compiles,
+  recording which `bm` worked (or that none did) as real, per-scale data
+  -- this IS how "the applicable range of this config" gets determined,
+  not assumed from a single working data point at M=2048.
 
   Correctness reference is EAGER (matching check()'s and
   compare_fused_configs_alternating()'s established, validated convention
@@ -567,10 +597,13 @@ def sweep_new_config_across_token_counts(
   affordably -- if any point here looks surprising or borderline, re-check
   it specifically with the alternating comparison before trusting it.
   """
+  bm_candidates_pool = (2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+
   results = []
   for m in token_counts:
-    bm = min(m, 2048)
-    assert m % bm == 0, f"m={m} not divisible by bm={bm} -- fix the sweep list or bm rule"
+    bm_candidates = [c for c in bm_candidates_pool if c <= m and m % c == 0]
+    if m not in bm_candidates:
+      bm_candidates.append(m)  # m itself is always a valid (if maybe large) fallback
 
     key = jax.random.key(hash(m) % (2**31))
     kx, kg, ku = jax.random.split(key, 3)
@@ -579,19 +612,36 @@ def sweep_new_config_across_token_counts(
     w_gate = (jax.random.normal(kg, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
     w_up = (jax.random.normal(ku, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
 
-    new_fn = functools.partial(fused_gateup_situ, bm=bm, bk=bk, bn=bn)
+    new_fn = None
+    new_out = None
+    bm = None
+    last_error = None
+    for candidate_bm in bm_candidates:
+      trial_fn = functools.partial(fused_gateup_situ, bm=candidate_bm, bk=bk, bn=bn)
+      try:
+        trial_out = jax.jit(trial_fn)(x, w_gate, w_up)
+        jax.block_until_ready(trial_out)
+      except Exception as e:  # noqa: BLE001 -- an OOM at some tile size is
+        # real, reportable data (which sizes DON'T fit), not a bug to hide.
+        last_error = e
+        print(f"[m={m:5d} bm={candidate_bm:5d}] OOM/error, trying a smaller bm: {type(e).__name__}")
+        continue
+      bm, new_fn, new_out = candidate_bm, trial_fn, trial_out
+      break
+
+    if new_fn is None:
+      print(f"[m={m:5d}] FAILED at every bm candidate {bm_candidates}: {type(last_error).__name__}: {str(last_error)[:200]}")
+      results.append({
+          "m": m, "bm": None, "ok": False, "relative_max_diff": None,
+          "new_ms_pipe": None, "xla_ms_pipe": None, "speedup_pipe": None,
+          "new_ms_block": None, "xla_ms_block": None, "speedup_block": None,
+          "error": str(last_error)[:300],
+      })
+      continue
+
     xla_fn = functools.partial(
         _reference_gateup_situ, beta=SITU_BETA, linear_beta=SITU_LINEAR_BETA, round_dtype=jnp.bfloat16,
     )
-
-    try:
-      new_out = jax.jit(new_fn)(x, w_gate, w_up)
-      jax.block_until_ready(new_out)
-    except Exception as e:  # noqa: BLE001 -- deliberately broad: an OOM at
-      # some scale is a real, reportable result here, not a bug to hide.
-      print(f"[m={m:5d} bm={bm}] FAILED to compile/run: {type(e).__name__}: {str(e)[:200]}")
-      results.append({"m": m, "bm": bm, "ok": False, "error": str(e)})
-      continue
 
     expected = _reference_gateup_situ(x, w_gate, w_up, SITU_BETA, SITU_LINEAR_BETA, jnp.bfloat16)
     diff = jnp.abs(new_out.astype(jnp.float32) - expected.astype(jnp.float32))
@@ -619,10 +669,31 @@ def sweep_new_config_across_token_counts(
         "m": m, "bm": bm, "ok": ok, "relative_max_diff": relative_max_diff,
         "new_ms_pipe": new_ms, "xla_ms_pipe": xla_ms, "speedup_pipe": speedup_pipe,
         "new_ms_block": new_ms_block, "xla_ms_block": xla_ms_block, "speedup_block": speedup_block,
+        "error": "",
     })
 
   num_ok = sum(1 for r in results if r["ok"])
   print(f"\n{num_ok}/{len(results)} token-count points passed correctness.")
+
+  if output_path is not None:
+    print(
+        "\nNOTE (not written to the CSV, just a reminder when reading it "
+        "later): the M=2048 row here is a SINGLE-SHOT measurement, same "
+        "methodology as every other row -- it is NOT directly comparable "
+        "to compare_fused_configs_alternating()'s 12-round, alternating-"
+        "order M=2048 result (which found new_vs_xla_speedup=1.049x, "
+        "vs. whatever single-shot number appears below). The two "
+        "methodologies gave meaningfully different answers at the same "
+        "config/scale -- don't average or reconcile them casually; when "
+        "re-measuring under one unified protocol later, decide which "
+        "methodology to standardize on FIRST."
+    )
+    _write_csv(
+        pathlib.Path(output_path),
+        results,
+        ["m", "bm", "ok", "relative_max_diff", "new_ms_pipe", "xla_ms_pipe",
+         "speedup_pipe", "new_ms_block", "xla_ms_block", "speedup_block", "error"],
+    )
   return results
 
 
