@@ -400,6 +400,111 @@ def check(
   return ok
 
 
+def compare_fused_configs_alternating(
+    m: int = 2048,
+    old_bm: int = 2048, old_bk: int = 512, old_bn: int = 1024,
+    new_bm: int = 2048, new_bk: int = LATENT_SIZE, new_bn: int = 256,
+    num_rounds: int = 12,
+    dtype=jnp.bfloat16,
+) -> dict:
+  """Three-way controlled comparison (old fused config, new fused config,
+  XLA baseline), per the user's explicit 2026-09-27 request: before
+  reporting the ~97% no-K-tiling result as real, confirm it's stable under
+  the same alternating-repeated-measurement discipline already used for
+  the single-matmul K-tiling experiment (`own_single_matmul_pallas_kernel.py`'s
+  `compare_bk_alternating`), not a one-shot number that could be noise or
+  a lucky run.
+
+  All three see the IDENTICAL input (same `m`, same fixed-per-m seed as
+  `check()`). The round-robin order rotates every round (old->new->xla,
+  new->xla->old, xla->old->new, repeating every 3 rounds) so no config is
+  systematically favored by always running first (e.g. any residual
+  warm-up effect) or last.
+
+  Correctness is checked ONCE against the XLA reference per fused config
+  (not per timing round -- a deterministic jit-compiled function's output
+  doesn't change between calls), using the same relative-diff convention
+  as `check()`.
+  """
+  key = jax.random.key(hash(m) % (2**31))
+  kx, kg, ku = jax.random.split(key, 3)
+  scale = 0.02
+  x = (jax.random.normal(kx, (m, LATENT_SIZE)) * scale).astype(dtype)
+  w_gate = (jax.random.normal(kg, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
+  w_up = (jax.random.normal(ku, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
+
+  old_fn = jax.jit(functools.partial(fused_gateup_situ, bm=old_bm, bk=old_bk, bn=old_bn))
+  new_fn = jax.jit(functools.partial(fused_gateup_situ, bm=new_bm, bk=new_bk, bn=new_bn))
+  xla_fn = jax.jit(functools.partial(
+      _reference_gateup_situ, beta=SITU_BETA, linear_beta=SITU_LINEAR_BETA, round_dtype=jnp.bfloat16,
+  ))
+
+  # Warm up (compile) all three before any timed round or correctness check.
+  old_out = old_fn(x, w_gate, w_up)
+  new_out = new_fn(x, w_gate, w_up)
+  xla_out = xla_fn(x, w_gate, w_up)
+  jax.block_until_ready((old_out, new_out, xla_out))
+
+  def _correctness(out, expected, label):
+    diff = jnp.abs(out.astype(jnp.float32) - expected.astype(jnp.float32))
+    max_abs_diff = float(jnp.max(diff))
+    out_scale = float(jnp.std(expected.astype(jnp.float32))) + 1e-8
+    relative_max_diff = max_abs_diff / out_scale
+    has_nan = bool(jnp.any(jnp.isnan(out)))
+    has_inf = bool(jnp.any(jnp.isinf(out)))
+    ok = relative_max_diff < 0.05 and not has_nan and not has_inf
+    print(
+        f"[correctness: {label}] max_abs_diff={max_abs_diff:.4e} "
+        f"relative_max_diff={relative_max_diff:.4f} has_nan={has_nan} has_inf={has_inf} "
+        f"{'OK' if ok else 'FAIL'}"
+    )
+    return ok
+
+  old_ok = _correctness(old_out, xla_out, f"old (bk={old_bk},bn={old_bn})")
+  new_ok = _correctness(new_out, xla_out, f"new (bk={new_bk},bn={new_bn})")
+
+  fns = {"old": old_fn, "new": new_fn, "xla": xla_fn}
+  times = {"old": [], "new": [], "xla": []}
+  order_cycle = [["old", "new", "xla"], ["new", "xla", "old"], ["xla", "old", "new"]]
+
+  for round_idx in range(num_rounds):
+    order = order_cycle[round_idx % 3]
+    round_times = {}
+    for name in order:
+      t0 = time.perf_counter()
+      jax.block_until_ready(fns[name](x, w_gate, w_up))
+      round_times[name] = (time.perf_counter() - t0) * 1000
+    for name in order:
+      times[name].append(round_times[name])
+    print(
+        f"[round {round_idx}] order={order} "
+        f"old={round_times['old']:.4f}ms new={round_times['new']:.4f}ms xla={round_times['xla']:.4f}ms"
+    )
+
+  def _stats(vals):
+    n = len(vals)
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / n
+    return {"mean": mean, "std": var ** 0.5, "min": min(vals), "max": max(vals)}
+
+  stats = {name: _stats(vals) for name, vals in times.items()}
+  print(
+      f"\n[summary] m={m} num_rounds={num_rounds} "
+      f"old=(bm={old_bm},bk={old_bk},bn={old_bn}) new=(bm={new_bm},bk={new_bk},bn={new_bn})\n"
+      f"  old: mean={stats['old']['mean']:.4f}ms std={stats['old']['std']:.4f}ms "
+      f"min={stats['old']['min']:.4f}ms max={stats['old']['max']:.4f}ms\n"
+      f"  new: mean={stats['new']['mean']:.4f}ms std={stats['new']['std']:.4f}ms "
+      f"min={stats['new']['min']:.4f}ms max={stats['new']['max']:.4f}ms\n"
+      f"  xla: mean={stats['xla']['mean']:.4f}ms std={stats['xla']['std']:.4f}ms "
+      f"min={stats['xla']['min']:.4f}ms max={stats['xla']['max']:.4f}ms\n"
+      f"  new_vs_xla_speedup={stats['xla']['mean'] / stats['new']['mean']:.3f}x "
+      f"old_vs_xla_speedup={stats['xla']['mean'] / stats['old']['mean']:.3f}x "
+      f"new_vs_old_speedup={stats['old']['mean'] / stats['new']['mean']:.3f}x\n"
+      f"  correctness: old={'OK' if old_ok else 'FAIL'} new={'OK' if new_ok else 'FAIL'}"
+  )
+  return {"times": times, "stats": stats, "old_ok": old_ok, "new_ok": new_ok}
+
+
 if __name__ == "__main__":
   print("devices:", jax.devices())
   print("jax version:", jax.__version__)
