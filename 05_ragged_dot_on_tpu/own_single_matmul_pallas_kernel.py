@@ -316,6 +316,97 @@ def profile_best_tile_device_trace(
   )
 
 
+def compare_bk_alternating(
+    bm: int = 2048,
+    bn: int = 512,
+    bk_tiled: int = 512,
+    bk_untiled: int = LATENT_SIZE,
+    m: int = 2048,
+    num_rounds: int = 10,
+    dtype=jnp.bfloat16,
+) -> dict:
+  """Controlled single-variable comparison, per the user's explicit
+  2026-09-26 request: the previous bk=3584/bn=512 result vs. the earlier
+  bk=512/bn=1024 result changed TWO variables at once (bk AND bn), so the
+  improvement couldn't be cleanly attributed to removing the K-loop alone
+  -- bn=512 (more n_tiles, more x-reread) should if anything have HURT,
+  making the result suggestive but not conclusive. This holds `bm`/`bn`
+  fixed and varies ONLY `bk` (512, i.e. 7 K-steps, vs LATENT_SIZE, i.e. 1
+  K-step) -- the SAME input (same `m`, so `check()`'s fixed-per-m seed
+  gives byte-identical x/w for both configs) -- and alternates the two
+  configs across `num_rounds` repeated measurements (not one-shot each),
+  specifically to catch time-varying confounds (thermal, noisy-neighbor
+  effects) a single measurement per config can't distinguish from a real,
+  stable difference.
+
+  This still does NOT distinguish "fewer loop iterations" from "less HBM
+  re-fetching per iteration" from "coarser per-step MXU dispatch overhead"
+  -- all three co-vary with num_k_tiles here. Settling THAT would need the
+  device trace (`profile_best_tile_device_trace`) compared between these
+  exact two configs, which this function does not do by itself.
+  """
+  key = jax.random.key(hash(m) % (2**31))
+  kx, kw = jax.random.split(key, 2)
+  scale = 0.02
+  x = (jax.random.normal(kx, (m, LATENT_SIZE)) * scale).astype(dtype)
+  w = (jax.random.normal(kw, (LATENT_SIZE, INTERMEDIATE_SIZE)) * scale).astype(dtype)
+
+  fn_tiled = jax.jit(functools.partial(pallas_matmul, bm=bm, bk=bk_tiled, bn=bn))
+  fn_untiled = jax.jit(functools.partial(pallas_matmul, bm=bm, bk=bk_untiled, bn=bn))
+
+  # Warm up both (compile) before any timed round.
+  jax.block_until_ready(fn_tiled(x, w))
+  jax.block_until_ready(fn_untiled(x, w))
+
+  tiled_times, untiled_times = [], []
+  for round_idx in range(num_rounds):
+    # Alternate order each round (ABBA-style) to cancel out any linear
+    # drift (e.g. thermal ramp-up) that a fixed A-then-B order could alias
+    # into a fake "B is always faster" pattern.
+    if round_idx % 2 == 0:
+      t0 = time.perf_counter()
+      jax.block_until_ready(fn_tiled(x, w))
+      tiled_ms = (time.perf_counter() - t0) * 1000
+      t0 = time.perf_counter()
+      jax.block_until_ready(fn_untiled(x, w))
+      untiled_ms = (time.perf_counter() - t0) * 1000
+    else:
+      t0 = time.perf_counter()
+      jax.block_until_ready(fn_untiled(x, w))
+      untiled_ms = (time.perf_counter() - t0) * 1000
+      t0 = time.perf_counter()
+      jax.block_until_ready(fn_tiled(x, w))
+      tiled_ms = (time.perf_counter() - t0) * 1000
+    tiled_times.append(tiled_ms)
+    untiled_times.append(untiled_ms)
+    print(
+        f"[round {round_idx}] bk={bk_tiled} (tiled)={tiled_ms:.4f}ms "
+        f"bk={bk_untiled} (untiled)={untiled_ms:.4f}ms "
+        f"diff={(tiled_ms - untiled_ms) * 1000:.1f}us"
+    )
+
+  def _stats(vals):
+    n = len(vals)
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / n
+    return {"mean": mean, "std": var ** 0.5, "min": min(vals), "max": max(vals)}
+
+  tiled_stats = _stats(tiled_times)
+  untiled_stats = _stats(untiled_times)
+  print(
+      f"\n[summary] bm={bm} bn={bn} m={m} num_rounds={num_rounds}\n"
+      f"  bk={bk_tiled} (tiled, {LATENT_SIZE // bk_tiled} K-steps): "
+      f"mean={tiled_stats['mean']:.4f}ms std={tiled_stats['std']:.4f}ms "
+      f"min={tiled_stats['min']:.4f}ms max={tiled_stats['max']:.4f}ms\n"
+      f"  bk={bk_untiled} (untiled, 1 K-step): "
+      f"mean={untiled_stats['mean']:.4f}ms std={untiled_stats['std']:.4f}ms "
+      f"min={untiled_stats['min']:.4f}ms max={untiled_stats['max']:.4f}ms\n"
+      f"  mean_diff={(tiled_stats['mean'] - untiled_stats['mean']) * 1000:.1f}us "
+      f"(positive means the tiled/K-looped version is slower)"
+  )
+  return {"tiled": tiled_stats, "untiled": untiled_stats, "tiled_times": tiled_times, "untiled_times": untiled_times}
+
+
 if __name__ == "__main__":
   print("devices:", jax.devices())
   print("jax version:", jax.__version__)
