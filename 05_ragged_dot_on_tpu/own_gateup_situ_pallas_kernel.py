@@ -221,6 +221,119 @@ def _reference_gateup_situ(
   return (situ_gate * bounded_up).astype(x.dtype)
 
 
+def load_real_expert_gate_up(expert_idx: int = 0, layer: int = 1) -> tuple[jax.Array, jax.Array]:
+  """Loads and dequantizes ONE real Kimi K3 expert's gate/up weights (`w1`/
+  `w3`) from `wp_kv6_real_weights/` (populated by
+  `fetch_real_mxfp4_expert_weights.py` -- run that first, e.g.
+  `python fetch_real_mxfp4_expert_weights.py --num-experts 1`, if the
+  directory doesn't exist yet), transposed to this file's `(latent_size,
+  intermediate_size)` convention, dtype bfloat16.
+
+  Deliberately duplicates (rather than imports) `wp_kv6_real_checkpoint_check.py`'s
+  `_load_real_expert` gate/up half: importing that module would pull in
+  `kimi_k3_latent_moe_ragged_dot.py`'s real tokamax dependency for no reason
+  -- this file's whole point is staying runnable anywhere with just jax (see
+  module docstring), and this loader only needs `mxfp4_dequant`.
+  """
+  import numpy as np  # noqa: PLC0415 -- only needed here, not a project-wide dependency
+  from mxfp4_dequant import dequantize_mxfp4  # noqa: PLC0415
+
+  expert_dir = (
+      pathlib.Path(__file__).parent / "wp_kv6_real_weights" / f"layer{layer}_expert{expert_idx}"
+  )
+  if not expert_dir.exists():
+    raise FileNotFoundError(
+        f"{expert_dir} not found -- run `python fetch_real_mxfp4_expert_weights.py "
+        f"--num-experts {expert_idx + 1}` first (no TPU needed, just network access "
+        "to the public moonshotai/Kimi-K3 HF repo; ~16.7MB per expert)."
+    )
+
+  def _dequant(name: str) -> jax.Array:
+    packed = jnp.asarray(np.load(expert_dir / f"{name}.weight_packed.npy"))
+    scale = jnp.asarray(np.load(expert_dir / f"{name}.weight_scale.npy"))
+    return dequantize_mxfp4(packed, scale)
+
+  # w1=gate, w3=up, both (intermediate_size, latent_size) pre-transpose --
+  # confirmed from modeling_kimi_linear.py's own comments (see
+  # wp_kv6_real_checkpoint_check.py's module docstring for the full trail).
+  gate = _dequant("w1").T.astype(jnp.bfloat16)
+  up = _dequant("w3").T.astype(jnp.bfloat16)
+  return gate, up
+
+
+def check_with_real_mxfp4_weights(
+    m: int = 2048,
+    bm: int = 2048,
+    bk: int = LATENT_SIZE,
+    bn: int = 256,
+    expert_idx: int = 0,
+    layer: int = 1,
+    dtype=jnp.bfloat16,
+) -> bool:
+  """Same correctness check as `check()`, but with REAL, dequantized Kimi K3
+  gate/up weights (one real expert) instead of this file's usual synthetic
+  `scale=0.02` random init -- answers "does the hand-written fused kernel
+  still behave correctly once real parameter magnitudes/distributions
+  replace toy random weights", per explicit user request (2026-09-27) to
+  simulate loading real parameters.
+
+  Only the WEIGHTS are real; `x` stays synthetic -- isolates weight realism
+  specifically (real SiTU-GLU inputs would additionally depend on the real
+  router/down-projection, out of scope here), matching this project's
+  established WP-KV6 convention of keeping non-quantized pieces synthetic.
+
+  Correctness-only by design: runs in `interpret=True` mode (via
+  `fused_gateup_situ`'s own `has_tpu` check), no TPU needed -- this is about
+  numeric behavior at real weight magnitudes, not performance, so unlike
+  every timing-focused function in this file it does not need the real v6e
+  VM at all.
+  """
+  w_gate, w_up = load_real_expert_gate_up(expert_idx=expert_idx, layer=layer)
+  assert w_gate.shape == (LATENT_SIZE, INTERMEDIATE_SIZE), (
+      f"unexpected real weight shape after transpose: {w_gate.shape}"
+  )
+  assert w_up.shape == w_gate.shape
+
+  key = jax.random.key(hash(m) % (2**31))
+  x = (jax.random.normal(key, (m, LATENT_SIZE)) * 0.02).astype(dtype)
+
+  pallas_fn = functools.partial(
+      fused_gateup_situ,
+      beta=SITU_BETA,
+      linear_beta=SITU_LINEAR_BETA,
+      round_dtype=jnp.bfloat16,
+      acc_dtype=jnp.float32,
+      bm=bm,
+      bk=bk,
+      bn=bn,
+  )
+  out = jax.jit(pallas_fn)(x, w_gate, w_up)
+  jax.block_until_ready(out)
+
+  expected = _reference_gateup_situ(x, w_gate, w_up, SITU_BETA, SITU_LINEAR_BETA, jnp.bfloat16)
+  diff = jnp.abs(out.astype(jnp.float32) - expected.astype(jnp.float32))
+  max_abs_diff = float(jnp.max(diff))
+  out_scale = float(jnp.std(expected.astype(jnp.float32))) + 1e-8
+  relative_max_diff = max_abs_diff / out_scale
+  has_nan = bool(jnp.any(jnp.isnan(out)))
+  has_inf = bool(jnp.any(jnp.isinf(out)))
+  tolerance = 0.05
+  ok = relative_max_diff < tolerance and not has_nan and not has_inf
+  status = "OK" if ok else "FAIL"
+
+  gate_std = float(jnp.std(w_gate.astype(jnp.float32)))
+  up_std = float(jnp.std(w_up.astype(jnp.float32)))
+  print(
+      f"[{status}] real-weight check: layer={layer} expert={expert_idx} m={m} "
+      f"tile=(bm={bm},bk={bk},bn={bn}) "
+      f"real_w_gate_std={gate_std:.4f} real_w_up_std={up_std:.4f} "
+      f"(vs this file's usual synthetic scale=0.02) "
+      f"max_abs_diff={max_abs_diff:.4e} relative_max_diff={relative_max_diff:.4f} "
+      f"has_nan={has_nan} has_inf={has_inf}"
+  )
+  return ok
+
+
 def inspect_unfused_hlo(m: int = 2048, dtype=jnp.bfloat16) -> str:
   """Prints and returns the compiled HLO for `_reference_gateup_situ` (the
   "unfused" baseline) at real Kimi K3 dimensions -- step 2 of the
