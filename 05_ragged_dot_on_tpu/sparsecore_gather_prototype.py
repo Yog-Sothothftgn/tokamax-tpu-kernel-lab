@@ -66,22 +66,47 @@ there is NO window size that avoids both:
     is NOT specific to our width -- window sizes other than the compiler's
     expected native tile (128 for int32) simply aren't lowered yet.
 
-**CONFIRMED WORKING instead**: chunking along the FEATURE dimension --
-gather `chunk_width=128`-wide column slices (matching the guide's own
-tile-safe width) at `gather_window_size=128`, repeated `LATENT_SIZE //
-chunk_width = 28` times to cover the full 3584 columns, concatenating the
-28 outputs back into a full-width row. Verified on real v6e hardware
-(2026-09-29): all 28 chunks compile and match `x[indices]` exactly, and
-the full 28-chunk reconstruction matches `jnp.take(x, indices, axis=0)`
-exactly, at `batch_size=512`, `num_indices=256`, plain int32 (no bf16
-packing yet -- see `sparsecore_gather_chunked`). **Compile+correctness
-only so far** -- 28 separate kernel launches per real dispatch call could
-plausibly cost more in per-launch overhead than the whole-row approach
-would have saved, which is exactly the "does sync/handoff eat the benefit"
-question this file exists to answer; not yet measured at real scale (see
-`check_chunked`). `gather_window_size` therefore is fixed at 128 (the one
-confirmed-working, tiling-safe value) rather than left as a free
-parameter -- smaller windows are confirmed broken, not just untried.
+**CONFIRMED WORKING (correctness), but CONCLUSIVELY NOT WORTH IT
+(performance)**: chunking along the FEATURE dimension -- gather
+`chunk_width=128`-wide column slices (matching the guide's own tile-safe
+width) at `gather_window_size=128`, repeated `LATENT_SIZE // chunk_width =
+28` times to cover the full 3584 columns, concatenating the 28 outputs
+back into a full-width row. Verified on real v6e hardware (2026-09-29):
+all 28 chunks compile and match `x[indices]` exactly, full reconstruction
+matches `jnp.take` exactly (small scale, int32) -- AND, separately, at
+REAL production scale (`num_tokens=2048`, `local_num_experts=64`,
+`m_padded=4736`, real `LATENT_SIZE=3584`, int32, no bf16 packing yet, via
+`check_chunked`):
+
+  [timing-chunked][pipelined] xla=0.0858ms sparsecore_chunked=6.8557ms
+    (speedup=0.013x, 28 kernel launches/call)
+  [timing-chunked][per-call]  xla=0.1936ms sparsecore_chunked=7.0083ms
+    (speedup=0.028x)
+
+**The chunked SparseCore gather is ~80x (pipelined) / ~36x (per-call)
+SLOWER than the current plain XLA gather at our real shape.** The 28
+separate kernel launches' overhead doesn't just erode the gather's
+potential advantage -- it overwhelms it by nearly two orders of magnitude.
+This is decisive enough that adding bf16 packing on top (which only adds
+MORE per-call overhead, on both the packing step and the halved-but-still-
+28-chunk gather) would not plausibly close this gap -- **bf16 packing was
+therefore deliberately NOT pursued after this result**, per the same
+"don't keep chasing once there's a real, large, well-evidenized negative
+result" discipline this project has applied elsewhere. `gather_window_size`
+is fixed at 128 (the one confirmed-working, tiling-safe value) throughout
+-- smaller windows are confirmed broken (see above), not just untried.
+
+**Conclusion of this SparseCore investigation**: SparseCore's gather
+primitive, as documented, does not help this project's real MoE dispatch
+gather -- confirmed by two independent, real hardware findings, not
+speculation: (1) the guide's own benchmark shape (narrow rows, millions of
+indices) doesn't match ours (wide rows, thousands of indices) to begin
+with; (2) the workaround needed to even make our width compile (chunking
+into 28 separate kernel launches) costs ~80x more than it could possibly
+save. Combined with WP4/WP5's existing, hardware-confirmed 23-106x speedup
+from JIT-compiling the CURRENT plain-XLA dispatch (a separate, already-
+solved problem), there is no remaining case for pursuing SparseCore for
+dispatch/combine in this project.
 
 To run (real v6e VM only):
   python sparsecore_gather_prototype.py
