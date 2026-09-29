@@ -76,38 +76,53 @@ all 28 chunks compile and match `x[indices]` exactly, full reconstruction
 matches `jnp.take` exactly, at small scale with genuinely non-zero test
 data (`batch_size=512`, `num_indices=256`, `jnp.arange`-based int32).
 
-A first real-scale timing run (`num_tokens=2048`, `local_num_experts=64`,
-`m_padded=4736`, real `LATENT_SIZE=3584`, via `check_chunked`) measured:
+A real-scale timing run with CORRECTED (non-degenerate) test data
+(`num_tokens=2048`, `local_num_experts=64`, `m_padded=4736`, real
+`LATENT_SIZE=3584`, via `check_chunked`) measured, reproducibly across two
+separate runs:
 
-  [timing-chunked][pipelined] xla=0.0858ms sparsecore_chunked=6.8557ms
+  [timing-chunked][pipelined] xla=0.0864ms sparsecore_chunked=6.8591ms
     (speedup=0.013x, 28 kernel launches/call)
-  [timing-chunked][per-call]  xla=0.1936ms sparsecore_chunked=7.0083ms
-    (speedup=0.028x)
+  [timing-chunked][per-call]  xla=0.2179ms sparsecore_chunked=7.0163ms
+    (speedup=0.031x)
 
-i.e. the 28-separate-launch chunked gather measured ~80x (pipelined) /
-~36x (per-call) slower than the current plain XLA gather. **This number
-should NOT be read as a final verdict yet, for two reasons, per review**:
-(1) that SAME run's correctness check used degenerate test data (`x
-.astype(jnp.int32)` on `normal()*0.02`-scale values truncates almost
-everything to 0, so "correctness passed" there was not a meaningful check
-of whether indices were used correctly -- fixed in `check_chunked` to use
-genuinely distinct `jnp.arange`-based int32 data instead, with an explicit
-assert against ever regressing back to near-all-zero test data); (2) the
-SOURCE of the 6.86ms has not been isolated -- whether it's dominated by
-per-kernel-LAUNCH dispatch overhead (28 separate `pl.kernel` calls) or by
-something else about this access pattern is not yet determined via a
-device trace or any other direct measurement.
+i.e. the 28-separate-launch chunked gather really is ~80x (pipelined) /
+~32x (per-call) slower than the current plain XLA gather -- confirmed
+under valid test data, not an artifact of the earlier degenerate-data bug.
 
-**Next concrete step (not yet run)**: `sparsecore_gather_chunked_single_kernel`
-attempts to fold all 28 chunks into ONE `pl.kernel` call (a second grid
-dimension over chunk index, dynamic column-slicing inside the kernel body)
--- if this compiles and is faster than the 28-launch version, that
-directly confirms launch overhead was the driver and bf16 packing becomes
-worth revisiting; if it does not compile, the exact compiler error is what
-gets analyzed next (see `check_chunked_single_kernel`), not a blanket
-"unsupported" conclusion. `gather_window_size` is fixed at 128 (the one
-confirmed-working, tiling-safe value) throughout -- smaller windows are
-confirmed broken (see above), not just untried.
+**`sparsecore_gather_chunked_single_kernel` (folding all 28 per-chunk
+launches into ONE `pl.kernel` call) DOES compile and IS bit-exact
+correct** -- the untested `.at[gather_index, pl.ds(...)]` combination
+(mixing a per-row gather index with an ordinary dynamic column slice in
+one access) works on this jax build. Real-scale timing (`check_chunked_single_kernel`):
+
+  [timing-single-kernel][pipelined] xla=0.0858ms
+    sparsecore_chunked(28 launches)=6.8597ms
+    sparsecore_chunked(1 launch)=2.1462ms
+    (vs xla speedup=0.040x, vs 28-launch speedup=3.196x)
+
+Merging into one kernel call recovers a real ~3.2x -- confirming per-
+launch dispatch overhead WAS a genuine, significant contributor, not a
+red herring. **But even the single-kernel version remains ~25x slower
+than plain XLA gather.** Something beyond kernel-launch count still
+dominates -- plausibly the 28 separate `sync_copy` calls still issued
+INSIDE that one kernel (one per chunk, each still only 128 columns wide),
+i.e. the per-transfer DMA overhead of many narrow accesses, not just the
+per-launch dispatch overhead, may be the deeper bottleneck. NOT yet
+isolated via a device trace.
+
+**Possible next experiment (not yet run, cheap, well-motivated -- not
+required)**: `chunk_width` is currently fixed at 128 to match
+`gather_window_size`, but VMEM headroom at `window=128` was NOT the
+binding constraint at `chunk_width=128` (the whole-row failure was at
+`chunk_width=3584`, `917759` words needed vs a `65536`-word budget --
+`chunk_width=128` only needs `128*128=16384` words, well under budget).
+A wider `chunk_width` (e.g. 256 or 512, VMEM-budget permitting) would mean
+FEWER, LARGER `sync_copy` calls inside the single kernel (7-14 instead of
+28) -- if the remaining ~25x gap is dominated by per-transfer count rather
+than per-launch count, this should recover more of it; if it's dominated
+by something else (e.g. the underlying DMA bandwidth for this access
+pattern itself), it won't. Untried as of this note.
 
 To run (real v6e VM only):
   python sparsecore_gather_prototype.py
