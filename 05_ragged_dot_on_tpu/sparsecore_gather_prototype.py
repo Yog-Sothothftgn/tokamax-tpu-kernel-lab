@@ -66,47 +66,48 @@ there is NO window size that avoids both:
     is NOT specific to our width -- window sizes other than the compiler's
     expected native tile (128 for int32) simply aren't lowered yet.
 
-**CONFIRMED WORKING (correctness), but CONCLUSIVELY NOT WORTH IT
-(performance)**: chunking along the FEATURE dimension -- gather
+**CONFIRMED WORKING (correctness at small scale), STATUS AT REAL SCALE
+STILL BEING PINNED DOWN**: chunking along the FEATURE dimension -- gather
 `chunk_width=128`-wide column slices (matching the guide's own tile-safe
 width) at `gather_window_size=128`, repeated `LATENT_SIZE // chunk_width =
 28` times to cover the full 3584 columns, concatenating the 28 outputs
 back into a full-width row. Verified on real v6e hardware (2026-09-29):
 all 28 chunks compile and match `x[indices]` exactly, full reconstruction
-matches `jnp.take` exactly (small scale, int32) -- AND, separately, at
-REAL production scale (`num_tokens=2048`, `local_num_experts=64`,
-`m_padded=4736`, real `LATENT_SIZE=3584`, int32, no bf16 packing yet, via
-`check_chunked`):
+matches `jnp.take` exactly, at small scale with genuinely non-zero test
+data (`batch_size=512`, `num_indices=256`, `jnp.arange`-based int32).
+
+A first real-scale timing run (`num_tokens=2048`, `local_num_experts=64`,
+`m_padded=4736`, real `LATENT_SIZE=3584`, via `check_chunked`) measured:
 
   [timing-chunked][pipelined] xla=0.0858ms sparsecore_chunked=6.8557ms
     (speedup=0.013x, 28 kernel launches/call)
   [timing-chunked][per-call]  xla=0.1936ms sparsecore_chunked=7.0083ms
     (speedup=0.028x)
 
-**The chunked SparseCore gather is ~80x (pipelined) / ~36x (per-call)
-SLOWER than the current plain XLA gather at our real shape.** The 28
-separate kernel launches' overhead doesn't just erode the gather's
-potential advantage -- it overwhelms it by nearly two orders of magnitude.
-This is decisive enough that adding bf16 packing on top (which only adds
-MORE per-call overhead, on both the packing step and the halved-but-still-
-28-chunk gather) would not plausibly close this gap -- **bf16 packing was
-therefore deliberately NOT pursued after this result**, per the same
-"don't keep chasing once there's a real, large, well-evidenized negative
-result" discipline this project has applied elsewhere. `gather_window_size`
-is fixed at 128 (the one confirmed-working, tiling-safe value) throughout
--- smaller windows are confirmed broken (see above), not just untried.
+i.e. the 28-separate-launch chunked gather measured ~80x (pipelined) /
+~36x (per-call) slower than the current plain XLA gather. **This number
+should NOT be read as a final verdict yet, for two reasons, per review**:
+(1) that SAME run's correctness check used degenerate test data (`x
+.astype(jnp.int32)` on `normal()*0.02`-scale values truncates almost
+everything to 0, so "correctness passed" there was not a meaningful check
+of whether indices were used correctly -- fixed in `check_chunked` to use
+genuinely distinct `jnp.arange`-based int32 data instead, with an explicit
+assert against ever regressing back to near-all-zero test data); (2) the
+SOURCE of the 6.86ms has not been isolated -- whether it's dominated by
+per-kernel-LAUNCH dispatch overhead (28 separate `pl.kernel` calls) or by
+something else about this access pattern is not yet determined via a
+device trace or any other direct measurement.
 
-**Conclusion of this SparseCore investigation**: SparseCore's gather
-primitive, as documented, does not help this project's real MoE dispatch
-gather -- confirmed by two independent, real hardware findings, not
-speculation: (1) the guide's own benchmark shape (narrow rows, millions of
-indices) doesn't match ours (wide rows, thousands of indices) to begin
-with; (2) the workaround needed to even make our width compile (chunking
-into 28 separate kernel launches) costs ~80x more than it could possibly
-save. Combined with WP4/WP5's existing, hardware-confirmed 23-106x speedup
-from JIT-compiling the CURRENT plain-XLA dispatch (a separate, already-
-solved problem), there is no remaining case for pursuing SparseCore for
-dispatch/combine in this project.
+**Next concrete step (not yet run)**: `sparsecore_gather_chunked_single_kernel`
+attempts to fold all 28 chunks into ONE `pl.kernel` call (a second grid
+dimension over chunk index, dynamic column-slicing inside the kernel body)
+-- if this compiles and is faster than the 28-launch version, that
+directly confirms launch overhead was the driver and bf16 packing becomes
+worth revisiting; if it does not compile, the exact compiler error is what
+gets analyzed next (see `check_chunked_single_kernel`), not a blanket
+"unsupported" conclusion. `gather_window_size` is fixed at 128 (the one
+confirmed-working, tiling-safe value) throughout -- smaller windows are
+confirmed broken (see above), not just untried.
 
 To run (real v6e VM only):
   python sparsecore_gather_prototype.py
@@ -305,7 +306,26 @@ def check_chunked(
   # int32 stand-in for the real bf16 activation -- NOT numerically
   # meaningful (bf16 packing/unpacking is deferred), just enough to time
   # and correctness-check the gather MECHANISM at the real shape.
-  x_int32 = x.astype(jnp.int32)
+  #
+  # **Real bug, caught by review**: an earlier version of this function did
+  # `x_int32 = x.astype(jnp.int32)` directly. `x` is `normal() * 0.02`
+  # (this project's usual synthetic-weight scale) -- values with std~0.02,
+  # essentially all |value| < 1, so casting straight to int32 TRUNCATES
+  # nearly everything to exactly 0. Both sides of the correctness
+  # comparison then gathered an (almost) all-zero array -- a degenerate
+  # test that would pass even if the indices were completely wrong, since
+  # "0 gathered from anywhere" still equals "0". Fixed by using genuinely
+  # distinct, mostly-nonzero int32 values (one per element, via `arange`),
+  # decoupled from `x`'s real (small-scale) values -- matches the earlier,
+  # legitimately-nonzero small-scale chunk test this function is supposed
+  # to extend to real scale. The distinctness assert below makes this
+  # regression loud instead of silent if it ever recurs.
+  x_int32 = jnp.arange(num_tokens * LATENT_SIZE, dtype=jnp.int32).reshape(num_tokens, LATENT_SIZE)
+  assert int(jnp.sum(x_int32 == 0)) <= 1, (
+      "test data is degenerate (nearly all zero) -- a correctness PASS "
+      "against this data would not be trustworthy; this assert exists so "
+      "that bug cannot silently recur"
+  )
 
   sc_fn = functools.partial(
       sparsecore_gather_chunked, chunk_width=chunk_width, gather_window_size=gather_window_size
@@ -338,6 +358,140 @@ def check_chunked(
       f"(speedup={xla_ms_pipe / sc_ms_pipe:.3f}x, {num_chunks} kernel launches/call)\n"
       f"[timing-chunked][per-call]  xla={xla_ms_block:.4f}ms sparsecore_chunked={sc_ms_block:.4f}ms "
       f"(speedup={xla_ms_block / sc_ms_block:.3f}x)"
+  )
+  return ok
+
+
+def sparsecore_gather_chunked_single_kernel(
+    x_int32: jax.Array,
+    padded_token_idx: jax.Array,
+    valid_mask: jax.Array,
+    chunk_width: int = 128,
+    gather_window_size: int = 128,
+) -> jax.Array:
+  """EXPERIMENTAL, genuinely untested API surface -- per explicit user
+  instruction, this exists to surface a REAL compile error/result rather
+  than assume merging works or declare the chunked approach a dead end
+  without trying it.
+
+  `sparsecore_gather_chunked` launches `num_chunks` (28) SEPARATE
+  `pl.kernel` calls from an outer Python loop -- each one a full kernel
+  dispatch. This function instead tries to fold all 28 chunks into ONE
+  `pl.kernel` call by adding a SECOND grid dimension over chunk index, and
+  selecting the corresponding 128-wide column slice of the FULL (un-sliced)
+  `x_int32` table dynamically INSIDE the kernel body via `pl.ds(chunk_id *
+  chunk_width, chunk_width)`, combined with the existing per-row GATHER
+  index (`i_vmem.at[0]`) in the SAME `.at[]` access.
+
+  **Whether SparseCore's `.at[]` addressing supports combining a per-row
+  GATHER index with an ordinary dynamic column SLICE in one access is not
+  documented anywhere this file's research found, and not assumed here to
+  work** -- if this fails to compile, the goal is to capture and report the
+  EXACT error (which op, which pass, what it says), not to conclude
+  "impossible" from a single attempt.
+  """
+  from jax.experimental import pallas as pl
+  from jax.experimental.pallas import tpu as pltpu
+  from jax.experimental.pallas import tpu_sc as plsc
+
+  num_tokens, value_dim = x_int32.shape
+  assert value_dim == LATENT_SIZE, f"expected value_dim={LATENT_SIZE}, got {value_dim}"
+  assert x_int32.dtype == jnp.int32, f"expected int32, got {x_int32.dtype}"
+  assert value_dim % chunk_width == 0
+  num_chunks = value_dim // chunk_width
+  num_indices = padded_token_idx.shape[0]
+  assert num_indices % gather_window_size == 0
+
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "No SparseCore on this TPU -- cannot run this prototype"
+  vector_mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+
+  safe_idx = jnp.where(padded_token_idx < 0, 0, padded_token_idx).astype(jnp.int32)
+  indices_r = safe_idx.reshape((1, num_indices))
+
+  @pl.kernel(
+      out_type=jax.ShapeDtypeStruct((num_indices, value_dim), jnp.int32),
+      mesh=vector_mesh,
+  )
+  def kernel(x_hbm, i_hbm, o_hbm):
+    def body(i_vmem, o_vmem):
+      chunk_id = pl.program_id(1)
+      col = pl.ds(chunk_id * chunk_width, chunk_width)
+      pltpu.sync_copy(x_hbm.at[i_vmem.at[0], col], o_vmem)
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(num_indices // gather_window_size, num_chunks),
+        in_specs=[pl.BlockSpec((1, gather_window_size), index_map=lambda i, c: (0, i))],
+        out_specs=[pl.BlockSpec((gather_window_size, chunk_width), index_map=lambda i, c: (i, c))],
+        core_axis_name='subcore',
+        dimension_semantics=(pltpu.PARALLEL, pltpu.PARALLEL),
+    )(i_hbm, o_hbm)
+
+  gathered = kernel(x_int32, indices_r)
+  return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
+
+
+def check_chunked_single_kernel(
+    num_tokens: int = 2048,
+    local_num_experts: int = 64,
+    chunk_width: int = 128,
+    gather_window_size: int = 128,
+    seed: int = 0,
+) -> bool:
+  """Correctness + timing for `sparsecore_gather_chunked_single_kernel`,
+  same real-scale setup and same non-degenerate int32 test data as
+  `check_chunked` -- if this compiles and is correct, compares its timing
+  against BOTH the plain XLA gather and `sparsecore_gather_chunked` (the
+  28-separate-launches version), to see whether merging into one kernel
+  actually removes the per-launch overhead `check_chunked` found.
+  """
+  x, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
+      num_tokens=num_tokens, local_num_experts=local_num_experts, seed=seed
+  )
+  num_indices = int(padded_token_idx.shape[0])
+  x_int32 = jnp.arange(num_tokens * LATENT_SIZE, dtype=jnp.int32).reshape(num_tokens, LATENT_SIZE)
+  print(f"[setup-single-kernel] num_tokens={num_tokens} num_indices(m_padded)={num_indices} "
+        f"value_dim={LATENT_SIZE} num_chunks={LATENT_SIZE // chunk_width}")
+
+  def xla_fn(xx, idx, vm):
+    safe_idx = jnp.where(idx < 0, 0, idx)
+    gathered = xx[safe_idx]
+    return jnp.where(vm[:, None], gathered, jnp.zeros_like(gathered))
+
+  sc_single_fn = functools.partial(
+      sparsecore_gather_chunked_single_kernel, chunk_width=chunk_width,
+      gather_window_size=gather_window_size,
+  )
+
+  try:
+    out = jax.jit(sc_single_fn)(x_int32, padded_token_idx, valid_mask)
+    jax.block_until_ready(out)
+  except Exception as e:  # noqa: BLE001 -- surfacing the real error is the point
+    print(f"[single-kernel] COMPILE/RUN FAILED -- reporting the real error, not guessing:\n{e}")
+    return False
+
+  expected = jax.jit(xla_fn)(x_int32, padded_token_idx, valid_mask)
+  jax.block_until_ready(expected)
+  max_abs_diff = float(jnp.max(jnp.abs(out - expected)))
+  ok = max_abs_diff == 0.0
+  print(f"[{'OK' if ok else 'FAIL'}] single-kernel chunked gather vs plain XLA gather (int32): "
+        f"max_abs_diff={max_abs_diff} (expect exact 0)")
+  if not ok:
+    return False
+
+  sc_multi_fn = functools.partial(
+      sparsecore_gather_chunked, chunk_width=chunk_width, gather_window_size=gather_window_size
+  )
+  xla_ms_pipe = _time_jit_pipelined(xla_fn, x_int32, padded_token_idx, valid_mask)
+  sc_multi_ms_pipe = _time_jit_pipelined(sc_multi_fn, x_int32, padded_token_idx, valid_mask)
+  sc_single_ms_pipe = _time_jit_pipelined(sc_single_fn, x_int32, padded_token_idx, valid_mask)
+  print(
+      f"[timing-single-kernel][pipelined] xla={xla_ms_pipe:.4f}ms "
+      f"sparsecore_chunked(28 launches)={sc_multi_ms_pipe:.4f}ms "
+      f"sparsecore_chunked(1 launch)={sc_single_ms_pipe:.4f}ms "
+      f"(vs xla speedup={xla_ms_pipe / sc_single_ms_pipe:.3f}x, "
+      f"vs 28-launch speedup={sc_multi_ms_pipe / sc_single_ms_pipe:.3f}x)"
   )
   return ok
 
@@ -717,4 +871,10 @@ if __name__ == "__main__":
   # the module docstring for the two real hardware errors) -- run the
   # chunked path instead, the one confirmed correct on real hardware.
   ok = check_chunked()
-  print(f"\n{'all checks passed' if ok else 'CHECK FAILED -- see above'}")
+  print(f"\n{'chunked (28 launches): all checks passed' if ok else 'chunked (28 launches): CHECK FAILED -- see above'}")
+
+  print("\n--- attempting single-kernel merge (experimental, untested API surface) ---")
+  ok_single = check_chunked_single_kernel()
+  print(
+      f"\n{'single-kernel: all checks passed' if ok_single else 'single-kernel: FAILED or did not compile -- see error above'}"
+  )
