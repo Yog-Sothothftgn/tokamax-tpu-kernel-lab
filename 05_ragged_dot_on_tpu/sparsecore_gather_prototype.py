@@ -47,15 +47,41 @@ problem from a bug in this file's own code, before assuming the rest works.
 If the probe fails, verify compatibility in a SEPARATE throwaway venv --
 do not upgrade jax in the existing, already-working one.
 
-**VMEM caveat**: the guide's own gather example uses `value_dim=128`; ours
-is `LATENT_SIZE=3584` (28x wider). Per-subcore VMEM budget for SparseCore
-is NOT the same (and not confirmed here to be the same size) as the 32MB
-shared TensorCore scoped-VMEM ceiling this project already hit repeatedly
-in `own_gateup_situ_pallas_kernel.py` -- `gather_window_size` therefore
-defaults conservatively SMALL (8) rather than guessing large and hitting an
-unknown OOM ceiling; increase it once basic correctness is confirmed on
-real hardware, the same "let a real OOM message tell you the ceiling,
-don't guess" discipline already established in this project.
+**VMEM caveat, CONFIRMED on real v6e hardware (2026-09-29), whole-row
+gather does NOT fit at our width**: the guide's own gather example uses
+`value_dim=128`; ours is `LATENT_SIZE=3584` (28x wider). A direct,
+unmodified port of the guide's whole-row gather to `value_dim=3584` hits
+one of two REAL, hardware-confirmed failures depending on window size, and
+there is NO window size that avoids both:
+  - `gather_window_size=128` (the guide's own literal, tiling-safe value):
+    `'memref.alloca' op E3000: CompileTimeSparseCoreAllocationFailure:
+    current allocation offset upper bound (917759 words) exceeds the
+    legit[imate limit]` -- per-subcore VMEM is only 262144 bytes (65536
+    words, from `pltpu.get_tpu_info().sparse_core.vmem_capacity_bytes`);
+    128 rows x 3584 words is ~14x over that.
+  - Any other window size tried (32, 8): `'sc_tpu.enqueue_transfer' op Not
+    implemented: Source and target leading tiles have different trailing
+    dimensions` -- a real Mosaic lowering limitation, reproduced at BOTH
+    `value_dim=128` (the guide's own width) and `value_dim=3584`, so this
+    is NOT specific to our width -- window sizes other than the compiler's
+    expected native tile (128 for int32) simply aren't lowered yet.
+
+**CONFIRMED WORKING instead**: chunking along the FEATURE dimension --
+gather `chunk_width=128`-wide column slices (matching the guide's own
+tile-safe width) at `gather_window_size=128`, repeated `LATENT_SIZE //
+chunk_width = 28` times to cover the full 3584 columns, concatenating the
+28 outputs back into a full-width row. Verified on real v6e hardware
+(2026-09-29): all 28 chunks compile and match `x[indices]` exactly, and
+the full 28-chunk reconstruction matches `jnp.take(x, indices, axis=0)`
+exactly, at `batch_size=512`, `num_indices=256`, plain int32 (no bf16
+packing yet -- see `sparsecore_gather_chunked`). **Compile+correctness
+only so far** -- 28 separate kernel launches per real dispatch call could
+plausibly cost more in per-launch overhead than the whole-row approach
+would have saved, which is exactly the "does sync/handoff eat the benefit"
+question this file exists to answer; not yet measured at real scale (see
+`check_chunked`). `gather_window_size` therefore is fixed at 128 (the one
+confirmed-working, tiling-safe value) rather than left as a free
+parameter -- smaller windows are confirmed broken, not just untried.
 
 To run (real v6e VM only):
   python sparsecore_gather_prototype.py
@@ -137,6 +163,160 @@ def current_jit_gather(x: jax.Array, padded_token_idx: jax.Array, valid_mask: ja
   return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
 
 
+def sparsecore_gather_chunked(
+    x_int32: jax.Array,
+    padded_token_idx: jax.Array,
+    valid_mask: jax.Array,
+    chunk_width: int = 128,
+    gather_window_size: int = 128,
+) -> jax.Array:
+  """The CONFIRMED-WORKING SparseCore gather path at our real value_dim
+  (3584) -- see this file's module docstring for why the naive whole-row
+  `sparsecore_gather` below cannot work at this width at ANY window size
+  (real hardware errors, not a guess). Chunks the feature dimension into
+  `value_dim // chunk_width` column slices (default 128-wide, matching the
+  guide's own tile-safe width), gathers each chunk separately at
+  `gather_window_size=128` (the one window size confirmed NOT to hit the
+  tiling lowering bug), then concatenates the chunks back into a full-
+  width row. Verified correct on real v6e hardware (2026-09-29): all 28
+  chunks (at `chunk_width=128`) match `x[indices]` exactly, and the full
+  concatenated reconstruction matches `jnp.take(x, indices, axis=0)`
+  exactly.
+
+  INT32 ONLY, no bf16 packing yet -- per explicit user instruction, this
+  step is scoped to "does the chunked approach compile, run correctly, and
+  perform reasonably" BEFORE adding bf16-packing complexity on top.
+  `check_chunked` casts the real bf16 activation to int32 as a shape/
+  mechanism stand-in -- not numerically meaningful, just enough to time
+  and correctness-check the GATHER itself; bf16 packing is a separate,
+  later step once this int32 timing picture is understood.
+
+  `gather_window_size` is NOT a free parameter here (see module docstring)
+  -- 128 is the one confirmed-safe value; changing it needs new hardware
+  evidence, not a guess. `num_chunks` separate kernel launches per call is
+  the real, not-yet-measured cost this function's timing exists to reveal
+  -- per-launch overhead x 28 could plausibly erase whatever the gather
+  itself saves, which is exactly the "does sync/handoff eat the benefit"
+  question from the original request.
+  """
+  from jax.experimental import pallas as pl
+  from jax.experimental.pallas import tpu as pltpu
+  from jax.experimental.pallas import tpu_sc as plsc
+
+  num_tokens, value_dim = x_int32.shape
+  assert value_dim == LATENT_SIZE, f"expected value_dim={LATENT_SIZE}, got {value_dim}"
+  assert x_int32.dtype == jnp.int32, f"expected int32, got {x_int32.dtype}"
+  assert value_dim % chunk_width == 0, (
+      f"value_dim={value_dim} not divisible by chunk_width={chunk_width}"
+  )
+  num_chunks = value_dim // chunk_width
+  num_indices = padded_token_idx.shape[0]
+  assert num_indices % gather_window_size == 0, (
+      f"num_indices={num_indices} not divisible by gather_window_size={gather_window_size}"
+  )
+
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "No SparseCore on this TPU -- cannot run this prototype"
+  vector_mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+
+  safe_idx = jnp.where(padded_token_idx < 0, 0, padded_token_idx).astype(jnp.int32)
+  indices_r = safe_idx.reshape((1, num_indices))
+
+  def gather_one_chunk(x_chunk_hbm):
+    @pl.kernel(
+        out_type=jax.ShapeDtypeStruct((num_indices, chunk_width), jnp.int32),
+        mesh=vector_mesh,
+    )
+    def kernel(x_hbm, i_hbm, o_hbm):
+      def body(i_vmem, o_vmem):
+        pltpu.sync_copy(x_hbm.at[i_vmem.at[0]], o_vmem)
+
+      pltpu.emit_pipeline(
+          body,
+          grid=(num_indices // gather_window_size,),
+          in_specs=[pl.BlockSpec((1, gather_window_size), index_map=lambda i: (0, i))],
+          out_specs=[pl.BlockSpec((gather_window_size, chunk_width), index_map=lambda i: (i, 0))],
+          core_axis_name='subcore',
+          dimension_semantics=(pltpu.PARALLEL,),
+      )(i_hbm, o_hbm)
+
+    return kernel(x_chunk_hbm, indices_r)
+
+  chunks = [
+      gather_one_chunk(x_int32[:, c * chunk_width:(c + 1) * chunk_width])
+      for c in range(num_chunks)
+  ]
+  gathered = jnp.concatenate(chunks, axis=-1)
+  return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
+
+
+def check_chunked(
+    num_tokens: int = 2048,
+    local_num_experts: int = 64,
+    chunk_width: int = 128,
+    gather_window_size: int = 128,
+    seed: int = 0,
+) -> bool:
+  """Correctness + timing for the CONFIRMED-WORKING chunked SparseCore
+  gather, at REAL production scale (real `m_padded`, real
+  `LATENT_SIZE=3584`), int32 only (bf16 packing deferred -- see
+  `sparsecore_gather_chunked`'s docstring). Compares against a plain XLA
+  gather on the SAME int32 stand-in data, with both timing conventions
+  (pipelined/blocking, same convention as every other check in this
+  project) -- this is the real-scale answer to "do the 28 separate kernel
+  launches cost more than they save".
+  """
+  x, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
+      num_tokens=num_tokens, local_num_experts=local_num_experts, seed=seed
+  )
+  num_indices = int(padded_token_idx.shape[0])
+  num_chunks = LATENT_SIZE // chunk_width
+  print(
+      f"[setup-chunked] num_tokens={num_tokens} local_num_experts={local_num_experts} "
+      f"num_indices(m_padded)={num_indices} value_dim={LATENT_SIZE} num_chunks={num_chunks} "
+      f"num_valid={int(jnp.sum(valid_mask))}"
+  )
+
+  # int32 stand-in for the real bf16 activation -- NOT numerically
+  # meaningful (bf16 packing/unpacking is deferred), just enough to time
+  # and correctness-check the gather MECHANISM at the real shape.
+  x_int32 = x.astype(jnp.int32)
+
+  sc_fn = functools.partial(
+      sparsecore_gather_chunked, chunk_width=chunk_width, gather_window_size=gather_window_size
+  )
+
+  def xla_fn(xx, idx, vm):
+    safe_idx = jnp.where(idx < 0, 0, idx)
+    gathered = xx[safe_idx]
+    return jnp.where(vm[:, None], gathered, jnp.zeros_like(gathered))
+
+  out = jax.jit(sc_fn)(x_int32, padded_token_idx, valid_mask)
+  jax.block_until_ready(out)
+  expected = jax.jit(xla_fn)(x_int32, padded_token_idx, valid_mask)
+  jax.block_until_ready(expected)
+
+  max_abs_diff = float(jnp.max(jnp.abs(out - expected)))
+  ok = max_abs_diff == 0.0  # pure data movement, expect exact match
+  print(
+      f"[{'OK' if ok else 'FAIL'}] chunked sparsecore gather vs plain XLA gather (int32): "
+      f"max_abs_diff={max_abs_diff} (expect exact 0)"
+  )
+
+  xla_ms_pipe = _time_jit_pipelined(xla_fn, x_int32, padded_token_idx, valid_mask)
+  xla_ms_block = _time_jit_blocking(xla_fn, x_int32, padded_token_idx, valid_mask)
+  sc_ms_pipe = _time_jit_pipelined(sc_fn, x_int32, padded_token_idx, valid_mask)
+  sc_ms_block = _time_jit_blocking(sc_fn, x_int32, padded_token_idx, valid_mask)
+
+  print(
+      f"[timing-chunked][pipelined] xla={xla_ms_pipe:.4f}ms sparsecore_chunked={sc_ms_pipe:.4f}ms "
+      f"(speedup={xla_ms_pipe / sc_ms_pipe:.3f}x, {num_chunks} kernel launches/call)\n"
+      f"[timing-chunked][per-call]  xla={xla_ms_block:.4f}ms sparsecore_chunked={sc_ms_block:.4f}ms "
+      f"(speedup={xla_ms_block / sc_ms_block:.3f}x)"
+  )
+  return ok
+
+
 def sparsecore_gather(
     x: jax.Array,
     padded_token_idx: jax.Array,
@@ -144,10 +324,17 @@ def sparsecore_gather(
     gather_window_size: int = 8,
     repack_every_call: bool = True,
 ) -> jax.Array:
-  """SparseCore gather at our real shape, structurally mirroring the
-  official guide's `gather_bf16_packed` example (bf16 needs pairwise-
-  packing into int32 since SparseCore DMA only natively moves 32-bit
-  words -- see this file's module docstring).
+  """**KNOWN NON-WORKING at this file's real `LATENT_SIZE=3584`, kept only
+  as the initial (naive, whole-row) attempt and a record of the exact
+  hardware errors that ruled it out -- see this file's module docstring
+  and use `sparsecore_gather_chunked` instead.** Every `gather_window_size`
+  tried either OOMs per-subcore VMEM (128) or hits a real Mosaic lowering
+  bug (32, 8) -- there is no value that avoids both at this width.
+
+  Original docstring, for context: SparseCore gather at our real shape,
+  structurally mirroring the official guide's `gather_bf16_packed` example
+  (bf16 needs pairwise-packing into int32 since SparseCore DMA only
+  natively moves 32-bit words -- see this file's module docstring).
 
   `repack_every_call`: if True (the default, and the realistic case for a
   live forward pass where `x` is freshly computed every call), `x` must be
@@ -419,9 +606,16 @@ def _probe_sparsecore_api() -> bool:
   if not stage1_ok:
     return False
 
-  # Stage 2: guide's own tiny plain-int32 gather (sync_copy + indexed BlockSpec).
-  batch_size, value_dim, gather_window_size, num_steps = 256, 128, 32, 4
-  num_indices = gather_window_size * num_steps
+  # Stage 2: guide's own tiny plain-int32 gather (sync_copy + indexed
+  # BlockSpec). gather_window_size=128 is the guide's own literal,
+  # confirmed-tiling-safe value (see module docstring) -- an earlier
+  # version of this probe used 32 "to make it tiny", which is itself the
+  # exact window size confirmed (on real hardware) to hit a real Mosaic
+  # lowering bug, unrelated to whether SparseCore gather works at all. Only
+  # num_steps is shrunk for a quick probe; window size is NOT a free
+  # parameter here.
+  batch_size, value_dim, gather_window_size, num_steps = 4096, 128, 128, 2
+  num_indices = gather_window_size * sc_info.num_cores * sc_info.num_subcores * num_steps
   x_g = jnp.arange(batch_size * value_dim).reshape(batch_size, value_dim).astype(jnp.int32)
   indices_g = jax.random.randint(jax.random.key(1), (num_indices,), 0, batch_size, jnp.int32)
 
@@ -493,5 +687,9 @@ if __name__ == "__main__":
     )
     raise SystemExit(1)
 
-  ok = check()
+  # check() exercises the whole-row sparsecore_gather, which is KNOWN
+  # NON-WORKING at this file's real LATENT_SIZE=3584 (see its docstring and
+  # the module docstring for the two real hardware errors) -- run the
+  # chunked path instead, the one confirmed correct on real hardware.
+  ok = check_chunked()
   print(f"\n{'all checks passed' if ok else 'CHECK FAILED -- see above'}")
