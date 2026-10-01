@@ -67,12 +67,17 @@ VALUE_DIM = 128
 NUM_INDICES = 256
 
 
-def _make_test_data(seed: int = 0):
+def _make_test_data(seed: int = 0, value_dim: int = VALUE_DIM, batch_size: int = BATCH_SIZE):
   """Distinct-valued int32 table + an index array with GUARANTEED
-  out-of-order and duplicate entries (not left to chance)."""
-  x = jnp.arange(BATCH_SIZE * VALUE_DIM, dtype=jnp.int32).reshape(BATCH_SIZE, VALUE_DIM)
+  out-of-order and duplicate entries (not left to chance). `value_dim`/
+  `batch_size` default to this file's A1/A2 constants; A3 passes the real
+  `LATENT_SIZE=3584` instead, changing ONLY this one thing -- the index
+  array's own construction (duplicates/out-of-order pattern) does not
+  depend on value_dim at all, so it is byte-identical either way.
+  """
+  x = jnp.arange(batch_size * value_dim, dtype=jnp.int32).reshape(batch_size, value_dim)
   key = jax.random.key(seed)
-  indices = jax.random.randint(key, (NUM_INDICES,), 0, BATCH_SIZE, jnp.int32)
+  indices = jax.random.randint(key, (NUM_INDICES,), 0, batch_size, jnp.int32)
   indices = indices.at[1].set(indices[0])  # forced duplicate, adjacent
   indices = indices.at[-1].set(indices[0])  # forced duplicate, far away
   mid = NUM_INDICES // 2
@@ -90,7 +95,9 @@ def _full_error(e: Exception) -> str:
   return "".join(traceback.format_exception(type(e), e, e.__traceback__))
 
 
-def _describe_blocks(window_size: int, indices_2d: bool, *, is_echo: bool) -> tuple[tuple, tuple]:
+def _describe_blocks(
+    window_size: int, indices_2d: bool, *, is_echo: bool, value_dim: int = VALUE_DIM
+) -> tuple[tuple, tuple]:
   """Prints the exact BlockSpec shapes a given call uses, so that two
   failures with similar-looking error TEXT can be checked against which
   tiled memref they actually name, per review: `index_copy_only`'s INPUT
@@ -106,7 +113,7 @@ def _describe_blocks(window_size: int, indices_2d: bool, *, is_echo: bool) -> tu
   not be treated as confirming each other.
   """
   in_shape = (1, window_size) if indices_2d else (window_size,)
-  out_shape = in_shape if is_echo else (window_size, VALUE_DIM)
+  out_shape = in_shape if is_echo else (window_size, value_dim)
   kind = "echo (index-copy-only)" if is_echo else "gather"
   print(f"    [{kind}] input(indices) block shape={in_shape}, output block shape={out_shape}")
   return in_shape, out_shape
@@ -128,8 +135,10 @@ def gather_once(
     materialize_index: bool = False,
 ) -> jax.Array:
   """A2 step 2 (and A1's only test): the actual indirect gather, at
-  `chunk_width=VALUE_DIM` (the full row -- table is only 128 wide here by
-  construction). `indices_2d` selects between the 2D `(1, W)` convention
+  `chunk_width=x.shape[1]` (the full row of whatever table `x` is --
+  derived from `x`'s own shape, not a hardcoded constant, so this same
+  function serves both A1/A2's narrow `value_dim=128` table and A3's real
+  `LATENT_SIZE=3584` table unchanged). `indices_2d` selects between the 2D `(1, W)` convention
   `sparsecore_gather_prototype.py` used (reshape indices, `.at[0]` inside
   the kernel) and the guide's OWN bf16-packed example's flat 1D `(W,)`
   convention.
@@ -154,6 +163,7 @@ def gather_once(
   vector_mesh = _vector_mesh()
   num_indices = indices.shape[0]
   assert num_indices % window_size == 0
+  value_dim = x.shape[1]
 
   if indices_2d:
     indices_in = indices.reshape((1, num_indices))
@@ -162,7 +172,7 @@ def gather_once(
     indices_in = indices
     in_block = pl.BlockSpec((window_size,), index_map=lambda i: (i,))
 
-  @pl.kernel(out_type=jax.ShapeDtypeStruct((num_indices, VALUE_DIM), x.dtype), mesh=vector_mesh)
+  @pl.kernel(out_type=jax.ShapeDtypeStruct((num_indices, value_dim), x.dtype), mesh=vector_mesh)
   def kernel(x_hbm, i_hbm, o_hbm):
     def body(i_vmem, o_vmem):
       if indices_2d:
@@ -175,7 +185,7 @@ def gather_once(
         body,
         grid=(num_indices // window_size,),
         in_specs=[in_block],
-        out_specs=[pl.BlockSpec((window_size, VALUE_DIM), index_map=lambda i: (i, 0))],
+        out_specs=[pl.BlockSpec((window_size, value_dim), index_map=lambda i: (i, 0))],
         core_axis_name='subcore',
         dimension_semantics=(pltpu.PARALLEL,),
     )(i_hbm, o_hbm)
@@ -353,6 +363,52 @@ def run_a2() -> None:
             f"FAILED -- full error below\n{_full_error(e)}")
 
 
+REAL_LATENT_SIZE = 3584  # must match kimi_k3_config().latent_size
+
+
+def run_a3_real_width(window_size: int = 8, real_value_dim: int = REAL_LATENT_SIZE) -> bool:
+  """Minimal, single-variable extension of A2's CONFIRMED-WORKING config
+  (1D, ref-based indices -- i.e. `indices_2d=False, materialize_index=
+  False`, at `window_size=8`) to the REAL `LATENT_SIZE=3584`, per explicit
+  user request: change ONLY the column count. Everything else stays
+  identical to A1/A2 -- same int32 dtype, same `batch_size=512`, same
+  `num_indices=256`, same forced duplicate/out-of-order index pattern
+  (`_make_test_data`'s index construction doesn't depend on `value_dim` at
+  all, so it's byte-for-byte the same array here). No bf16 packing, no
+  performance measurement -- compile+correctness only, exactly like A1/A2,
+  so as not to mix in new variables.
+
+  **VMEM-budget caveat, per explicit user note**: one `(window_size,
+  real_value_dim)` int32 buffer is `8*3584*4 bytes = 112KiB`, comfortably
+  under this hardware's 256KiB per-subcore budget -- but that is ONE
+  buffer's size, not the whole kernel's actual VMEM footprint (pipelining
+  typically double-buffers, and there may be other scratch/semaphore
+  overhead) -- so this compiling is worth TESTING, not something already
+  guaranteed by that arithmetic alone.
+  """
+  print("\n" + "=" * 78)
+  print(
+      f"A3: confirmed-working config (1D, ref-based indices, W={window_size}) "
+      f"at REAL value_dim={real_value_dim} -- ONLY this one variable changed from A2's value_dim=128"
+  )
+  print("=" * 78)
+  x, indices = _make_test_data(value_dim=real_value_dim)
+  expected = jnp.take(x, indices, axis=0)
+  _describe_blocks(window_size, indices_2d=False, is_echo=False, value_dim=real_value_dim)
+  try:
+    out = gather_once(x, indices, window_size, indices_2d=False, materialize_index=False)
+    jax.block_until_ready(out)
+    correct = bool(jnp.array_equal(out, expected))
+    print(f"[A3] W={window_size}, value_dim={real_value_dim}, 1D ref: COMPILED, correct={correct}")
+    return correct
+  except Exception as e:  # noqa: BLE001
+    print(
+        f"[A3] W={window_size}, value_dim={real_value_dim}, 1D ref: "
+        f"FAILED -- full error below\n{_full_error(e)}"
+    )
+    return False
+
+
 if __name__ == "__main__":
   print("devices:", jax.devices())
   print("jax version:", jax.__version__)
@@ -381,3 +437,6 @@ if __name__ == "__main__":
       "output block correctly distinguished from the indices-shaped "
       "block) is real evidence of a shared cause.\n" + "=" * 78
   )
+
+  a3_ok = run_a3_real_width()
+  print(f"\n{'A3: compiled and correct at real value_dim' if a3_ok else 'A3: FAILED or incorrect -- see above'}")
