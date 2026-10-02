@@ -147,16 +147,18 @@ def sparsecore_gather_whole_row_w8_bf16(
     repack_every_call: bool = True,
 ) -> jax.Array:
   """Whole-row (no column chunking), `W=8`, SparseCore gather at REAL
-  bf16 -- the official guide's `gather_bf16_packed` pattern (pack PAIRS OF
-  ADJACENT ROWS into int32, since SparseCore DMA only natively moves
-  32-bit words; unpack inside the kernel body via `is_odd` selection on the
-  ORIGINAL row index), applied verbatim to the confirmed-working whole-
-  row/`W=8`/1D-ref index convention instead of the guide's own narrow
-  `value_dim=128` example. **This exact combination (bf16 packing x
-  whole-row x W=8) has not been tried before** -- bf16 adds an unpack step
-  and a temporary `gather_vmem` scratch buffer that the plain-int32
-  `sparsecore_gather_whole_row_w8` doesn't have, so whether this compiles
-  at all is being checked here, not assumed.
+  bf16 -- packs PAIRS OF ADJACENT ROWS into int32 (SparseCore DMA only
+  natively moves 32-bit words), applied to the confirmed-working whole-
+  row/`W=8`/1D-ref index convention. The official guide's own
+  `gather_bf16_packed` example unpacks via a direct `int32 -> bfloat16`
+  `.view()` inside the kernel -- that is CONFIRMED NOT IMPLEMENTED on
+  this SC backend ("Changing bitwidths not supported"), found and worked
+  around via the isolated `sparsecore_bf16_bitwise_unpack_probe.py`
+  (2026-10-02): unpack via bitwise `&`/`>>`/narrowing-`astype` to get two
+  `uint16` halves, then a SAME-WIDTH `uint16 -> bfloat16` `.view()`
+  (confirmed working), with the interleave-back-to-original-order and
+  even/odd-row selection moved OUTSIDE the kernel (stack/reshape are
+  restricted inside the SC kernel body too, per that same probe).
 
   `repack_every_call`: `True` (realistic -- `x` arrives as plain bf16
   every forward pass, the reshape/view packing cost is INSIDE this jitted
@@ -190,44 +192,64 @@ def sparsecore_gather_whole_row_w8_bf16(
     assert x.dtype == jnp.int32, f"repack_every_call=False expects already-packed int32, got {x.dtype}"
     x_packed = x
 
+  # Unpack strategy CONFIRMED on real hardware via the isolated
+  # sparsecore_bf16_bitwise_unpack_probe.py (2026-10-02): a WIDTH-CHANGING
+  # int32->bfloat16 `.view()` inside the kernel is not implemented on SC
+  # ("Changing bitwidths not supported"), but a SAME-WIDTH uint16->
+  # bfloat16 `.view()`, reached via ordinary bitwise extraction (`&`,
+  # `>>`, narrowing `.astype`), IS implemented. That probe also found
+  # `jnp.stack`/reshape INSIDE the kernel hits a separate SC limitation
+  # ("Reshape is not a no-op") -- so this kernel does ONLY shape-
+  # preserving, dtype-changing ops (astype/view) inside, and produces TWO
+  # separate same-shape outputs (low 16 bits, high 16 bits of each packed
+  # int32 word, each reinterpreted as bf16) instead of one combined
+  # array. The interleave-back-into-original-column-order (low/high ->
+  # original bf16 layout) and the even/odd-original-row selection both
+  # happen OUTSIDE the kernel in plain JAX, where stack/reshape have no
+  # SC restriction.
   @pl.kernel(
-      out_type=jax.ShapeDtypeStruct((num_indices, LATENT_SIZE), jnp.bfloat16),
+      out_type=(
+          jax.ShapeDtypeStruct((num_indices, LATENT_SIZE), jnp.bfloat16),
+          jax.ShapeDtypeStruct((num_indices, LATENT_SIZE), jnp.bfloat16),
+      ),
       mesh=vector_mesh,
       scratch_types=dict(gather_vmem=pltpu.VMEM((window_size, LATENT_SIZE), jnp.int32)),
   )
-  def kernel(x_packed_hbm, i_hbm, o_hbm, *, gather_vmem):
-    def body(idx_vmem, o_vmem):
-      # Doc's gather_bf16_packed pattern calls jax.lax.div(idx_vmem, ...)
-      # directly on the ref -- on this jax version that raises
-      # "Triggering __jax_array__() during abstractification is no longer
-      # supported" (a real, mundane API-version issue, not a hardware
-      # limit). Fixed per that error's own suggestion: materialize ONCE
-      # into an actual array, then use it consistently for both the
-      # arithmetic (div/mod) and the gather address itself -- window_size
-      # is 8 here, which happens to equal this hardware's num_lanes (8),
-      # so this materialized vector satisfies the "lane_count-sized
-      # offsets" constraint that broke the earlier W=128 materialize_index
-      # experiment in sparsecore_gather_window_size_diagnosis.py (128 !=
-      # 8) -- worth testing at this specific window size, not assumed.
+  def kernel(x_packed_hbm, i_hbm, o_low_hbm, o_high_hbm, *, gather_vmem):
+    def body(idx_vmem, o_low_vmem, o_high_vmem):
+      # jax.lax.div/mod directly on a ref raised "Triggering
+      # __jax_array__() ... no longer supported" -- materialize once,
+      # use consistently (window_size=8 == this hardware's num_lanes,
+      # which matters for other materialized-index paths, not this div).
       idx_val = idx_vmem[...]
       pltpu.sync_copy(x_packed_hbm.at[jax.lax.div(idx_val, packing)], gather_vmem)
-      # Same class of issue as idx_vmem above: gather_vmem is a ref too --
-      # .view() is an array method, not a ref method ('AbstractRef' object
-      # has no attribute 'view'). Materialize it first.
-      pairs = gather_vmem[...].view(jnp.bfloat16).reshape(-1, packing, LATENT_SIZE)
-      is_odd = (idx_val % packing)[:, None]
-      o_vmem[...] = jnp.where(is_odd == 1, pairs[:, 1], pairs[:, 0])
+      raw = gather_vmem[...].astype(jnp.uint32)  # materialize + same-width (32->32) reinterpret
+      low16 = (raw & 0xFFFF).astype(jnp.uint16)  # standard integer narrow, not a bitcast
+      high16 = (raw >> 16).astype(jnp.uint16)    # uint32 >> is a logical (zero-fill) shift
+      o_low_vmem[...] = low16.view(jnp.bfloat16)   # SAME-WIDTH (16->16) bitcast -- confirmed working
+      o_high_vmem[...] = high16.view(jnp.bfloat16)
 
     pltpu.emit_pipeline(
         body,
         grid=(num_indices // window_size,),
         in_specs=[pl.BlockSpec((window_size,), index_map=lambda i: (i,))],
-        out_specs=[pl.BlockSpec((window_size, LATENT_SIZE), index_map=lambda i: (i, 0))],
+        out_specs=[
+            pl.BlockSpec((window_size, LATENT_SIZE), index_map=lambda i: (i, 0)),
+            pl.BlockSpec((window_size, LATENT_SIZE), index_map=lambda i: (i, 0)),
+        ],
         core_axis_name='subcore',
         dimension_semantics=(pltpu.PARALLEL,),
-    )(i_hbm, o_hbm)
+    )(i_hbm, o_low_hbm, o_high_hbm)
 
-  gathered = kernel(x_packed, safe_idx)
+  low_out, high_out = kernel(x_packed, safe_idx)
+  # Interleave low/high back into the SAME column order `.view(bf16)`
+  # would have produced (position 2j=low[j], 2j+1=high[j]), then select
+  # the even- or odd-original-row half based on the real gathered index
+  # -- all plain JAX, outside the kernel, no SC restriction here.
+  unpacked_concat = jnp.stack([low_out, high_out], axis=-1).reshape(num_indices, 2 * LATENT_SIZE)
+  pairs = unpacked_concat.reshape(num_indices, packing, LATENT_SIZE)
+  is_odd = (safe_idx % packing)[:, None]
+  gathered = jnp.where(is_odd == 1, pairs[:, 1], pairs[:, 0])
   return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
 
 
