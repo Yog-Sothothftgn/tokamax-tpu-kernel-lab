@@ -81,37 +81,48 @@ def bitwise_unpack_probe() -> bool:
   print(f"test_values: {test_values}")
   print(f"packed (int32): {packed}")
 
+  # TWO separate outputs instead of one combined (num_pairs, 2) array --
+  # `jnp.stack(...)` inside the kernel body triggered a different SC
+  # limitation one step further ("Not implemented: Reshape is not a
+  # no-op", from a (8,)->(8,1) reshape the stack lowers to). Avoiding
+  # ANY reshape/stack inside the kernel entirely: each output is written
+  # with ONE trivial, same-shape, un-sliced store -- the interleaving
+  # back into original order happens OUTSIDE the kernel in plain JAX,
+  # where reshape/stack have no SC restriction.
   @pl.kernel(
-      out_type=jax.ShapeDtypeStruct((num_pairs, 2), jnp.bfloat16),
+      out_type=(
+          jax.ShapeDtypeStruct((num_pairs,), jnp.bfloat16),
+          jax.ShapeDtypeStruct((num_pairs,), jnp.bfloat16),
+      ),
       mesh=vector_mesh,
   )
-  def kernel(packed_hbm, o_hbm):
-    def body(packed_vmem, o_vmem):
+  def kernel(packed_hbm, o_low_hbm, o_high_hbm):
+    def body(packed_vmem, o_low_vmem, o_high_vmem):
       packed_val = packed_vmem[...].astype(jnp.uint32)  # same-width (32->32) reinterpret, not the restricted case
       low16 = (packed_val & 0xFFFF).astype(jnp.uint16)  # standard integer narrow, not a bitcast
       high16 = (packed_val >> 16).astype(jnp.uint16)    # uint32 >> is a logical (zero-fill) shift
-      low_bf16 = low16.view(jnp.bfloat16)   # SAME-WIDTH (16->16) bitcast -- the untested hypothesis
-      high_bf16 = high16.view(jnp.bfloat16)
-      # `o_vmem[:, 0] = ...` is a slice-THEN-integer-index store, which SC
-      # doesn't support ("Integer indexing of refs that follows a non-
-      # trivial slice is not supported on SC") -- this got past the
-      # bitcast itself (the error moved past it), just not past this
-      # particular store pattern. Build the full (num_pairs, 2) array
-      # first and do ONE trivial, un-sliced full-ref write instead.
-      o_vmem[...] = jnp.stack([low_bf16, high_bf16], axis=-1)
+      o_low_vmem[...] = low16.view(jnp.bfloat16)   # SAME-WIDTH (16->16) bitcast -- the untested hypothesis
+      o_high_vmem[...] = high16.view(jnp.bfloat16)
 
     pltpu.emit_pipeline(
         body,
         grid=(1,),  # single step -- no gather, no windowing, this is a pure unpack probe
         in_specs=[pl.BlockSpec((num_pairs,), index_map=lambda i: (0,))],
-        out_specs=[pl.BlockSpec((num_pairs, 2), index_map=lambda i: (0, 0))],
+        out_specs=[
+            pl.BlockSpec((num_pairs,), index_map=lambda i: (0,)),
+            pl.BlockSpec((num_pairs,), index_map=lambda i: (0,)),
+        ],
         core_axis_name='subcore',
         dimension_semantics=(pltpu.PARALLEL,),
-    )(packed_hbm, o_hbm)
+    )(packed_hbm, o_low_hbm, o_high_hbm)
 
-  out = jax.jit(kernel)(packed)
-  jax.block_until_ready(out)
-  unpacked = out.reshape(n)
+  low_out, high_out = jax.jit(kernel)(packed)
+  jax.block_until_ready((low_out, high_out))
+  print(f"low_out (bf16): {low_out}")
+  print(f"high_out (bf16): {high_out}")
+  # Interleave back to original order OUTSIDE the kernel (plain XLA, no
+  # SC restriction here): position 2i = low_out[i], position 2i+1 = high_out[i].
+  unpacked = jnp.stack([low_out, high_out], axis=-1).reshape(n)
   print(f"unpacked (bf16): {unpacked}")
 
   # Bit-for-bit comparison, not approximate -- all test values are
