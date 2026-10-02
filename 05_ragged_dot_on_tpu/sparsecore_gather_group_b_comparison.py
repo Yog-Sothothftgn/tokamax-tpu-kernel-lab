@@ -180,15 +180,20 @@ def sparsecore_gather_whole_row_w8_bf16(
 
   safe_idx = jnp.where(padded_token_idx < 0, 0, padded_token_idx).astype(jnp.int32)
 
+  # value_dim is DERIVED from x's own shape, not hardcoded to the real
+  # LATENT_SIZE=3584 -- lets this same function run both the real-width
+  # case and a reduced-width VMEM-capacity control (per explicit user
+  # request, 2026-10-02: keep W=8 and every other variable fixed, halve
+  # ONLY value_dim, to check whether the whole bf16 pipeline is correct
+  # when it comfortably fits VMEM, before deciding how to cover the real
+  # 3584 columns).
   if repack_every_call:
     num_tokens, value_dim = x.shape
-    assert value_dim == LATENT_SIZE, f"expected value_dim={LATENT_SIZE}, got {value_dim}"
     assert x.dtype == jnp.bfloat16, f"repack_every_call=True expects bfloat16, got {x.dtype}"
     assert num_tokens % packing == 0, "row-pairing needs an even token count"
     x_packed = x.reshape(num_tokens // packing, packing * value_dim).view(jnp.int32)
   else:
     _num_packed_rows, value_dim = x.shape
-    assert value_dim == LATENT_SIZE, f"expected value_dim={LATENT_SIZE}, got {value_dim}"
     assert x.dtype == jnp.int32, f"repack_every_call=False expects already-packed int32, got {x.dtype}"
     x_packed = x
 
@@ -209,11 +214,11 @@ def sparsecore_gather_whole_row_w8_bf16(
   # SC restriction.
   @pl.kernel(
       out_type=(
-          jax.ShapeDtypeStruct((num_indices, LATENT_SIZE), jnp.bfloat16),
-          jax.ShapeDtypeStruct((num_indices, LATENT_SIZE), jnp.bfloat16),
+          jax.ShapeDtypeStruct((num_indices, value_dim), jnp.bfloat16),
+          jax.ShapeDtypeStruct((num_indices, value_dim), jnp.bfloat16),
       ),
       mesh=vector_mesh,
-      scratch_types=dict(gather_vmem=pltpu.VMEM((window_size, LATENT_SIZE), jnp.int32)),
+      scratch_types=dict(gather_vmem=pltpu.VMEM((window_size, value_dim), jnp.int32)),
   )
   def kernel(x_packed_hbm, i_hbm, o_low_hbm, o_high_hbm, *, gather_vmem):
     def body(idx_vmem, o_low_vmem, o_high_vmem):
@@ -234,8 +239,8 @@ def sparsecore_gather_whole_row_w8_bf16(
         grid=(num_indices // window_size,),
         in_specs=[pl.BlockSpec((window_size,), index_map=lambda i: (i,))],
         out_specs=[
-            pl.BlockSpec((window_size, LATENT_SIZE), index_map=lambda i: (i, 0)),
-            pl.BlockSpec((window_size, LATENT_SIZE), index_map=lambda i: (i, 0)),
+            pl.BlockSpec((window_size, value_dim), index_map=lambda i: (i, 0)),
+            pl.BlockSpec((window_size, value_dim), index_map=lambda i: (i, 0)),
         ],
         core_axis_name='subcore',
         dimension_semantics=(pltpu.PARALLEL,),
@@ -246,8 +251,8 @@ def sparsecore_gather_whole_row_w8_bf16(
   # would have produced (position 2j=low[j], 2j+1=high[j]), then select
   # the even- or odd-original-row half based on the real gathered index
   # -- all plain JAX, outside the kernel, no SC restriction here.
-  unpacked_concat = jnp.stack([low_out, high_out], axis=-1).reshape(num_indices, 2 * LATENT_SIZE)
-  pairs = unpacked_concat.reshape(num_indices, packing, LATENT_SIZE)
+  unpacked_concat = jnp.stack([low_out, high_out], axis=-1).reshape(num_indices, 2 * value_dim)
+  pairs = unpacked_concat.reshape(num_indices, packing, value_dim)
   is_odd = (safe_idx % packing)[:, None]
   gathered = jnp.where(is_odd == 1, pairs[:, 1], pairs[:, 0])
   return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
@@ -411,15 +416,6 @@ def run_bf16_comparison(num_rounds: int = 10, num_repeats: int = 20, seed: int =
 
   x_packed = x_bf16.reshape(NUM_TOKENS // 2, 2 * LATENT_SIZE).view(jnp.int32)
 
-  impls = {
-      "xla_bf16": xla_gather,
-      "sparsecore_prepacked": functools.partial(
-          sparsecore_gather_whole_row_w8_bf16, window_size=8, repack_every_call=False
-      ),
-      "sparsecore_repack_live": functools.partial(
-          sparsecore_gather_whole_row_w8_bf16, window_size=8, repack_every_call=True
-      ),
-  }
   # Each implementation needs DIFFERENT x -- xla_bf16/repack_live take
   # plain x_bf16, prepacked takes x_packed. _run_comparison's `args` are
   # shared across implementations, so here each callable closes over the
@@ -450,6 +446,73 @@ def run_bf16_comparison(num_rounds: int = 10, num_repeats: int = 20, seed: int =
     )
 
 
+def run_bf16_half_width_capacity_check(seed: int = 0) -> bool:
+  """VMEM-capacity control (2026-10-02), per explicit user request, NOT a
+  production fix: the real-width (`value_dim=LATENT_SIZE=3584`) bf16
+  whole-row `W=8` gather failed to compile with
+  `CompileTimeSparseCoreAllocationFailure` (needs ~86143 words vs a
+  65536-word budget -- the extra `gather_vmem` scratch plus TWO
+  double-buffered bf16 outputs roughly triple the per-step VMEM
+  footprint compared to the int32 version, which only just fit at this
+  window size). This control keeps EVERY other variable fixed --
+  `window_size=8`, the real production `padded_token_idx`/`valid_mask`,
+  the exact same bitwise-unpack/two-output/external-reassembly kernel --
+  and changes ONLY `value_dim`: 3584 -> 1792 (half), where the estimated
+  footprint (~43000 words) comfortably fits. If this compiles and is
+  bit-exact correct, it confirms the bf16 PIPELINE LOGIC itself is
+  right and the real blocker is purely this implementation's VMEM
+  budget at the real width -- the next decision (chunk the real 3584
+  columns, or shrink buffers some other way) can then be made knowing
+  that, rather than conflated with "does the bf16 approach even work".
+  """
+  print(f"devices: {jax.devices()}")
+  print(f"jax version: {jax.__version__}")
+
+  _x_bf16_real, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
+      num_tokens=NUM_TOKENS, local_num_experts=LOCAL_NUM_EXPERTS, seed=seed
+  )
+  num_indices = int(padded_token_idx.shape[0])
+  half_value_dim = LATENT_SIZE // 2  # 1792
+  print(
+      f"[setup] num_tokens={NUM_TOKENS} local_num_experts={LOCAL_NUM_EXPERTS} "
+      f"num_indices(m_padded)={num_indices} value_dim={half_value_dim} "
+      f"(HALF of real {LATENT_SIZE}, capacity control only) num_valid={int(jnp.sum(valid_mask))}"
+  )
+
+  # Synthetic bf16 table at HALF width -- indices/mask are the real,
+  # unchanged production ones; only the data table's column count differs.
+  key = jax.random.key(seed)
+  x_half = (jax.random.normal(key, (NUM_TOKENS, half_value_dim)) * 0.02).astype(jnp.bfloat16)
+
+  def xla_fn():
+    return xla_gather(x_half, padded_token_idx, valid_mask)
+
+  def sc_fn():
+    return sparsecore_gather_whole_row_w8_bf16(
+        x_half, padded_token_idx, valid_mask, window_size=8, repack_every_call=True
+    )
+
+  try:
+    expected = jax.jit(xla_fn)()
+    jax.block_until_ready(expected)
+    out = jax.jit(sc_fn)()
+    jax.block_until_ready(out)
+  except Exception as e:  # noqa: BLE001 -- surfacing the real error is the point
+    import traceback
+    print(
+        "\n[half-width capacity check] FAILED to compile/run -- full error below:\n"
+        + "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    )
+    return False
+
+  ok = bool(jnp.array_equal(out, expected))
+  print(
+      f"[half-width capacity check] value_dim={half_value_dim}, W=8: "
+      f"COMPILED, correct={ok} (expect exact match -- pure data movement)"
+  )
+  return ok
+
+
 if __name__ == "__main__":
   from jax.experimental.pallas import tpu as pltpu
   sc_info = pltpu.get_tpu_info().sparse_core
@@ -460,3 +523,5 @@ if __name__ == "__main__":
   run_group_b()
   print("\n" + "=" * 78 + "\nMoving to the real bf16 round\n" + "=" * 78)
   run_bf16_comparison()
+  print("\n" + "=" * 78 + "\nVMEM-capacity control: same pipeline, half value_dim\n" + "=" * 78)
+  run_bf16_half_width_capacity_check()
