@@ -92,8 +92,13 @@ def bitwise_unpack_probe() -> bool:
       high16 = (packed_val >> 16).astype(jnp.uint16)    # uint32 >> is a logical (zero-fill) shift
       low_bf16 = low16.view(jnp.bfloat16)   # SAME-WIDTH (16->16) bitcast -- the untested hypothesis
       high_bf16 = high16.view(jnp.bfloat16)
-      o_vmem[:, 0] = low_bf16
-      o_vmem[:, 1] = high_bf16
+      # `o_vmem[:, 0] = ...` is a slice-THEN-integer-index store, which SC
+      # doesn't support ("Integer indexing of refs that follows a non-
+      # trivial slice is not supported on SC") -- this got past the
+      # bitcast itself (the error moved past it), just not past this
+      # particular store pattern. Build the full (num_pairs, 2) array
+      # first and do ONE trivial, un-sliced full-ref write instead.
+      o_vmem[...] = jnp.stack([low_bf16, high_bf16], axis=-1)
 
     pltpu.emit_pipeline(
         body,
