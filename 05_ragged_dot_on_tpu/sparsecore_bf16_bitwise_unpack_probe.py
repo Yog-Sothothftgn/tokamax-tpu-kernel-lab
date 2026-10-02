@@ -72,7 +72,12 @@ def bitwise_unpack_probe() -> bool:
   num_pairs = n // 2
 
   # Pack OUTSIDE the kernel (plain XLA op, not the thing being tested).
-  packed = test_values.reshape(num_pairs, 2).view(jnp.int32)
+  # NOTE: .view(int32) on a (num_pairs, 2) bf16 array gives (num_pairs, 1)
+  # int32 (view halves the LAST dim, not drops it) -- reshape to 1D to
+  # match the kernel's 1D BlockSpec below. (First run hit a plain shape-
+  # rank mismatch here, "safe_zip() argument 1 has length 2 but argument
+  # 0 has length 1" -- a bug in this script, not a new Mosaic limitation.)
+  packed = test_values.reshape(num_pairs, 2).view(jnp.int32).reshape(num_pairs)
   print(f"test_values: {test_values}")
   print(f"packed (int32): {packed}")
 
