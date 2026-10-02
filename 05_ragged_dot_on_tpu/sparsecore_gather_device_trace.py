@@ -86,6 +86,26 @@ def sc_bf16_two_chunk(x, idx, mask):
   return sparsecore_gather_two_chunk_w8_bf16(x, idx, mask, window_size=8, repack_every_call=True)
 
 
+def capture_trace_runs(runs, padded_token_idx, valid_mask, trace_dir=TRACE_DIR, num_repeats=NUM_REPEATS) -> None:
+  """Generic capture: `runs` maps a distinct name -> (jitted fn, x). Each
+  fn is called as `fn(x, padded_token_idx, valid_mask)` with explicit
+  arguments (not closure-captured constants -- same fix as
+  run_two_chunk_bf16_timing) so every traced call genuinely re-runs any
+  packing. Names must be distinct AND be the jit function's `__name__`
+  (the XLA module is named `jit_<name>(...)`), since device events are
+  attributed by module span, not by host annotation windows."""
+  for name, (fn, x) in runs.items():
+    jax.block_until_ready(fn(x, padded_token_idx, valid_mask))
+  print(f"Writing device trace to {trace_dir} ...")
+  with jax.profiler.trace(trace_dir):
+    for name, (fn, x) in runs.items():
+      with jax.profiler.TraceAnnotation(f"{name}_repeats"):
+        for _ in range(num_repeats):
+          out = fn(x, padded_token_idx, valid_mask)
+        jax.block_until_ready(out)
+  print(f"Trace written to {trace_dir}.")
+
+
 def capture_trace(seed: int = 0) -> None:
   print(f"devices: {jax.devices()}")
   print(f"jax version: {jax.__version__}")
@@ -107,27 +127,13 @@ def capture_trace(seed: int = 0) -> None:
       "sc_int32_wholerow": (jax.jit(sc_int32_wholerow), x_int32),
       "sc_bf16_two_chunk": (jax.jit(sc_bf16_two_chunk), x_bf16),
   }
-
-  # Warm up (compile) everything BEFORE tracing, with explicit arguments
-  # (not closure-captured constants -- same fix as run_two_chunk_bf16_timing)
-  # so every traced call genuinely re-runs the repack.
-  for name, (fn, x) in runs.items():
-    jax.block_until_ready(fn(x, padded_token_idx, valid_mask))
-
-  print(f"Writing device trace to {TRACE_DIR} ...")
-  with jax.profiler.trace(TRACE_DIR):
-    for name, (fn, x) in runs.items():
-      with jax.profiler.TraceAnnotation(f"{name}_repeats"):
-        for _ in range(NUM_REPEATS):
-          out = fn(x, padded_token_idx, valid_mask)
-        jax.block_until_ready(out)
-  print(f"Trace written to {TRACE_DIR}.")
+  capture_trace_runs(runs, padded_token_idx, valid_mask)
 
 
-def _find_trace_json() -> str:
-  matches = glob.glob(f"{TRACE_DIR}/plugins/profile/*/*.trace.json.gz")
+def _find_trace_json(trace_dir: str = TRACE_DIR) -> str:
+  matches = glob.glob(f"{trace_dir}/plugins/profile/*/*.trace.json.gz")
   if not matches:
-    raise FileNotFoundError(f"no trace.json.gz found under {TRACE_DIR} -- run capture_trace() first")
+    raise FileNotFoundError(f"no trace.json.gz found under {trace_dir} -- run capture first")
   return sorted(matches)[-1]
 
 
@@ -136,8 +142,8 @@ def _mean(vals):
   return sum(vals) / len(vals) if vals else float("nan")
 
 
-def analyze_trace() -> None:
-  path = _find_trace_json()
+def analyze_trace(module_names=MODULE_NAMES, trace_dir: str = TRACE_DIR) -> None:
+  path = _find_trace_json(trace_dir)
   print(f"Analyzing {path}")
   with gzip.open(path, "rt") as f:
     data = json.load(f)
@@ -172,7 +178,7 @@ def analyze_trace() -> None:
   def inside(evs, lo, hi):
     return [e for e in evs if lo <= e["ts"] <= hi]
 
-  for mod in MODULE_NAMES:
+  for mod in module_names:
     instances = []
     for tk in tc_module_tracks:
       for e in by_track[tk]:
@@ -217,6 +223,7 @@ def analyze_trace() -> None:
     kernel_durs = []
     kernels_per_call = []
     run_events_per_sc_kernel = []   # ep_run_kernel total across ALL 16 TECs of ONE SparseCore, ONE kernel
+    run_events_per_call = []        # ep_run_kernel total across BOTH SparseCores and every kernel of ONE call
     steps_per_tec = []
     busy_fracs, run_durs = [], []
     wait_in_per_tec, wait_out_per_tec = [], []
@@ -225,6 +232,7 @@ def analyze_trace() -> None:
     for inst in instances:
       lo, hi = inst["ts"] - 20, inst["ts"] + inst["dur"] + 20
       n_kernels_this_call = 0
+      call_run_total = 0
       for ok in offload_tracks:
         pid = ok[0]
         for k in by_track[ok]:
@@ -258,7 +266,9 @@ def analyze_trace() -> None:
             finish_offsets_med.append(finishes[len(finishes) // 2])
             finish_offsets_max.append(finishes[-1])
             run_events_per_sc_kernel.append(sc_run_total)
+            call_run_total += sc_run_total
       kernels_per_call.append(n_kernels_this_call)
+      run_events_per_call.append(call_run_total)
 
     if not kernel_durs:
       print("(no SparseCore offload kernels inside this module -- pure TensorCore path)")
@@ -268,6 +278,9 @@ def analyze_trace() -> None:
           f"per sc kernel), mean kernel duration={_mean(kernel_durs):.1f}us")
     print(f"grid-step bodies (`ep_run_kernel`): per TEC per kernel={_mean(steps_per_tec):.1f}, "
           f"TOTAL across one SparseCore's TECs per kernel={_mean(run_events_per_sc_kernel):.1f}")
+    print(f"ep_run_kernel TOTAL per call across BOTH SparseCores and all kernels={_mean(run_events_per_call):.1f} "
+          f"(= grid steps actually executed; equals the grid size x number of kernels if the work is split, "
+          f"2x that if both SparseCores each run everything)")
     print("  -> compare that total with the kernel's grid size (num_indices // window_size = 592): "
           "~592 means this SparseCore alone runs the whole grid (so both SparseCores together do it TWICE); "
           "~296 would mean the grid is split across both SparseCores.")
