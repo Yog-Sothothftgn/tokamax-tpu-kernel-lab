@@ -145,6 +145,7 @@ def sparsecore_gather_whole_row_w8_bf16(
     valid_mask: jax.Array,
     window_size: int = 8,
     repack_every_call: bool = True,
+    core_split: bool = False,
 ) -> jax.Array:
   """Whole-row (no column chunking), `W=8`, SparseCore gather at REAL
   bf16 -- packs PAIRS OF ADJACENT ROWS into int32 (SparseCore DMA only
@@ -180,6 +181,21 @@ def sparsecore_gather_whole_row_w8_bf16(
 
   safe_idx = jnp.where(padded_token_idx < 0, 0, padded_token_idx).astype(jnp.int32)
 
+  # Optional cross-SparseCore split (see sparsecore_gather_core_split.py):
+  # core_axis_name=('core','subcore') partitions ONE flat grid over both
+  # SparseCores x 16 subcores instead of each SparseCore running the whole
+  # grid. The grid must be divisible by the 32 workers, so the index array
+  # is padded with zeros (valid in-bounds gathers) to a multiple of
+  # window*cores*subcores and the kernel outputs are sliced back below.
+  if core_split:
+    quantum = window_size * sc_info.num_cores * sc_info.num_subcores
+    pad = (-num_indices) % quantum
+  else:
+    pad = 0
+  kernel_n = num_indices + pad
+  safe_idx_k = jnp.pad(safe_idx, (0, pad)) if pad else safe_idx
+  core_axes = ('core', 'subcore') if core_split else 'subcore'
+
   # value_dim is DERIVED from x's own shape, not hardcoded to the real
   # LATENT_SIZE=3584 -- lets this same function run both the real-width
   # case and a reduced-width VMEM-capacity control (per explicit user
@@ -214,8 +230,8 @@ def sparsecore_gather_whole_row_w8_bf16(
   # SC restriction.
   @pl.kernel(
       out_type=(
-          jax.ShapeDtypeStruct((num_indices, value_dim), jnp.bfloat16),
-          jax.ShapeDtypeStruct((num_indices, value_dim), jnp.bfloat16),
+          jax.ShapeDtypeStruct((kernel_n, value_dim), jnp.bfloat16),
+          jax.ShapeDtypeStruct((kernel_n, value_dim), jnp.bfloat16),
       ),
       mesh=vector_mesh,
       scratch_types=dict(gather_vmem=pltpu.VMEM((window_size, value_dim), jnp.int32)),
@@ -236,17 +252,19 @@ def sparsecore_gather_whole_row_w8_bf16(
 
     pltpu.emit_pipeline(
         body,
-        grid=(num_indices // window_size,),
+        grid=(kernel_n // window_size,),
         in_specs=[pl.BlockSpec((window_size,), index_map=lambda i: (i,))],
         out_specs=[
             pl.BlockSpec((window_size, value_dim), index_map=lambda i: (i, 0)),
             pl.BlockSpec((window_size, value_dim), index_map=lambda i: (i, 0)),
         ],
-        core_axis_name='subcore',
+        core_axis_name=core_axes,
         dimension_semantics=(pltpu.PARALLEL,),
     )(i_hbm, o_low_hbm, o_high_hbm)
 
-  low_out, high_out = kernel(x_packed, safe_idx)
+  low_out, high_out = kernel(x_packed, safe_idx_k)
+  if pad:
+    low_out, high_out = low_out[:num_indices], high_out[:num_indices]
   # Interleave low/high back into the SAME column order `.view(bf16)`
   # would have produced (position 2j=low[j], 2j+1=high[j]), then select
   # the even- or odd-original-row half based on the real gathered index
@@ -264,6 +282,7 @@ def sparsecore_gather_two_chunk_w8_bf16(
     valid_mask: jax.Array,
     window_size: int = 8,
     repack_every_call: bool = True,
+    core_split: bool = False,
 ) -> jax.Array:
   """Covers the REAL `LATENT_SIZE=3584` by calling the CONFIRMED-CORRECT
   half-width (1792) `sparsecore_gather_whole_row_w8_bf16` kernel TWICE,
@@ -287,10 +306,12 @@ def sparsecore_gather_two_chunk_w8_bf16(
   assert value_dim % 2 == 0, f"value_dim={value_dim} must be evenly splittable into 2 chunks"
   half = value_dim // 2
   chunk0 = sparsecore_gather_whole_row_w8_bf16(
-      x[:, :half], padded_token_idx, valid_mask, window_size=window_size, repack_every_call=repack_every_call
+      x[:, :half], padded_token_idx, valid_mask, window_size=window_size, repack_every_call=repack_every_call,
+      core_split=core_split,
   )
   chunk1 = sparsecore_gather_whole_row_w8_bf16(
-      x[:, half:], padded_token_idx, valid_mask, window_size=window_size, repack_every_call=repack_every_call
+      x[:, half:], padded_token_idx, valid_mask, window_size=window_size, repack_every_call=repack_every_call,
+      core_split=core_split,
   )
   return jnp.concatenate([chunk0, chunk1], axis=-1)
 
