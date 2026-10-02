@@ -1,6 +1,8 @@
-"""Group B, scaled down per explicit user request (2026-10-01): compares
-exactly THREE gather implementations at real production scale, answering
-one question each:
+"""Group B, scaled down per explicit user request (2026-10-01), TWO rounds
+in this file:
+
+**Round 1, `run_group_b` (int32)**: compares exactly THREE gather
+implementations at real production scale, answering one question each:
 
   implementation                                    question
   -------------------------------------------------  ----------------------------------
@@ -11,16 +13,30 @@ one question each:
 `W=16` deliberately excluded -- only `W=8` has been confirmed correct at
 the real `LATENT_SIZE=3584` (via `sparsecore_gather_window_size_diagnosis.
 py`'s `run_a3_real_width`); `W=16` has not been validated at this width.
-
-Scope: INT32 ONLY, per the user's own established "int32 first, bf16
-last, don't mix variables" methodology -- `x` is a real-shaped but
-synthetic int32 stand-in (same non-degeneracy fix as
+Scope: INT32 ONLY, per the user's own established "int32 first, bf16 last,
+don't mix variables" methodology -- `x` is a real-shaped but synthetic
+int32 stand-in (same non-degeneracy fix as
 `sparsecore_gather_prototype.py`'s `check_chunked`: `jnp.arange`-based
 distinct values, NOT `x.astype(int32)` on small-scale bf16 values, which
-truncates almost everything to 0). Real bf16 packing is a SEPARATE, later
-step, only once one of these three implementations is confirmed worth it.
+truncates almost everything to 0).
 
-Methodology (matching this project's established discipline):
+**Round 2, `run_bf16_comparison` (REAL bf16)**, added once round 1 showed
+whole-row-W8 was the best int32 candidate (still ~11x/~5x slower than
+XLA, but ~2.3x faster than the 128-chunk version) -- per explicit user
+request, keeps the SAME indices/W=8/whole-row shape, now at real bf16:
+
+  1. XLA bf16 gather (real production dtype baseline)
+  2. SparseCore, x ALREADY packed into int32 pairs-of-rows (packing cost
+     excluded from the timed call -- best case)
+  3. SparseCore, plain bf16 x, packed ON THE FLY inside the timed call
+     (the realistic case for a live forward pass)
+
+This exact combination (bf16 packing x whole-row x W=8) had not been
+tried before -- bf16 adds an unpack step and a temporary `gather_vmem`
+scratch buffer the int32 round never needed, so whether it even compiles
+is checked here (full error captured if not), not assumed.
+
+Methodology (matching this project's established discipline, both rounds):
   - Correctness checked FIRST, exact match required (pure data movement,
     no rounding-noise tolerance) -- timing is not measured for an
     implementation that fails correctness.
@@ -123,6 +139,84 @@ def sparsecore_gather_whole_row_w8(
   return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
 
 
+def sparsecore_gather_whole_row_w8_bf16(
+    x: jax.Array,
+    padded_token_idx: jax.Array,
+    valid_mask: jax.Array,
+    window_size: int = 8,
+    repack_every_call: bool = True,
+) -> jax.Array:
+  """Whole-row (no column chunking), `W=8`, SparseCore gather at REAL
+  bf16 -- the official guide's `gather_bf16_packed` pattern (pack PAIRS OF
+  ADJACENT ROWS into int32, since SparseCore DMA only natively moves
+  32-bit words; unpack inside the kernel body via `is_odd` selection on the
+  ORIGINAL row index), applied verbatim to the confirmed-working whole-
+  row/`W=8`/1D-ref index convention instead of the guide's own narrow
+  `value_dim=128` example. **This exact combination (bf16 packing x
+  whole-row x W=8) has not been tried before** -- bf16 adds an unpack step
+  and a temporary `gather_vmem` scratch buffer that the plain-int32
+  `sparsecore_gather_whole_row_w8` doesn't have, so whether this compiles
+  at all is being checked here, not assumed.
+
+  `repack_every_call`: `True` (realistic -- `x` arrives as plain bf16
+  every forward pass, the reshape/view packing cost is INSIDE this jitted
+  function) vs `False` (best case -- caller already has `x` in packed
+  int32 layout, shape `(num_tokens // 2, LATENT_SIZE)`, packing cost
+  excluded from this call).
+  """
+  from jax.experimental import pallas as pl
+  from jax.experimental.pallas import tpu as pltpu
+  from jax.experimental.pallas import tpu_sc as plsc
+
+  packing = 2  # 32 // 16, bf16 -> int32
+  num_indices = padded_token_idx.shape[0]
+  assert num_indices % window_size == 0
+
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "No SparseCore on this TPU -- cannot run this comparison"
+  vector_mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+
+  safe_idx = jnp.where(padded_token_idx < 0, 0, padded_token_idx).astype(jnp.int32)
+
+  if repack_every_call:
+    num_tokens, value_dim = x.shape
+    assert value_dim == LATENT_SIZE, f"expected value_dim={LATENT_SIZE}, got {value_dim}"
+    assert x.dtype == jnp.bfloat16, f"repack_every_call=True expects bfloat16, got {x.dtype}"
+    assert num_tokens % packing == 0, "row-pairing needs an even token count"
+    x_packed = x.reshape(num_tokens // packing, packing * value_dim).view(jnp.int32)
+  else:
+    _num_packed_rows, value_dim = x.shape
+    assert value_dim == LATENT_SIZE, f"expected value_dim={LATENT_SIZE}, got {value_dim}"
+    assert x.dtype == jnp.int32, f"repack_every_call=False expects already-packed int32, got {x.dtype}"
+    x_packed = x
+
+  @pl.kernel(
+      out_type=jax.ShapeDtypeStruct((num_indices, LATENT_SIZE), jnp.bfloat16),
+      mesh=vector_mesh,
+      scratch_types=dict(gather_vmem=pltpu.VMEM((window_size, LATENT_SIZE), jnp.int32)),
+  )
+  def kernel(x_packed_hbm, i_hbm, o_hbm, *, gather_vmem):
+    def body(idx_vmem, o_vmem):
+      # Doc's gather_bf16_packed pattern, verbatim: halved-index gather,
+      # then select even/odd original row from the unpacked pair.
+      pltpu.sync_copy(x_packed_hbm.at[jax.lax.div(idx_vmem, packing)], gather_vmem)
+      pairs = gather_vmem.view(jnp.bfloat16).reshape(-1, packing, LATENT_SIZE)
+      is_odd = (idx_vmem % packing)[:, None]
+      o_vmem[...] = jnp.where(is_odd == 1, pairs[:, 1], pairs[:, 0])
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(num_indices // window_size,),
+        in_specs=[pl.BlockSpec((window_size,), index_map=lambda i: (i,))],
+        out_specs=[pl.BlockSpec((window_size, LATENT_SIZE), index_map=lambda i: (i, 0))],
+        core_axis_name='subcore',
+        dimension_semantics=(pltpu.PARALLEL,),
+    )(i_hbm, o_hbm)
+
+  gathered = kernel(x_packed, safe_idx)
+  return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
+
+
 def _time_pipelined(f, *args, num_repeats: int = 20) -> float:
   f_jit = jax.jit(f)
   out = f_jit(*args)
@@ -152,12 +246,83 @@ def _median_spread(vals: list[float]) -> dict:
   return {"median": median, "min": s[0], "max": s[-1]}
 
 
+def _run_comparison(
+    impls: dict,
+    args: tuple,
+    label: str,
+    num_rounds: int = 10,
+    num_repeats: int = 20,
+) -> bool:
+  """Shared methodology for both the int32 Group B round and the bf16
+  round below: correctness FIRST (exact match against the first
+  implementation's own output, which callers should order so it's the
+  trusted baseline), then `num_rounds` rounds x `num_repeats` calls each,
+  rotating the comparison order every round, both timing conventions kept
+  separate, reporting median and min/max spread. Returns whether all
+  implementations passed correctness (timing is skipped entirely if not).
+  """
+  names = list(impls.keys())
+  reference_name = names[0]
+
+  jitted = {name: jax.jit(fn) for name, fn in impls.items()}
+  outputs = {}
+  for name, f in jitted.items():
+    out = f(*args)
+    jax.block_until_ready(out)
+    outputs[name] = out
+
+  expected = outputs[reference_name]
+  all_ok = True
+  for name in names:
+    ok = bool(jnp.array_equal(outputs[name], expected))
+    print(f"[correctness, {label}] {name}: {'OK' if ok else 'FAIL'} (vs {reference_name})")
+    all_ok = all_ok and ok
+  if not all_ok:
+    print(f"\n[{label}] correctness FAILED for at least one implementation -- stopping before timing.")
+    return False
+
+  pipe_times = {n: [] for n in names}
+  block_times = {n: [] for n in names}
+  for round_idx in range(num_rounds):
+    rot = round_idx % len(names)
+    order = names[rot:] + names[:rot]
+    for name in order:
+      f = jitted[name]
+      pipe_times[name].append(_time_pipelined(f, *args, num_repeats=num_repeats))
+      block_times[name].append(_time_blocking(f, *args, num_repeats=num_repeats))
+    print(f"[round {round_idx}, {label}] order={order}")
+
+  print(f"\n[{label} results -- real scale, {num_rounds} rounds x {num_repeats} calls each]")
+  for name in names:
+    p = _median_spread(pipe_times[name])
+    b = _median_spread(block_times[name])
+    print(
+        f"  {name:32s} pipelined: median={p['median']:.4f}ms (min={p['min']:.4f} max={p['max']:.4f})  "
+        f"per-call: median={b['median']:.4f}ms (min={b['min']:.4f} max={b['max']:.4f})"
+    )
+
+  ref_pipe_median = _median_spread(pipe_times[reference_name])["median"]
+  ref_block_median = _median_spread(block_times[reference_name])["median"]
+  print(f"\n[{label}: speedup vs {reference_name} (median), pipelined / per-call]")
+  for name in names:
+    if name == reference_name:
+      continue
+    p_med = _median_spread(pipe_times[name])["median"]
+    b_med = _median_spread(block_times[name])["median"]
+    print(
+        f"  {name:32s} pipelined_speedup={ref_pipe_median / p_med:.3f}x  "
+        f"per_call_speedup={ref_block_median / b_med:.3f}x"
+    )
+  return True
+
+
 def run_group_b(num_rounds: int = 10, num_repeats: int = 20, seed: int = 0) -> None:
+  """INT32-only round (unchanged from the original Group B run)."""
   print(f"devices: {jax.devices()}")
   print(f"jax version: {jax.__version__}")
   print(f"seed: {seed}")
 
-  x_bf16, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
+  _x_bf16, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
       num_tokens=NUM_TOKENS, local_num_experts=LOCAL_NUM_EXPERTS, seed=seed
   )
   num_indices = int(padded_token_idx.shape[0])
@@ -182,60 +347,70 @@ def run_group_b(num_rounds: int = 10, num_repeats: int = 20, seed: int = 0) -> N
       ),
       "sparsecore_wholerow_w8": functools.partial(sparsecore_gather_whole_row_w8, window_size=8),
   }
-  names = list(impls.keys())
+  _run_comparison(impls, (x_int32, padded_token_idx, valid_mask), label="int32", num_rounds=num_rounds, num_repeats=num_repeats)
 
-  # Correctness FIRST, for all three, before any timing.
-  expected = xla_gather(x_int32, padded_token_idx, valid_mask)
-  jitted = {}
-  all_ok = True
-  for name, fn in impls.items():
-    f = jax.jit(fn)
-    out = f(x_int32, padded_token_idx, valid_mask)
-    jax.block_until_ready(out)
-    ok = bool(jnp.array_equal(out, expected))
-    print(f"[correctness] {name}: {'OK' if ok else 'FAIL'}")
-    all_ok = all_ok and ok
-    jitted[name] = f
-  if not all_ok:
-    print("\nCorrectness FAILED for at least one implementation -- stopping before any timing.")
-    return
 
-  pipe_times = {n: [] for n in names}
-  block_times = {n: [] for n in names}
+def run_bf16_comparison(num_rounds: int = 10, num_repeats: int = 20, seed: int = 0) -> None:
+  """REAL bf16 round, per explicit user request: same real indices, same
+  W=8/whole-row candidate, now three implementations: (1) plain XLA bf16
+  gather, (2) SparseCore with x ALREADY packed into int32 (packing cost
+  excluded), (3) SparseCore with plain bf16 x, packed on the fly inside
+  the timed call (the realistic case). Correctness must be exact (pure
+  data movement -- no rounding-noise tolerance), checked before any
+  timing, same as every other check in this file.
+  """
+  print(f"devices: {jax.devices()}")
+  print(f"jax version: {jax.__version__}")
+  print(f"seed: {seed}")
 
-  for round_idx in range(num_rounds):
-    rot = round_idx % len(names)
-    order = names[rot:] + names[:rot]  # rotate the comparison order every round
-    for name in order:
-      f = jitted[name]
-      pipe_times[name].append(
-          _time_pipelined(f, x_int32, padded_token_idx, valid_mask, num_repeats=num_repeats)
-      )
-      block_times[name].append(
-          _time_blocking(f, x_int32, padded_token_idx, valid_mask, num_repeats=num_repeats)
-      )
-    print(f"[round {round_idx}] order={order}")
+  x_bf16, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
+      num_tokens=NUM_TOKENS, local_num_experts=LOCAL_NUM_EXPERTS, seed=seed
+  )
+  num_indices = int(padded_token_idx.shape[0])
+  print(
+      f"[setup] num_tokens={NUM_TOKENS} local_num_experts={LOCAL_NUM_EXPERTS} "
+      f"num_indices(m_padded)={num_indices} value_dim={LATENT_SIZE} "
+      f"num_valid={int(jnp.sum(valid_mask))}"
+  )
 
-  print(f"\n[Group B results -- int32, real scale, {num_rounds} rounds x {num_repeats} calls each]")
-  for name in names:
-    p = _median_spread(pipe_times[name])
-    b = _median_spread(block_times[name])
-    print(
-        f"  {name:28s} pipelined: median={p['median']:.4f}ms (min={p['min']:.4f} max={p['max']:.4f})  "
-        f"per-call: median={b['median']:.4f}ms (min={b['min']:.4f} max={b['max']:.4f})"
+  x_packed = x_bf16.reshape(NUM_TOKENS // 2, 2 * LATENT_SIZE).view(jnp.int32)
+
+  impls = {
+      "xla_bf16": xla_gather,
+      "sparsecore_prepacked": functools.partial(
+          sparsecore_gather_whole_row_w8_bf16, window_size=8, repack_every_call=False
+      ),
+      "sparsecore_repack_live": functools.partial(
+          sparsecore_gather_whole_row_w8_bf16, window_size=8, repack_every_call=True
+      ),
+  }
+  # Each implementation needs DIFFERENT x -- xla_bf16/repack_live take
+  # plain x_bf16, prepacked takes x_packed. _run_comparison's `args` are
+  # shared across implementations, so here each callable closes over the
+  # right data and takes none, rather than threading a placeholder arg
+  # through the shared helper.
+  wrapped = {
+      "xla_bf16": lambda: xla_gather(x_bf16, padded_token_idx, valid_mask),
+      "sparsecore_prepacked": lambda: sparsecore_gather_whole_row_w8_bf16(
+          x_packed, padded_token_idx, valid_mask, window_size=8, repack_every_call=False
+      ),
+      "sparsecore_repack_live": lambda: sparsecore_gather_whole_row_w8_bf16(
+          x_bf16, padded_token_idx, valid_mask, window_size=8, repack_every_call=True
+      ),
+  }
+  try:
+    _run_comparison(
+        wrapped, (), label="bf16",
+        num_rounds=num_rounds, num_repeats=num_repeats,
     )
-
-  xla_pipe_median = _median_spread(pipe_times["xla"])["median"]
-  xla_block_median = _median_spread(block_times["xla"])["median"]
-  print("\n[speedup vs xla (median), pipelined / per-call]")
-  for name in names:
-    if name == "xla":
-      continue
-    p_med = _median_spread(pipe_times[name])["median"]
-    b_med = _median_spread(block_times[name])["median"]
+  except Exception as e:  # noqa: BLE001 -- surfacing the real compile error is the point
+    import traceback
     print(
-        f"  {name:28s} pipelined_speedup={xla_pipe_median / p_med:.3f}x  "
-        f"per_call_speedup={xla_block_median / b_med:.3f}x"
+        "\n[bf16] at least one implementation FAILED to compile/run -- "
+        "full error below (bf16 packing adds an unpack step and a "
+        "temporary scratch buffer this exact combination hadn't been "
+        "tried with before):\n"
+        + "".join(traceback.format_exception(type(e), e, e.__traceback__))
     )
 
 
@@ -247,3 +422,5 @@ if __name__ == "__main__":
     raise SystemExit(1)
   print(f"sparse_core info: {sc_info}")
   run_group_b()
+  print("\n" + "=" * 78 + "\nMoving to the real bf16 round\n" + "=" * 78)
+  run_bf16_comparison()
