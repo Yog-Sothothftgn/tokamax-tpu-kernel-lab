@@ -600,6 +600,43 @@ def run_bf16_half_width_capacity_check(seed: int = 0) -> bool:
   return ok
 
 
+def run_two_chunk_bf16_timing(num_rounds: int = 10, num_repeats: int = 20, seed: int = 0) -> None:
+  """Times the CONFIRMED-CORRECT two-chunk bf16 whole-row-`W=8` gather
+  (`sparsecore_gather_two_chunk_w8_bf16`) against plain XLA bf16, at real
+  production scale, using the SAME rigorous methodology as every other
+  timed comparison in this file (correctness-first, `num_rounds` rounds x
+  `num_repeats` calls, rotating order, dual timing convention, median +
+  min/max spread). The int32 whole-row-`W=8` numbers (~11x/~5x slower
+  than XLA) are the closest prior reference point, but this adds real
+  bf16 packing/unpacking cost AND doubles the kernel launches (one per
+  1792-wide chunk) on top of that -- NOT assumed to carry over, measured
+  fresh here.
+  """
+  print(f"devices: {jax.devices()}")
+  print(f"jax version: {jax.__version__}")
+  print(f"seed: {seed}")
+
+  x_bf16, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
+      num_tokens=NUM_TOKENS, local_num_experts=LOCAL_NUM_EXPERTS, seed=seed
+  )
+  num_indices = int(padded_token_idx.shape[0])
+  print(
+      f"[setup] num_tokens={NUM_TOKENS} local_num_experts={LOCAL_NUM_EXPERTS} "
+      f"num_indices(m_padded)={num_indices} value_dim={LATENT_SIZE} (2 chunks of {LATENT_SIZE // 2}) "
+      f"num_valid={int(jnp.sum(valid_mask))}"
+  )
+
+  wrapped = {
+      "xla_bf16": lambda: xla_gather(x_bf16, padded_token_idx, valid_mask),
+      "sparsecore_two_chunk_w8": lambda: sparsecore_gather_two_chunk_w8_bf16(
+          x_bf16, padded_token_idx, valid_mask, window_size=8, repack_every_call=True
+      ),
+  }
+  _run_comparison(
+      wrapped, (), label="two-chunk-bf16", num_rounds=num_rounds, num_repeats=num_repeats
+  )
+
+
 if __name__ == "__main__":
   from jax.experimental.pallas import tpu as pltpu
   sc_info = pltpu.get_tpu_info().sparse_core
@@ -613,4 +650,6 @@ if __name__ == "__main__":
   print("\n" + "=" * 78 + "\nVMEM-capacity control: same pipeline, half value_dim\n" + "=" * 78)
   run_bf16_half_width_capacity_check()
   print("\n" + "=" * 78 + "\nTwo-chunk (1792+1792) coverage of the real LATENT_SIZE=3584\n" + "=" * 78)
-  run_two_chunk_bf16_correctness_check()
+  if run_two_chunk_bf16_correctness_check():
+    print("\n" + "=" * 78 + "\nTiming the two-chunk bf16 gather vs plain XLA bf16\n" + "=" * 78)
+    run_two_chunk_bf16_timing()
