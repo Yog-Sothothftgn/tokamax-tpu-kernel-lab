@@ -197,11 +197,22 @@ def sparsecore_gather_whole_row_w8_bf16(
   )
   def kernel(x_packed_hbm, i_hbm, o_hbm, *, gather_vmem):
     def body(idx_vmem, o_vmem):
-      # Doc's gather_bf16_packed pattern, verbatim: halved-index gather,
-      # then select even/odd original row from the unpacked pair.
-      pltpu.sync_copy(x_packed_hbm.at[jax.lax.div(idx_vmem, packing)], gather_vmem)
+      # Doc's gather_bf16_packed pattern calls jax.lax.div(idx_vmem, ...)
+      # directly on the ref -- on this jax version that raises
+      # "Triggering __jax_array__() during abstractification is no longer
+      # supported" (a real, mundane API-version issue, not a hardware
+      # limit). Fixed per that error's own suggestion: materialize ONCE
+      # into an actual array, then use it consistently for both the
+      # arithmetic (div/mod) and the gather address itself -- window_size
+      # is 8 here, which happens to equal this hardware's num_lanes (8),
+      # so this materialized vector satisfies the "lane_count-sized
+      # offsets" constraint that broke the earlier W=128 materialize_index
+      # experiment in sparsecore_gather_window_size_diagnosis.py (128 !=
+      # 8) -- worth testing at this specific window size, not assumed.
+      idx_val = idx_vmem[...]
+      pltpu.sync_copy(x_packed_hbm.at[jax.lax.div(idx_val, packing)], gather_vmem)
       pairs = gather_vmem.view(jnp.bfloat16).reshape(-1, packing, LATENT_SIZE)
-      is_odd = (idx_vmem % packing)[:, None]
+      is_odd = (idx_val % packing)[:, None]
       o_vmem[...] = jnp.where(is_odd == 1, pairs[:, 1], pairs[:, 0])
 
     pltpu.emit_pipeline(
