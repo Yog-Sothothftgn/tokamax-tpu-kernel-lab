@@ -1,40 +1,48 @@
-"""Device trace profiling (2026-10-02), per explicit user request: before
-concluding further (or trying to) optimize SparseCore for this workload,
-or treating "SparseCore is just inherently slower here" as settled,
-capture a REAL device trace of both the two-chunk bf16 SparseCore gather
-(`sparsecore_gather_two_chunk_w8_bf16`, the confirmed-correct, best-found
-real-dtype candidate) and the plain XLA bf16 gather, so time can be
-ATTRIBUTED to specific stages -- DMA/transfer, compute, kernel-launch
-dispatch, host-side gaps -- instead of inferred from wall-clock numbers
-alone. Answers: is the real bottleneck something OUR implementation does
-inefficiently (fixable), or is it the SparseCore mechanism itself being
-slow for THIS access pattern (few, wide, scattered rows) regardless of
-implementation (a real hardware/workload mismatch, matching the original
-suspicion from this whole investigation's very first finding -- the
-guide's own benchmark was narrow-row/millions-of-indices, the opposite
-shape from ours)?
+"""Device trace profiling (2026-10-02), per explicit user request: attribute
+where the SparseCore gather's time actually goes -- is it something OUR
+implementation does inefficiently (fixable), or is the SparseCore
+mechanism itself a poor fit for this access pattern (few, wide, scattered
+rows) regardless of implementation?
 
-Reuses this project's established `jax.profiler.trace` workflow (same
-Chrome Trace Format JSON output, parseable via plain `gzip`+`json`
-stdlib, matching the pattern already used for the TensorCore kernel work
-earlier in this project -- see memory for `explore_trace.py`/
-`explore_trace_2.py`'s grouping-by-(pid,tid,name) discipline, including
-the earlier finding that "Pallas Primitives"/"TC Overlay" tracks can be
-EMPTY for a given kernel style -- don't assume SparseCore's own
-profiling granularity ahead of time, dump everything found and let the
-real trace decide).
+First real trace (earlier version of this file) found, from the XLA side:
+`jit_xla_gather` takes only ~51us of device time per call (gather_fusion
+~28us + broadcast_select_fusion ~22us) for a ~34MB output -- already
+within ~2x of this chip's HBM roofline (~30us minimum for ~49MB of
+necessary traffic at ~1.6TB/s), so NO implementation can beat it by more
+than ~1.7x on this op. The SparseCore path measured ~4.6ms per call
+(two SC kernel launches of ~2.12ms each + ~0.36ms TensorCore-side
+reshape/select work), with the 32 TECs (2 SparseCores x 16 subcores)
+only ~37-49% busy inside each kernel.
 
-Two steps, both in this one file for convenience (capture needs the real
-TPU; analysis is pure stdlib and could run anywhere, but there's no
-reason to split them here):
-  1. `capture_trace()`: warms up (compiles) both implementations, then
-     traces `num_repeats` calls of EACH inside its own
-     `TraceAnnotation`-wrapped region, so the two can be told apart in
-     the resulting trace.
-  2. `analyze_trace()`: loads the written trace.json.gz, prints
-     process/thread metadata, and a full (pid, tid, name) breakdown of
-     every duration event whose timestamp falls inside either annotated
-     region -- not just a guess at which track matters.
+Known limitation of that first analysis, fixed here: device events were
+attributed to regions via HOST-side annotation time windows, but host and
+device clocks are offset -- a few device events landed in the wrong
+window (e.g. one SparseCore call's events showed up under the XLA
+region). This version attributes by DEVICE-side module spans instead:
+each implementation gets a distinct jit function name, so its XLA module
+(`jit_<name>(...)`, on the "XLA Modules" track) has an unambiguous
+device-clock time span, and TensorCore ops / SparseCore kernels / TEC
+events are counted only if they fall inside such a span. Track roles
+(XLA Modules / XLA Ops / Sparse Core Modules / SparseCore Offload Type /
+TEC n) are identified from the trace's own thread-name metadata, not from
+hardcoded pid/tid numbers.
+
+Three implementations are traced, so the cost can be split instead of
+inferred:
+  1. `xla_bf16_gather`      -- plain XLA bf16 gather (the baseline).
+  2. `sc_int32_wholerow`    -- SparseCore W=8 whole-row gather, int32,
+                               NO unpack compute (pure indirect-DMA cost).
+  3. `sc_bf16_two_chunk`    -- the real-dtype candidate (two 1792-wide
+                               chunks, bitwise unpack, live repack).
+Same DMA byte count between (2) and (3) by construction (68MB gathered,
+68MB written either way) -- so the gap between them is NOT more data
+moved, it is the unpack compute, the second launch, and the TC-side
+repack/reassembly.
+
+For one kernel launch of each SparseCore implementation, one TEC's
+event timeline is also printed (startup offset, each ep_run_kernel's
+start/duration, gaps between them) to show whether the idle time is a
+fixed startup/teardown cost or spread between steps.
 
 To run (real v6e VM only):
   python sparsecore_gather_device_trace.py
@@ -57,11 +65,25 @@ from sparsecore_gather_group_b_comparison import (  # noqa: E402
     NUM_TOKENS,
     LOCAL_NUM_EXPERTS,
     xla_gather,
+    sparsecore_gather_whole_row_w8,
     sparsecore_gather_two_chunk_w8_bf16,
 )
 
 TRACE_DIR = "/tmp/sparsecore_gather_trace"
 NUM_REPEATS = 20
+MODULE_NAMES = ("xla_bf16_gather", "sc_int32_wholerow", "sc_bf16_two_chunk")
+
+
+def xla_bf16_gather(x, idx, mask):
+  return xla_gather(x, idx, mask)
+
+
+def sc_int32_wholerow(x, idx, mask):
+  return sparsecore_gather_whole_row_w8(x, idx, mask, window_size=8)
+
+
+def sc_bf16_two_chunk(x, idx, mask):
+  return sparsecore_gather_two_chunk_w8_bf16(x, idx, mask, window_size=8, repack_every_call=True)
 
 
 def capture_trace(seed: int = 0) -> None:
@@ -76,44 +98,42 @@ def capture_trace(seed: int = 0) -> None:
       f"[setup] num_tokens={NUM_TOKENS} local_num_experts={LOCAL_NUM_EXPERTS} "
       f"num_indices(m_padded)={num_indices} value_dim={LATENT_SIZE} num_valid={int(jnp.sum(valid_mask))}"
   )
+  # Non-degenerate int32 stand-in (same fix as everywhere else in this
+  # investigation -- never astype(int32) on small-scale bf16 data).
+  x_int32 = jnp.arange(NUM_TOKENS * LATENT_SIZE, dtype=jnp.int32).reshape(NUM_TOKENS, LATENT_SIZE)
 
-  xla_fn = jax.jit(xla_gather)
-  sc_fn = jax.jit(
-      lambda x, idx, mask: sparsecore_gather_two_chunk_w8_bf16(
-          x, idx, mask, window_size=8, repack_every_call=True
-      )
-  )
+  runs = {
+      "xla_bf16_gather": (jax.jit(xla_bf16_gather), x_bf16),
+      "sc_int32_wholerow": (jax.jit(sc_int32_wholerow), x_int32),
+      "sc_bf16_two_chunk": (jax.jit(sc_bf16_two_chunk), x_bf16),
+  }
 
-  # Warm up (exclude compile time from the trace) -- explicit args, same
-  # fix as run_two_chunk_bf16_timing's correction, so the repack step is
-  # genuinely re-run (and thus genuinely traced) on every call below, not
-  # silently constant-folded away.
-  jax.block_until_ready(xla_fn(x_bf16, padded_token_idx, valid_mask))
-  jax.block_until_ready(sc_fn(x_bf16, padded_token_idx, valid_mask))
+  # Warm up (compile) everything BEFORE tracing, with explicit arguments
+  # (not closure-captured constants -- same fix as run_two_chunk_bf16_timing)
+  # so every traced call genuinely re-runs the repack.
+  for name, (fn, x) in runs.items():
+    jax.block_until_ready(fn(x, padded_token_idx, valid_mask))
 
   print(f"Writing device trace to {TRACE_DIR} ...")
   with jax.profiler.trace(TRACE_DIR):
-    with jax.profiler.TraceAnnotation("xla_bf16_repeats"):
-      for _ in range(NUM_REPEATS):
-        out = xla_fn(x_bf16, padded_token_idx, valid_mask)
-      jax.block_until_ready(out)
-    with jax.profiler.TraceAnnotation("sparsecore_two_chunk_repeats"):
-      for _ in range(NUM_REPEATS):
-        out = sc_fn(x_bf16, padded_token_idx, valid_mask)
-      jax.block_until_ready(out)
-  print(
-      f"Trace written to {TRACE_DIR}. Look for the 'xla_bf16_repeats' and "
-      "'sparsecore_two_chunk_repeats' annotated regions below, or run "
-      "analyze_trace() (called automatically if this file is run as a "
-      "script) for a full breakdown."
-  )
+    for name, (fn, x) in runs.items():
+      with jax.profiler.TraceAnnotation(f"{name}_repeats"):
+        for _ in range(NUM_REPEATS):
+          out = fn(x, padded_token_idx, valid_mask)
+        jax.block_until_ready(out)
+  print(f"Trace written to {TRACE_DIR}.")
 
 
 def _find_trace_json() -> str:
   matches = glob.glob(f"{TRACE_DIR}/plugins/profile/*/*.trace.json.gz")
   if not matches:
     raise FileNotFoundError(f"no trace.json.gz found under {TRACE_DIR} -- run capture_trace() first")
-  return sorted(matches)[-1]  # most recent, if more than one
+  return sorted(matches)[-1]
+
+
+def _mean(vals):
+  vals = list(vals)
+  return sum(vals) / len(vals) if vals else float("nan")
 
 
 def analyze_trace() -> None:
@@ -124,54 +144,117 @@ def analyze_trace() -> None:
   events = data["traceEvents"] if isinstance(data, dict) else data
   print(f"total events: {len(events)}")
 
-  # Process/thread names, so pid/tid numbers can be read as human labels.
   thread_names: dict[tuple, str] = {}
   for e in events:
     if e.get("ph") == "M" and e.get("name") == "thread_name":
       thread_names[(e.get("pid"), e.get("tid"))] = e.get("args", {}).get("name", "?")
 
-  # Find the two annotated regions' time windows (ph=='b'/'e' or a single
-  # ph=='X' span, depending on how TraceAnnotation is recorded) by name.
-  windows: dict[str, tuple[float, float]] = {}
+  # Index duration events by (pid, tid) once, sorted by start time.
+  by_track: dict[tuple, list] = defaultdict(list)
   for e in events:
-    name = e.get("name", "")
-    if name in ("xla_bf16_repeats", "sparsecore_two_chunk_repeats") and e.get("ph") == "X":
-      ts, dur = e.get("ts", 0), e.get("dur", 0)
-      windows[name] = (ts, ts + dur)
-  print(f"annotated regions (ts_start, ts_end): {windows}")
-  if not windows:
-    print(
-        "WARNING: could not find the annotation events by exact name match -- "
-        "dumping ALL ph=='X' events whose name contains 'repeats' as a fallback."
-    )
-    for e in events:
-      if e.get("ph") == "X" and "repeats" in e.get("name", ""):
-        print(f"  {e.get('name')!r} pid={e.get('pid')} tid={e.get('tid')} ts={e.get('ts')} dur={e.get('dur')}")
+    if e.get("ph") == "X":
+      by_track[(e.get("pid"), e.get("tid"))].append(e)
+  for evs in by_track.values():
+    evs.sort(key=lambda e: e["ts"])
 
-  # Full (pid, tid, name) breakdown of every duration event inside EACH
-  # annotated window, on the device process (pid==3, per this project's
-  # established convention) -- not guessing which track matters, dumping
-  # all of them.
-  for region_name, (lo, hi) in windows.items():
-    print(f"\n=== device events inside '{region_name}' (ts in [{lo}, {hi}]) ===")
-    grouped = defaultdict(lambda: [0, 0.0])
-    for e in events:
-      if e.get("ph") != "X":
-        continue
-      ts = e.get("ts", 0)
-      if not (lo <= ts <= hi):
-        continue
-      key = (e.get("pid"), e.get("tid"), e.get("name"))
-      grouped[key][0] += 1
-      grouped[key][1] += e.get("dur", 0)
-    for (pid, tid, name), (count, total_dur) in sorted(grouped.items(), key=lambda kv: -kv[1][1])[:40]:
-      tname = thread_names.get((pid, tid), "?")
-      print(
-          f"  pid={pid} tid={tid} ({tname:20s}) name={name!r:50s} "
-          f"count={count:5d} total_us={total_dur:10.2f} mean_us={total_dur / max(count, 1):8.3f}"
-      )
-    print(f"  (region wall-clock span: {(hi - lo):.1f}us, "
-          f"per-call average: {(hi - lo) / NUM_REPEATS:.2f}us)")
+  def tracks_named(pred):
+    return [k for k, n in thread_names.items() if pred(n)]
+
+  tc_module_tracks = tracks_named(lambda n: n == "XLA Modules")
+  tc_op_tracks = tracks_named(lambda n: n == "XLA Ops")
+  offload_tracks = tracks_named(lambda n: n == "SparseCore Offload Type")
+  tec_tracks = tracks_named(lambda n: n.startswith("TEC"))
+  print(
+      f"track roles found by thread-name: XLA Modules={tc_module_tracks} XLA Ops={tc_op_tracks} "
+      f"Offload={offload_tracks} num_TEC_tracks={len(tec_tracks)}"
+  )
+
+  def inside(evs, lo, hi):
+    return [e for e in evs if lo <= e["ts"] <= hi]
+
+  for mod in MODULE_NAMES:
+    instances = []
+    for tk in tc_module_tracks:
+      for e in by_track[tk]:
+        if e.get("name", "").startswith(f"jit_{mod}("):
+          instances.append(e)
+    instances.sort(key=lambda e: e["ts"])
+    print("\n" + "=" * 78)
+    print(f"module `jit_{mod}`: {len(instances)} instances found")
+    print("=" * 78)
+    if not instances:
+      continue
+
+    mod_durs = [e["dur"] for e in instances]
+    print(f"TensorCore-side module duration per call: mean={_mean(mod_durs):.1f}us "
+          f"min={min(mod_durs):.1f} max={max(mod_durs):.1f}")
+
+    # TensorCore ops inside each instance, summed per op name, averaged per call.
+    op_totals: dict[str, float] = defaultdict(float)
+    for inst in instances:
+      lo, hi = inst["ts"], inst["ts"] + inst["dur"]
+      for tk in tc_op_tracks:
+        for e in inside(by_track[tk], lo, hi):
+          op_totals[e["name"]] += e["dur"]
+    print("TensorCore XLA ops inside the module (mean us per call, top 8):")
+    for name, total in sorted(op_totals.items(), key=lambda kv: -kv[1])[:8]:
+      print(f"  {name!r:50s} {total / len(instances):9.1f}us")
+
+    # SparseCore offload kernels overlapping each instance.
+    kernel_durs = []
+    kernels_per_call = []
+    busy_fracs, ev_counts, ev_durs, start_gaps, tail_gaps = [], [], [], [], []
+    first_timeline = None
+    for inst in instances:
+      lo, hi = inst["ts"] - 50, inst["ts"] + inst["dur"] + 50
+      n_kernels_this_call = 0
+      for ok in offload_tracks:
+        pid = ok[0]
+        for k in inside(by_track[ok], lo, hi):
+          n_kernels_this_call += 1
+          a, b = k["ts"], k["ts"] + k["dur"]
+          kernel_durs.append(k["dur"])
+          for tk in tec_tracks:
+            if tk[0] != pid:
+              continue
+            tevs = inside(by_track[tk], a, b)
+            if not tevs:
+              continue
+            busy = sum(t["dur"] for t in tevs)
+            busy_fracs.append(busy / k["dur"])
+            ev_counts.append(len(tevs))
+            ev_durs.extend(t["dur"] for t in tevs)
+            start_gaps.append(tevs[0]["ts"] - a)
+            tail_gaps.append(b - (tevs[-1]["ts"] + tevs[-1]["dur"]))
+            if first_timeline is None:
+              first_timeline = (thread_names.get(tk, "?"), pid, a, k["dur"], tevs)
+      kernels_per_call.append(n_kernels_this_call)
+
+    if not kernel_durs:
+      print("(no SparseCore offload kernels overlapped this module -- pure TensorCore path)")
+      continue
+
+    print(f"SparseCore offload kernels: {_mean(kernels_per_call):.1f} per call (counted across both SparseCores), "
+          f"mean kernel duration={_mean(kernel_durs):.1f}us")
+    print(f"TEC activity inside each kernel: busy fraction (sum of TEC event durations / kernel wall)={_mean(busy_fracs):.1%} "
+          f"(min {min(busy_fracs):.1%}, max {max(busy_fracs):.1%}); "
+          f"events per TEC per kernel={_mean(ev_counts):.1f}, mean event duration={_mean(ev_durs):.1f}us")
+    print(f"  startup gap (kernel start -> first TEC event)={_mean(start_gaps):.1f}us, "
+          f"tail gap (last TEC event -> kernel end)={_mean(tail_gaps):.1f}us")
+
+    if first_timeline is not None:
+      tname, pid, a, kdur, tevs = first_timeline
+      print(f"One TEC's timeline for the first kernel ({tname} on pid {pid}, kernel wall={kdur:.1f}us), "
+            f"offsets relative to kernel start:")
+      prev_end = 0.0
+      shown = tevs[:10] + ([None] if len(tevs) > 14 else []) + tevs[-4:] if len(tevs) > 14 else tevs
+      for t in shown:
+        if t is None:
+          print("   ...")
+          continue
+        rel = t["ts"] - a
+        print(f"   +{rel:8.1f}us  dur={t['dur']:7.1f}us  gap_before={rel - prev_end:7.1f}us  name={t['name']!r}")
+        prev_end = rel + t["dur"]
 
 
 if __name__ == "__main__":
