@@ -380,6 +380,7 @@ def _run_comparison(
     label: str,
     num_rounds: int = 10,
     num_repeats: int = 20,
+    bitwise_check: bool = False,
 ) -> bool:
   """Shared methodology for both the int32 Group B round and the bf16
   round below: correctness FIRST (exact match against the first
@@ -388,6 +389,14 @@ def _run_comparison(
   rotating the comparison order every round, both timing conventions kept
   separate, reporting median and min/max spread. Returns whether all
   implementations passed correctness (timing is skipped entirely if not).
+
+  `bitwise_check=True` (per explicit user request for bf16 comparisons)
+  ADDITIONALLY requires the raw bit patterns to match
+  (`.view(jnp.uint16)`), not just value equality via `array_equal` --
+  `array_equal` alone would treat `-0.0 == 0.0` as equal (numerically
+  correct, but would hide a real bit-level unpack bug for that specific
+  value). Meaningful for float dtypes; harmless but unused for int32
+  callers (who pass the default `False`).
   """
   names = list(impls.keys())
   reference_name = names[0]
@@ -403,6 +412,10 @@ def _run_comparison(
   all_ok = True
   for name in names:
     ok = bool(jnp.array_equal(outputs[name], expected))
+    if bitwise_check:
+      ok = ok and bool(
+          jnp.array_equal(outputs[name].view(jnp.uint16), expected.view(jnp.uint16))
+      )
     print(f"[correctness, {label}] {name}: {'OK' if ok else 'FAIL'} (vs {reference_name})")
     all_ok = all_ok and ok
   if not all_ok:
@@ -626,14 +639,25 @@ def run_two_chunk_bf16_timing(num_rounds: int = 10, num_repeats: int = 20, seed:
       f"num_valid={int(jnp.sum(valid_mask))}"
   )
 
-  wrapped = {
-      "xla_bf16": lambda: xla_gather(x_bf16, padded_token_idx, valid_mask),
-      "sparsecore_two_chunk_w8": lambda: sparsecore_gather_two_chunk_w8_bf16(
-          x_bf16, padded_token_idx, valid_mask, window_size=8, repack_every_call=True
+  # Pass x_bf16/padded_token_idx/valid_mask as EXPLICIT jit arguments, not
+  # captured via a zero-arg closure -- per explicit review: a zero-arg
+  # `lambda: f(x_bf16, ...)` closes over x_bf16 as a Python-level
+  # constant, and jax.jit can then treat it as a COMPILE-TIME constant
+  # (potentially constant-folding the reshape/view "repack" step away
+  # entirely), which would silently defeat the whole point of
+  # `repack_every_call=True` measuring LIVE per-call packing cost. With
+  # explicit arguments, x_bf16 is a genuine traced input the compiled
+  # function must re-process on every call.
+  impls = {
+      "xla_bf16": xla_gather,
+      "sparsecore_two_chunk_w8": lambda x, idx, mask: sparsecore_gather_two_chunk_w8_bf16(
+          x, idx, mask, window_size=8, repack_every_call=True
       ),
   }
+  args = (x_bf16, padded_token_idx, valid_mask)
   _run_comparison(
-      wrapped, (), label="two-chunk-bf16", num_rounds=num_rounds, num_repeats=num_repeats
+      impls, args, label="two-chunk-bf16", num_rounds=num_rounds, num_repeats=num_repeats,
+      bitwise_check=True,
   )
 
 
