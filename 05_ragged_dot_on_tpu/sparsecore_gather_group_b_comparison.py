@@ -258,6 +258,93 @@ def sparsecore_gather_whole_row_w8_bf16(
   return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
 
 
+def sparsecore_gather_two_chunk_w8_bf16(
+    x: jax.Array,
+    padded_token_idx: jax.Array,
+    valid_mask: jax.Array,
+    window_size: int = 8,
+    repack_every_call: bool = True,
+) -> jax.Array:
+  """Covers the REAL `LATENT_SIZE=3584` by calling the CONFIRMED-CORRECT
+  half-width (1792) `sparsecore_gather_whole_row_w8_bf16` kernel TWICE,
+  once per 1792-wide column chunk, then concatenating -- per explicit
+  user decision (2026-10-02), the lower-risk of two options after the
+  real-width whole-shot attempt hit a genuine VMEM budget overflow
+  (`CompileTimeSparseCoreAllocationFailure`, ~86143 words needed vs a
+  65536-word budget) while the half-width capacity control
+  (`run_bf16_half_width_capacity_check`) confirmed the underlying
+  pipeline logic itself is correct. Reuses that exact, already-validated
+  kernel verbatim (its `value_dim` is derived from the input's own shape,
+  so no new kernel code is needed) -- only 2 chunks here, vs the earlier
+  int32 investigation's 28 chunks of 128 columns each.
+
+  Each chunk call applies the SAME real `valid_mask` independently (masks
+  to zero at invalid rows in both halves identically), so concatenating
+  the two already-masked halves gives the correct final result without
+  masking twice.
+  """
+  num_tokens, value_dim = x.shape
+  assert value_dim % 2 == 0, f"value_dim={value_dim} must be evenly splittable into 2 chunks"
+  half = value_dim // 2
+  chunk0 = sparsecore_gather_whole_row_w8_bf16(
+      x[:, :half], padded_token_idx, valid_mask, window_size=window_size, repack_every_call=repack_every_call
+  )
+  chunk1 = sparsecore_gather_whole_row_w8_bf16(
+      x[:, half:], padded_token_idx, valid_mask, window_size=window_size, repack_every_call=repack_every_call
+  )
+  return jnp.concatenate([chunk0, chunk1], axis=-1)
+
+
+def run_two_chunk_bf16_correctness_check(seed: int = 0) -> bool:
+  """Correctness + compile-ability ONLY (no timing yet, per established
+  discipline -- confirm it works at the REAL width before measuring
+  anything) for `sparsecore_gather_two_chunk_w8_bf16`, at real production
+  scale: real `num_tokens=2048`, real `padded_token_idx`/`valid_mask`,
+  real `LATENT_SIZE=3584` bf16 data. Checked against the plain XLA bf16
+  gather, exact match required (pure data movement).
+  """
+  print(f"devices: {jax.devices()}")
+  print(f"jax version: {jax.__version__}")
+
+  x_bf16, padded_token_idx, valid_mask, _production_sorted_tokens = real_dispatch_indices(
+      num_tokens=NUM_TOKENS, local_num_experts=LOCAL_NUM_EXPERTS, seed=seed
+  )
+  num_indices = int(padded_token_idx.shape[0])
+  print(
+      f"[setup] num_tokens={NUM_TOKENS} local_num_experts={LOCAL_NUM_EXPERTS} "
+      f"num_indices(m_padded)={num_indices} value_dim={LATENT_SIZE} (2 chunks of {LATENT_SIZE // 2}) "
+      f"num_valid={int(jnp.sum(valid_mask))}"
+  )
+
+  def xla_fn():
+    return xla_gather(x_bf16, padded_token_idx, valid_mask)
+
+  def sc_fn():
+    return sparsecore_gather_two_chunk_w8_bf16(
+        x_bf16, padded_token_idx, valid_mask, window_size=8, repack_every_call=True
+    )
+
+  try:
+    expected = jax.jit(xla_fn)()
+    jax.block_until_ready(expected)
+    out = jax.jit(sc_fn)()
+    jax.block_until_ready(out)
+  except Exception as e:  # noqa: BLE001 -- surfacing the real error is the point
+    import traceback
+    print(
+        "\n[two-chunk bf16] FAILED to compile/run -- full error below:\n"
+        + "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    )
+    return False
+
+  ok = bool(jnp.array_equal(out, expected))
+  print(
+      f"[two-chunk bf16] value_dim={LATENT_SIZE} via 2x{LATENT_SIZE // 2}, W=8: "
+      f"COMPILED, correct={ok} (expect exact match -- pure data movement)"
+  )
+  return ok
+
+
 def _time_pipelined(f, *args, num_repeats: int = 20) -> float:
   f_jit = jax.jit(f)
   out = f_jit(*args)
@@ -525,3 +612,5 @@ if __name__ == "__main__":
   run_bf16_comparison()
   print("\n" + "=" * 78 + "\nVMEM-capacity control: same pipeline, half value_dim\n" + "=" * 78)
   run_bf16_half_width_capacity_check()
+  print("\n" + "=" * 78 + "\nTwo-chunk (1792+1792) coverage of the real LATENT_SIZE=3584\n" + "=" * 78)
+  run_two_chunk_bf16_correctness_check()
