@@ -200,61 +200,103 @@ def analyze_trace() -> None:
     for name, total in sorted(op_totals.items(), key=lambda kv: -kv[1])[:8]:
       print(f"  {name!r:50s} {total / len(instances):9.1f}us")
 
-    # SparseCore offload kernels overlapping each instance.
+    # SparseCore offload kernels belonging to each instance. A kernel
+    # counts only if it lies FULLY inside the module's device-clock span
+    # (+-20us tolerance) -- an earlier version of this analysis used a
+    # looser +-50us window that also counted adjacent back-to-back calls'
+    # kernels (showing 3.9/5.9 kernels per call instead of 2 per
+    # SparseCore-launch).
+    #
+    # Only `ep_*` events are counted as TEC activity. An earlier version
+    # summed EVERY event on a TEC track, including the single enclosing
+    # span event that covers the whole kernel (e.g. 'sc_int32_wholerow.6',
+    # 853us) -- double-counting that gave impossible busy fractions
+    # (178%). Busy time here = sum of `ep_run_kernel` durations only
+    # (the per-grid-step body: indirect gather + any unpack compute);
+    # `ep_wait_in`/`ep_wait_out` are reported separately.
     kernel_durs = []
     kernels_per_call = []
-    busy_fracs, ev_counts, ev_durs, start_gaps, tail_gaps = [], [], [], [], []
+    run_events_per_sc_kernel = []   # ep_run_kernel total across ALL 16 TECs of ONE SparseCore, ONE kernel
+    steps_per_tec = []
+    busy_fracs, run_durs = [], []
+    wait_in_per_tec, wait_out_per_tec = [], []
+    start_offsets, finish_offsets_min, finish_offsets_med, finish_offsets_max = [], [], [], []
     first_timeline = None
     for inst in instances:
-      lo, hi = inst["ts"] - 50, inst["ts"] + inst["dur"] + 50
+      lo, hi = inst["ts"] - 20, inst["ts"] + inst["dur"] + 20
       n_kernels_this_call = 0
       for ok in offload_tracks:
         pid = ok[0]
-        for k in inside(by_track[ok], lo, hi):
-          n_kernels_this_call += 1
+        for k in by_track[ok]:
           a, b = k["ts"], k["ts"] + k["dur"]
+          if not (a >= lo and b <= hi):
+            continue
+          n_kernels_this_call += 1
           kernel_durs.append(k["dur"])
+          sc_run_total = 0
+          finishes = []
           for tk in tec_tracks:
             if tk[0] != pid:
               continue
-            tevs = inside(by_track[tk], a, b)
+            tevs = [t for t in inside(by_track[tk], a, b + 1) if t["name"].startswith("ep_")]
             if not tevs:
               continue
-            busy = sum(t["dur"] for t in tevs)
-            busy_fracs.append(busy / k["dur"])
-            ev_counts.append(len(tevs))
-            ev_durs.extend(t["dur"] for t in tevs)
-            start_gaps.append(tevs[0]["ts"] - a)
-            tail_gaps.append(b - (tevs[-1]["ts"] + tevs[-1]["dur"]))
+            runs = [t for t in tevs if t["name"] == "ep_run_kernel"]
+            sc_run_total += len(runs)
+            steps_per_tec.append(len(runs))
+            busy_fracs.append(sum(t["dur"] for t in runs) / k["dur"])
+            run_durs.extend(t["dur"] for t in runs)
+            wait_in_per_tec.append(sum(t["dur"] for t in tevs if t["name"] == "ep_wait_in"))
+            wait_out_per_tec.append(sum(t["dur"] for t in tevs if t["name"] == "ep_wait_out"))
+            start_offsets.append(min(t["ts"] for t in tevs) - a)
+            finishes.append(max(t["ts"] + t["dur"] for t in tevs) - a)
             if first_timeline is None:
               first_timeline = (thread_names.get(tk, "?"), pid, a, k["dur"], tevs)
+          if finishes:
+            finishes.sort()
+            finish_offsets_min.append(finishes[0])
+            finish_offsets_med.append(finishes[len(finishes) // 2])
+            finish_offsets_max.append(finishes[-1])
+            run_events_per_sc_kernel.append(sc_run_total)
       kernels_per_call.append(n_kernels_this_call)
 
     if not kernel_durs:
-      print("(no SparseCore offload kernels overlapped this module -- pure TensorCore path)")
+      print("(no SparseCore offload kernels inside this module -- pure TensorCore path)")
       continue
 
-    print(f"SparseCore offload kernels: {_mean(kernels_per_call):.1f} per call (counted across both SparseCores), "
-          f"mean kernel duration={_mean(kernel_durs):.1f}us")
-    print(f"TEC activity inside each kernel: busy fraction (sum of TEC event durations / kernel wall)={_mean(busy_fracs):.1%} "
-          f"(min {min(busy_fracs):.1%}, max {max(busy_fracs):.1%}); "
-          f"events per TEC per kernel={_mean(ev_counts):.1f}, mean event duration={_mean(ev_durs):.1f}us")
-    print(f"  startup gap (kernel start -> first TEC event)={_mean(start_gaps):.1f}us, "
-          f"tail gap (last TEC event -> kernel end)={_mean(tail_gaps):.1f}us")
+    print(f"SparseCore offload kernels: {_mean(kernels_per_call):.1f} per call (expect 2 = one launch per SparseCore "
+          f"per sc kernel), mean kernel duration={_mean(kernel_durs):.1f}us")
+    print(f"grid-step bodies (`ep_run_kernel`): per TEC per kernel={_mean(steps_per_tec):.1f}, "
+          f"TOTAL across one SparseCore's TECs per kernel={_mean(run_events_per_sc_kernel):.1f}")
+    print("  -> compare that total with the kernel's grid size (num_indices // window_size = 592): "
+          "~592 means this SparseCore alone runs the whole grid (so both SparseCores together do it TWICE); "
+          "~296 would mean the grid is split across both SparseCores.")
+    print(f"TEC busy fraction (sum of ep_run_kernel / kernel wall)={_mean(busy_fracs):.1%} "
+          f"(min {min(busy_fracs):.1%}, max {max(busy_fracs):.1%}); mean ep_run_kernel duration={_mean(run_durs):.1f}us")
+    print(f"per-TEC totals inside a kernel: ep_wait_in={_mean(wait_in_per_tec):.1f}us, ep_wait_out={_mean(wait_out_per_tec):.1f}us")
+    print(f"TEC start offset after kernel start: mean={_mean(start_offsets):.1f}us; "
+          f"TEC finish offset (min/median/max across TECs of one SparseCore): "
+          f"{_mean(finish_offsets_min):.1f} / {_mean(finish_offsets_med):.1f} / {_mean(finish_offsets_max):.1f}us "
+          f"(kernel wall {_mean(kernel_durs):.1f}us) -- a large spread = load imbalance or waiting on the slowest TEC")
 
     if first_timeline is not None:
       tname, pid, a, kdur, tevs = first_timeline
       print(f"One TEC's timeline for the first kernel ({tname} on pid {pid}, kernel wall={kdur:.1f}us), "
-            f"offsets relative to kernel start:")
-      prev_end = 0.0
-      shown = tevs[:10] + ([None] if len(tevs) > 14 else []) + tevs[-4:] if len(tevs) > 14 else tevs
-      for t in shown:
-        if t is None:
+            f"offsets relative to kernel start (gaps computed against the TRUE previous event):")
+      rows, prev_end = [], 0.0
+      for t in tevs:
+        rel = t["ts"] - a
+        rows.append((rel, t["dur"], rel - prev_end, t["name"]))
+        prev_end = max(prev_end, rel + t["dur"])
+      shown = rows[:12] + [None] + rows[-6:] if len(rows) > 20 else rows
+      for r in shown:
+        if r is None:
           print("   ...")
           continue
-        rel = t["ts"] - a
-        print(f"   +{rel:8.1f}us  dur={t['dur']:7.1f}us  gap_before={rel - prev_end:7.1f}us  name={t['name']!r}")
-        prev_end = rel + t["dur"]
+        print(f"   +{r[0]:8.1f}us  dur={r[1]:7.1f}us  gap_before={r[2]:7.1f}us  name={r[3]!r}")
+      big = sorted(rows, key=lambda r: -r[2])[:3]
+      print("  three largest gaps before an event on this TEC: "
+            + ", ".join(f"{g:.1f}us before {n!r} at +{rel:.1f}us" for rel, _d, g, n in big))
 
 
 if __name__ == "__main__":
