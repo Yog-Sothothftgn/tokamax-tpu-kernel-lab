@@ -211,7 +211,10 @@ def sparsecore_gather_whole_row_w8_bf16(
       # 8) -- worth testing at this specific window size, not assumed.
       idx_val = idx_vmem[...]
       pltpu.sync_copy(x_packed_hbm.at[jax.lax.div(idx_val, packing)], gather_vmem)
-      pairs = gather_vmem.view(jnp.bfloat16).reshape(-1, packing, LATENT_SIZE)
+      # Same class of issue as idx_vmem above: gather_vmem is a ref too --
+      # .view() is an array method, not a ref method ('AbstractRef' object
+      # has no attribute 'view'). Materialize it first.
+      pairs = gather_vmem[...].view(jnp.bfloat16).reshape(-1, packing, LATENT_SIZE)
       is_odd = (idx_val % packing)[:, None]
       o_vmem[...] = jnp.where(is_odd == 1, pairs[:, 1], pairs[:, 0])
 
