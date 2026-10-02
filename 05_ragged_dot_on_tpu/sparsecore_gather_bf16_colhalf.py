@@ -171,6 +171,77 @@ def sparsecore_gather_colhalf_bf16(
   return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
 
 
+def sparsecore_gather_colhalf_bf16_unpack_outside(
+    x: jax.Array,
+    padded_token_idx: jax.Array,
+    valid_mask: jax.Array,
+    window_size: int = 8,
+    core_split: bool = True,
+) -> jax.Array:
+  """CONTROL for "where should the unpack happen": identical to
+  `sparsecore_gather_colhalf_bf16` (same column-half packing, W=8, same
+  cross-core split + padding, same indices, live packing on every call)
+  EXCEPT the SparseCore kernel does ONLY the gather -- it copies packed
+  int32 rows straight into its (single) int32 output block, no scratch, no
+  unpack -- and the unpack (`& 0xFFFF` / `>> 16`, narrow to uint16,
+  same-width view as bf16), the column concatenate and the mask all run
+  OUTSIDE the kernel as ordinary element-wise XLA ops on the TensorCore.
+
+  Note the kernel's output layout and write-back also change (one int32
+  stream of (kernel_n, D/2) words instead of two bf16 streams of the same
+  total bytes), so the time difference vs the unpack-inside variant is not
+  purely unpack-instruction time -- it answers a placement question
+  (inside vs outside the SparseCore), not an instruction-cost one.
+  """
+  from jax.experimental import pallas as pl
+  from jax.experimental.pallas import tpu as pltpu
+  from jax.experimental.pallas import tpu_sc as plsc
+
+  _num_tokens, value_dim = x.shape
+  half = value_dim // 2
+  num_indices = padded_token_idx.shape[0]
+  assert num_indices % window_size == 0
+
+  sc_info = pltpu.get_tpu_info().sparse_core
+  assert sc_info is not None, "No SparseCore on this TPU"
+  vector_mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+
+  safe_idx = jnp.where(padded_token_idx < 0, 0, padded_token_idx).astype(jnp.int32)
+  if core_split:
+    quantum = window_size * sc_info.num_cores * sc_info.num_subcores
+    pad = (-num_indices) % quantum
+  else:
+    pad = 0
+  kernel_n = num_indices + pad
+  safe_idx_k = jnp.pad(safe_idx, (0, pad)) if pad else safe_idx
+  core_axes = ('core', 'subcore') if core_split else 'subcore'
+
+  packed = pack_colhalf(x)
+
+  @pl.kernel(out_type=jax.ShapeDtypeStruct((kernel_n, half), jnp.int32), mesh=vector_mesh)
+  def kernel(packed_hbm, i_hbm, o_hbm):
+    def body(idx_vmem, o_vmem):
+      pltpu.sync_copy(packed_hbm.at[idx_vmem], o_vmem)  # pure gather, no unpack
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(kernel_n // window_size,),
+        in_specs=[pl.BlockSpec((window_size,), index_map=lambda i: (i,))],
+        out_specs=[pl.BlockSpec((window_size, half), index_map=lambda i: (i, 0))],
+        core_axis_name=core_axes,
+        dimension_semantics=(pltpu.PARALLEL,),
+    )(i_hbm, o_hbm)
+
+  gathered_packed = kernel(packed, safe_idx_k)
+  if pad:
+    gathered_packed = gathered_packed[:num_indices]
+  bits = gathered_packed.view(jnp.uint32)  # same-width (32->32) reinterpret
+  lo = (bits & 0xFFFF).astype(jnp.uint16).view(jnp.bfloat16)
+  hi = (bits >> 16).astype(jnp.uint16).view(jnp.bfloat16)
+  gathered = jnp.concatenate([lo, hi], axis=-1)
+  return jnp.where(valid_mask[:, None], gathered, jnp.zeros_like(gathered))
+
+
 def _named(name, fn):
   def f(x, idx, mask):
     return fn(x, idx, mask)
