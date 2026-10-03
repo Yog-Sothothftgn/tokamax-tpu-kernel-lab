@@ -13,8 +13,10 @@ num_tokens = 2048 (control, = the earlier real case), 8192, 32768, 131072.
 Entries (all must reproduce the production `sorted_tokens` bit for bit):
   xla_ref            the unified XLA reference used so far: x[max(idx,0)] + mask
   xla_take_clip      same, with jnp.take(..., mode="clip")       } XLA baseline
-  xla_take_pib       same, with mode="promise_in_bounds"          } sensitivity:
+  xla_at_pib         same, with x.at[idx].get(mode="promise_in_bounds") } sensitivity:
                      is the XLA number an artefact of the gather mode?
+  xla_ref_spread     xla_ref on the SPREAD indices (invalid slots -> random row), so the
+  xla_at_pib_spread  XLA baseline gets the same index treatment as tokamax_spread
   tokamax_row0       Tokamax mosaic_tpu_v2 on the production indices (invalid
                      slots -> row 0, exactly what production feeds the gather)
   tokamax_spread     identical except invalid slots hold a fixed random in-range
@@ -48,6 +50,9 @@ from sparsecore_gather_spread_invalid_slots import spread_invalid_slots  # noqa:
 
 RESULTS_DIR = _HERE / "sparsecore_prod_routing_results"
 TOKEN_COUNTS = (2048, 8192, 32768, 131072)
+# Run 1 (commit 8044f3c) showed xla_take_clip == xla_ref, tokamax_row0 loses everywhere, tokamax_spread wins at >=32768
+# tokens -- but with NO spread-index XLA entry, so the win compared a spread-index Tokamax with a row-0-index XLA.
+# Run 2 (this file) adds xla_ref_spread and the promise_in_bounds .at[].get variants (row0 and spread).
 
 
 def xla_take_clip(x, idx, mask):
@@ -55,8 +60,9 @@ def xla_take_clip(x, idx, mask):
   return jnp.where(mask[:, None], g, jnp.zeros((), x.dtype))
 
 
-def xla_take_pib(x, idx, mask):
-  g = jnp.take(x, jnp.maximum(idx, 0), axis=0, mode="promise_in_bounds")
+def xla_at_pib(x, idx, mask):
+  # jnp.take rejects mode="promise_in_bounds" (measured: ValueError); .at[].get accepts it.
+  g = x.at[jnp.maximum(idx, 0)].get(mode="promise_in_bounds")
   return jnp.where(mask[:, None], g, jnp.zeros((), x.dtype))
 
 
@@ -76,8 +82,10 @@ def run_point(num_tokens: int, rounds: int = 10, repeats: int = 20):
         f"out={out_bytes / 1e9:.2f}GB inflight={k} slots_with_idx<0={int((idx < 0).sum())} #####")
   entries = {
       "xla_ref": (tc.reference_gather, (x, idx, mask)),
+      "xla_ref_spread": (tc.reference_gather, (x, idx_spread, mask)),
       "xla_take_clip": (xla_take_clip, (x, idx, mask)),
-      "xla_take_pib": (xla_take_pib, (x, idx, mask)),
+      "xla_at_pib": (xla_at_pib, (x, idx, mask)),
+      "xla_at_pib_spread": (xla_at_pib, (x, idx_spread, mask)),
       "tokamax_row0": (tc.tokamax_v2, (x, idx, mask)),
       "tokamax_spread": (tc.tokamax_v2, (x, idx_spread, mask)),
   }
@@ -132,8 +140,8 @@ def run_point(num_tokens: int, rounds: int = 10, repeats: int = 20):
       raw.append({"tokens": num_tokens, "slots": n, "inflight": k, "round": r, "pos": pos, "entry": nm,
                   "pipelined_ms": f"{pipelined(nm):.5f}", "per_call_ms": f"{blocking(nm):.5f}"})
   RESULTS_DIR.mkdir(exist_ok=True)
-  new = not (RESULTS_DIR / "prod_timing_raw.csv").exists()
-  with open(RESULTS_DIR / "prod_timing_raw.csv", "a", newline="") as f:
+  new = not (RESULTS_DIR / "prod2_timing_raw.csv").exists()
+  with open(RESULTS_DIR / "prod2_timing_raw.csv", "a", newline="") as f:
     w = csv.DictWriter(f, fieldnames=list(raw[0].keys()))
     if new:
       w.writeheader()
@@ -151,8 +159,8 @@ def run_point(num_tokens: int, rounds: int = 10, repeats: int = 20):
                     "offload_ops": offload.get(nm, "")})
     print(f"  tokens={num_tokens} {nm:16s} pipelined {p:.4f}ms (x{base_p / p:.3f} vs xla_ref) | "
           f"per-call {b:.4f}ms (x{base_b / b:.3f}) | offload_ops={offload.get(nm)}")
-  new = not (RESULTS_DIR / "prod_summary.csv").exists()
-  with open(RESULTS_DIR / "prod_summary.csv", "a", newline="") as f:
+  new = not (RESULTS_DIR / "prod2_summary.csv").exists()
+  with open(RESULTS_DIR / "prod2_summary.csv", "a", newline="") as f:
     w = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
     if new:
       w.writeheader()
@@ -165,7 +173,7 @@ def run_sweep():
     r = subprocess.run([sys.executable, __file__, "point", str(t)])
     if r.returncode != 0:
       print(f"!!! tokens={t} exited with code {r.returncode}")
-  f = RESULTS_DIR / "prod_summary.csv"
+  f = RESULTS_DIR / "prod2_summary.csv"
   print("\nsummary CSV:", f)
   print(f.read_text() if f.exists() else "(none)")
 
