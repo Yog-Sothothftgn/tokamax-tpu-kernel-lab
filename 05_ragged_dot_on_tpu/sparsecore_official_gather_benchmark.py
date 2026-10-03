@@ -512,6 +512,120 @@ def run_window_sweep(num_rounds: int = 10, num_repeats: int = 20):
   run_trace({v: fns[v] for v in trace_set}, (x, idx))
 
 
+# ---------------------------------------------------------------------------
+# Step 4: our real packed width (1792 int32 words = a 3584-wide bf16 row packed
+# two-per-word), int32, 2048 table rows. Two separate one-variable experiments:
+#   window1792: only the window W changes (4, 8, 16 -- the sizes that can fit
+#               VMEM at this row width), index values fixed per pattern.
+#   pattern:    only the index VALUES change (same count, shape, kernel,
+#               window 8): real production dispatch indices (invalid slots
+#               -> row 0) vs uniform random vs all-zero vs real with the
+#               invalid slots replaced by random in-range rows.
+# Both always include xla_take_clip on the same indices. Everything is
+# checked exactly against jnp.take(mode="clip") before timing.
+# ---------------------------------------------------------------------------
+
+PACKED_WIDTH = 1792
+TABLE_ROWS = 2048
+
+
+def _real_dispatch_padded(n: int):
+  from sparsecore_gather_prototype import real_dispatch_indices
+  _, padded_token_idx, valid_mask, _ = real_dispatch_indices(
+      num_tokens=TABLE_ROWS, local_num_experts=64, seed=0)
+  m = int(padded_token_idx.shape[0])
+  assert n >= m, f"n={n} < m_padded={m}"
+  idx = jnp.where(padded_token_idx < 0, 0, padded_token_idx).astype(jnp.int32)
+  idx = jnp.concatenate([idx, jnp.zeros((n - m,), jnp.int32)])
+  valid = jnp.concatenate([valid_mask, jnp.zeros((n - m,), bool)])
+  return idx, valid, m
+
+
+def _index_patterns(n: int) -> dict:
+  real, valid, m = _real_dispatch_padded(n)
+  rand = jax.random.randint(jax.random.key(1), (n,), 0, TABLE_ROWS, jnp.int32)
+  pats = {
+      "real_invalid_to_row0": real,
+      "uniform_random": rand,
+      "all_zero": jnp.zeros((n,), jnp.int32),
+      "real_invalid_to_random": jnp.where(valid, real, rand),
+  }
+  print(f"[patterns] n={n} m_padded={m} valid={int(valid.sum())} "
+        f"zeros_in_real={int((real == 0).sum())} distinct_in_real={int(jnp.unique(real).shape[0])}")
+  return pats
+
+
+def _run_idx_point(x, idx, variants, label, rows, summaries, point, num_rounds, num_repeats):
+  n = int(idx.shape[0])
+  d = int(x.shape[1])
+  expected = jax.jit(lambda a, i: jnp.take(a, i, axis=0, mode="clip"))(x, idx)
+  jax.block_until_ready(expected)
+  fns = {"xla_take_clip": _rename(lambda a, i: jnp.take(a, i, axis=0, mode="clip"), "xla_take_clip")}
+  status = {}
+  for v in variants:
+    try:
+      f = make_sc_gather(v, n, d)
+      out = jax.jit(f)(x, idx)
+      jax.block_until_ready(out)
+      ok = bool(jnp.array_equal(out, expected))
+      status[v] = "exact" if ok else "MISMATCH"
+      if ok:
+        fns[v] = f
+    except Exception as e:  # noqa: BLE001
+      status[v] = f"ERROR: {type(e).__name__}: {str(e).splitlines()[0][:160]}"
+  print(f"\n[{label}] n={n} value_dim={d} correctness={status}")
+  if len(fns) == 1:
+    summaries.append({"label": label, "point": point, "status": status, "summary": None})
+    return
+  summ = time_rotated(fns, (x, idx), label, rows, num_rounds, num_repeats, {**point, "label_": label})
+  out_gb = n * d * 4 / 1e9
+  for name, sv in summ.items():
+    sv["output_GBps_pipelined"] = out_gb / sv["pipelined_median_ms"] * 1000
+  summaries.append({"label": label, "point": point, "status": status, "summary": summ})
+
+
+def _print_idx_table(summaries):
+  print("\n" + "=" * 100 + "\n(speedup vs xla_take_clip on the SAME indices; >1 means SparseCore faster)")
+  for s in summaries:
+    if s["summary"] is None:
+      print(f"{s['label']:45s} no working SC variant: {s['status']}")
+      continue
+    clip = s["summary"]["xla_take_clip"]["pipelined_median_ms"]
+    for name, v in s["summary"].items():
+      print(f"{s['label']:45s} {name:24s} pipelined {v['pipelined_median_ms']:.4f}ms "
+            f"(x{clip / v['pipelined_median_ms']:.3f} vs clip) per-call {v['per_call_median_ms']:.4f}ms "
+            f"out {v['output_GBps_pipelined']:.0f} GB/s")
+
+
+def run_window_packed(num_rounds: int = 10, num_repeats: int = 20):
+  record_environment({"window1792": True})
+  n = 5120  # divisible by W*32 for W in {4, 8, 16}, so N is identical across W
+  x = jnp.arange(TABLE_ROWS * PACKED_WIDTH, dtype=jnp.int32).reshape(TABLE_ROWS, PACKED_WIDTH)
+  pats = _index_patterns(n)
+  rows, summaries = [], []
+  variants = [f"sc_1d_w{w}_core_split" for w in (4, 8, 16)]
+  for pname in ("uniform_random", "real_invalid_to_row0"):
+    _run_idx_point(x, pats[pname], variants, f"window1792 pattern={pname}", rows, summaries,
+                   dict(pattern=pname, num_indices=n, value_dim=PACKED_WIDTH), num_rounds, num_repeats)
+  write_rows_csv(RESULTS_DIR / "window1792_timing_raw.csv", rows)
+  (RESULTS_DIR / "window1792_summary.json").write_text(json.dumps(summaries, indent=2))
+  _print_idx_table(summaries)
+
+
+def run_index_pattern(num_rounds: int = 10, num_repeats: int = 20):
+  record_environment({"index_pattern": True})
+  n = 4864  # the padded size our real kernel uses (4736 -> multiple of 256)
+  x = jnp.arange(TABLE_ROWS * PACKED_WIDTH, dtype=jnp.int32).reshape(TABLE_ROWS, PACKED_WIDTH)
+  pats = _index_patterns(n)
+  rows, summaries = [], []
+  for pname, idx in pats.items():
+    _run_idx_point(x, idx, ["sc_1d_w8_core_split"], f"pattern={pname}", rows, summaries,
+                   dict(pattern=pname, num_indices=n, value_dim=PACKED_WIDTH), num_rounds, num_repeats)
+  write_rows_csv(RESULTS_DIR / "pattern_timing_raw.csv", rows)
+  (RESULTS_DIR / "pattern_summary.json").write_text(json.dumps(summaries, indent=2))
+  _print_idx_table(summaries)
+
+
 if __name__ == "__main__":
   mode = sys.argv[1] if len(sys.argv) > 1 else "repro"
   print(f"devices: {jax.devices()}  jax: {jax.__version__}  mode: {mode}")
@@ -521,5 +635,9 @@ if __name__ == "__main__":
     run_grid()
   elif mode == "window":
     run_window_sweep()
+  elif mode == "window1792":
+    run_window_packed()
+  elif mode == "pattern":
+    run_index_pattern()
   else:
-    raise SystemExit("usage: sparsecore_official_gather_benchmark.py [repro|grid|window]")
+    raise SystemExit("usage: sparsecore_official_gather_benchmark.py [repro|grid|window|window1792|pattern]")
