@@ -597,16 +597,50 @@ def _print_idx_table(summaries):
             f"out {v['output_GBps_pipelined']:.0f} GB/s")
 
 
+def _probe_variant(variant: str, n: int, d: int) -> bool:
+  """Compile+run one SparseCore variant in its OWN process and check it is
+  exact. A Mosaic/SparseCore core halt (E0200) poisons every later program
+  in the same process, so possibly-unsupported window sizes must never share
+  a process with the real measurement. The parent must NOT have initialised
+  the TPU yet (the child needs the device)."""
+  r = subprocess.run([sys.executable, __file__, "probe", variant, str(n), str(d)],
+                     capture_output=True, text=True, timeout=600)
+  ok = r.returncode == 0 and "PROBE_RESULT exact" in r.stdout
+  tail = (r.stdout + r.stderr).strip().splitlines()
+  detail = next((l for l in tail if "PROBE_RESULT" in l or "Error" in l or "error" in l), tail[-1] if tail else "")
+  print(f"[probe] {variant} n={n} d={d}: {'OK (exact)' if ok else 'FAILED'}  {'' if ok else detail[:300]}")
+  return ok
+
+
+def run_probe(variant: str, n: int, d: int):
+  x = jnp.arange(TABLE_ROWS * d, dtype=jnp.int32).reshape(TABLE_ROWS, d)
+  idx = jax.random.randint(jax.random.key(1), (n,), 0, TABLE_ROWS, jnp.int32)
+  expected = jax.jit(lambda a, i: jnp.take(a, i, axis=0, mode="clip"))(x, idx)
+  out = jax.jit(make_sc_gather(variant, n, d))(x, idx)
+  jax.block_until_ready(out)
+  print("PROBE_RESULT exact" if bool(jnp.array_equal(out, expected)) else "PROBE_RESULT mismatch")
+
+
 def run_window_packed(num_rounds: int = 10, num_repeats: int = 20):
-  record_environment({"window1792": True})
   n = 5120  # divisible by W*32 for W in {4, 8, 16}, so N is identical across W
+  # Probe each window in its own process FIRST (the first attempt of this
+  # experiment crashed with a SparseCore core halt that then poisoned every
+  # later program in the same process, so its numbers are void).
+  variants = [v for v in (f"sc_1d_w{w}_core_split" for w in (8, 16, 4)) if _probe_variant(v, n, PACKED_WIDTH)]
+  record_environment({"window1792": True, "probed_ok": variants})
+  if not variants:
+    print("No window size passed the isolated probe -- nothing to time.")
+    return
   x = jnp.arange(TABLE_ROWS * PACKED_WIDTH, dtype=jnp.int32).reshape(TABLE_ROWS, PACKED_WIDTH)
   pats = _index_patterns(n)
   rows, summaries = [], []
-  variants = [f"sc_1d_w{w}_core_split" for w in (4, 8, 16)]
-  for pname in ("uniform_random", "real_invalid_to_row0"):
-    _run_idx_point(x, pats[pname], variants, f"window1792 pattern={pname}", rows, summaries,
-                   dict(pattern=pname, num_indices=n, value_dim=PACKED_WIDTH), num_rounds, num_repeats)
+  # Random in-range indices only: the real-dispatch pattern is known (see the
+  # `pattern` experiment) to add a large separate penalty that would mask the
+  # window effect.
+  pname = "uniform_random"
+  _run_idx_point(x, pats[pname], sorted(variants, key=lambda v: int(re.findall(r"w(\d+)", v)[0])),
+                 f"window1792 pattern={pname}", rows, summaries,
+                 dict(pattern=pname, num_indices=n, value_dim=PACKED_WIDTH), num_rounds, num_repeats)
   write_rows_csv(RESULTS_DIR / "window1792_timing_raw.csv", rows)
   (RESULTS_DIR / "window1792_summary.json").write_text(json.dumps(summaries, indent=2))
   _print_idx_table(summaries)
@@ -628,7 +662,8 @@ def run_index_pattern(num_rounds: int = 10, num_repeats: int = 20):
 
 if __name__ == "__main__":
   mode = sys.argv[1] if len(sys.argv) > 1 else "repro"
-  print(f"devices: {jax.devices()}  jax: {jax.__version__}  mode: {mode}")
+  if mode != "window1792":  # window1792 must not touch the TPU before its isolated probes
+    print(f"devices: {jax.devices()}  jax: {jax.__version__}  mode: {mode}")
   if mode == "repro":
     run_repro()
   elif mode == "grid":
@@ -639,5 +674,7 @@ if __name__ == "__main__":
     run_window_packed()
   elif mode == "pattern":
     run_index_pattern()
+  elif mode == "probe":
+    run_probe(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
   else:
-    raise SystemExit("usage: sparsecore_official_gather_benchmark.py [repro|grid|window|window1792|pattern]")
+    raise SystemExit("usage: sparsecore_official_gather_benchmark.py [repro|grid|window|window1792|pattern]  (probe is internal)")
