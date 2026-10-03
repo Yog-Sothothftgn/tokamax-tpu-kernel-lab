@@ -35,6 +35,7 @@ To run (real v6e VM only, venv active, from 05_ragged_dot_on_tpu):
   python3 -u sparsecore_gather_scale_and_split.py trace 65536 2>&1 | tee sparsecore_scale_trace.log
   python3 -u sparsecore_gather_scale_and_split.py split 2>&1 | tee sparsecore_split.log
   python3 -u sparsecore_gather_scale_and_split.py sweep2 2>&1 | tee sparsecore_scale2.log
+  python3 -u sparsecore_gather_scale_and_split.py narrow 2>&1 | tee sparsecore_narrow.log
 """
 
 import csv
@@ -381,6 +382,145 @@ def run_split(rounds: int = 10, repeats: int = 20):
   (RESULTS_DIR / "split_summary.json").write_text(json.dumps(summaries, indent=2))
 
 
+# ----------------------------------------------------------------------------
+# Step 3 (`narrow`): is the problem partial-column access of a WIDE table, or
+# just "not narrow enough"? Pure int32 gather of 1792 words per row, random
+# in-range indices, one variable at a time against the best whole-row kernel:
+#   sc_whole_w16             whole 1792-word rows, window 16 (reference SparseCore)
+#   sc_split14_w64/_w128     14 column chunks of 128 words (the narrowest legal
+#                            split, same 128-word width as the guide's rows) cut out
+#                            of the wide table with .at[idx, pl.ds(...)], one kernel,
+#                            written straight to the final output
+#   sc_narrow_raw_w128       the table is ALREADY a narrow [rows*14, 128] table (passed
+#                            as an argument), indices expanded to idx*14 + c, the guide's
+#                            full-narrow-row kernel (2D index, window 128, core split);
+#                            output left as [N*14, 128]  -> kernel + index expansion only
+#   sc_narrow_restored_w128  same, output reshaped back to [N, 1792]
+#   sc_narrow_fullprep_w128  same, but ALSO reshapes the wide table to narrow inside the
+#                            call (everything needed if table and output must stay wide)
+# Pre-registered prediction: the (steps, bytes/step) fit says the kernel part is the
+# same as the whole-row kernel (equal steps and 64 KiB per step for window 128), and the
+# guide's own 128-wide benchmark already ran at about the same output rate (566 GB/s) as
+# our wide-row kernels (575 GB/s). Differences between the narrow variants should come
+# from the reshape/relayout copies, not from the gather.
+# ----------------------------------------------------------------------------
+
+NARROW_NAMES = ("sc_whole_w16", "sc_split14_w64", "sc_split14_w128",
+                "sc_narrow_raw_w128", "sc_narrow_restored_w128", "sc_narrow_fullprep_w128")
+
+
+def _narrow_grid_ok(name: str, n: int) -> bool:
+  if name == "sc_whole_w16":
+    return n % 16 == 0 and (n // 16) % 32 == 0
+  if name.startswith("sc_split14_w"):
+    w = int(name.rsplit("w", 1)[1])
+    return n % w == 0 and ((n // w) * 14) % 32 == 0
+  return ((n * 14) // 128) % 32 == 0 and (n * 14) % 128 == 0
+
+
+def make_narrow_variant(name: str, n: int, d: int = PACKED_WORDS, rows: int = 2048):
+  k, cw = d // 128, 128
+  if name == "sc_whole_w16":
+    g = make_split_gather(n, d, 1, 16)
+    fn = lambda x, idx, xn: g(x, idx)  # noqa: E731
+  elif name.startswith("sc_split14_w"):
+    g = make_split_gather(n, d, 14, int(name.rsplit("w", 1)[1]))
+    fn = lambda x, idx, xn: g(x, idx)  # noqa: E731
+  else:
+    kernel = ob.make_sc_gather("sc_official_core_split", n * k, cw)
+
+    def expand(idx):
+      return (idx[:, None] * k + jnp.arange(k, dtype=jnp.int32)[None, :]).reshape(-1)
+
+    if name == "sc_narrow_raw_w128":
+      fn = lambda x, idx, xn: kernel(xn, expand(idx))  # noqa: E731
+    elif name == "sc_narrow_restored_w128":
+      fn = lambda x, idx, xn: kernel(xn, expand(idx)).reshape(n, d)  # noqa: E731
+    else:
+      fn = lambda x, idx, xn: kernel(x.reshape(rows * k, cw), expand(idx)).reshape(n, d)  # noqa: E731
+
+  def named(x, idx, xn):
+    return fn(x, idx, xn)
+  named.__name__ = named.__qualname__ = name
+  return named
+
+
+def _narrow_inputs(n: int, d: int = PACKED_WORDS, rows: int = 2048):
+  x = jnp.arange(rows * d, dtype=jnp.int32).reshape(rows, d)
+  idx = jax.random.randint(jax.random.key(1), (n,), 0, rows, jnp.int32)
+  xn = x.reshape(rows * (d // 128), 128)
+  return x, idx, xn
+
+
+def _narrow_exact(name: str, out, expected, n: int, d: int = PACKED_WORDS) -> bool:
+  if name == "sc_narrow_raw_w128":
+    out = out.reshape(n, d)
+  return bool(jnp.array_equal(out, expected))
+
+
+def run_probe_narrow(name: str, n: int):
+  x, idx, xn = _narrow_inputs(n)
+  expected = jnp.take(x, idx, axis=0, mode="clip")
+  out = jax.jit(make_narrow_variant(name, n))(x, idx, xn)
+  jax.block_until_ready(out)
+  print("PROBE_RESULT exact" if _narrow_exact(name, out, expected, n) else "PROBE_RESULT mismatch")
+
+
+def _probe_narrow(name: str, n: int) -> bool:
+  r = subprocess.run([sys.executable, __file__, "probe_narrow", name, str(n)], capture_output=True, text=True,
+                     timeout=900)
+  ok = r.returncode == 0 and "PROBE_RESULT exact" in r.stdout
+  tail = (r.stdout + r.stderr).strip().splitlines()
+  detail = next((ln for ln in tail if "PROBE_RESULT" in ln or "Error" in ln), tail[-1] if tail else "")
+  print(f"[probe] {name} n={n}: {'OK (exact)' if ok else 'FAILED'} {'' if ok else detail[:300]}")
+  return ok
+
+
+def run_narrow(rounds: int = 10, repeats: int = 20):
+  ns = (8192, 65536)
+  alive = {n: [nm for nm in NARROW_NAMES if _narrow_grid_ok(nm, n) and _probe_narrow(nm, n)] for n in ns}
+  RESULTS_DIR.mkdir(exist_ok=True)
+  ob.RESULTS_DIR = RESULTS_DIR
+  ob.record_environment({"narrow_experiment": True, "probed_ok": alive})
+  rows_out, summaries = [], []
+  for n in ns:
+    x, idx, xn = _narrow_inputs(n)
+    expected = jnp.take(x, idx, axis=0, mode="clip")
+    fns = {"xla_take_clip": (lambda a, i, b: jnp.take(a, i, axis=0, mode="clip"))}
+    fns["xla_take_clip"].__name__ = "xla_take_clip"
+    for nm in alive[n]:
+      f = make_narrow_variant(nm, n)
+      if _narrow_exact(nm, jax.jit(f)(x, idx, xn), expected, n):
+        fns[nm] = f
+      else:
+        print(f"[correctness n={n}] {nm}: MISMATCH (dropped)")
+    summ = ob.time_rotated(fns, (x, idx, xn), f"narrow n={n}", rows_out, rounds, repeats, dict(n=n, d=PACKED_WORDS))
+    out_gb = n * PACKED_WORDS * 4 / 1e9
+    print(f"[n={n}] output {out_gb * 1000:.1f} MB (the fit below applies to the kernel part only)")
+    for nm in fns:
+      s = summ[nm]
+      line = f"  {nm:26s} pipelined {s['pipelined_median_ms']:.4f}ms  out {out_gb / s['pipelined_median_ms'] * 1000:.0f} GB/s"
+      if nm == "sc_whole_w16":
+        steps, step_bytes = (n // 16) / 32, 16 * d_bytes()
+      elif nm.startswith("sc_split14_w"):
+        w = int(nm.rsplit("w", 1)[1])
+        steps, step_bytes = (n // w) * 14 / 32, w * 128 * 4
+      elif nm.startswith("sc_narrow"):
+        steps, step_bytes = (n * 14 // 128) / 32, 128 * 128 * 4
+      else:
+        steps = None
+      if steps is not None:
+        line += f" | fit predicts {steps * (0.573 + step_bytes / 20.8e3) / 1000:.4f}ms (kernel only)"
+      print(line)
+    summaries.append({"n": n, "summary": summ})
+  ob.write_rows_csv(RESULTS_DIR / "narrow_timing_raw.csv", rows_out)
+  (RESULTS_DIR / "narrow_summary.json").write_text(json.dumps(summaries, indent=2))
+
+
+def d_bytes() -> int:
+  return PACKED_WORDS * 4
+
+
 if __name__ == "__main__":
   mode = sys.argv[1] if len(sys.argv) > 1 else "sweep"
   if mode == "sweep":
@@ -393,6 +533,10 @@ if __name__ == "__main__":
     run_trace(int(sys.argv[2]) if len(sys.argv) > 2 else 65536)
   elif mode == "split":
     run_split()
+  elif mode == "narrow":
+    run_narrow()
+  elif mode == "probe_narrow":
+    run_probe_narrow(sys.argv[2], int(sys.argv[3]))
   elif mode == "probe_split":
     run_probe_split(sys.argv[2], int(sys.argv[3]))
   else:
