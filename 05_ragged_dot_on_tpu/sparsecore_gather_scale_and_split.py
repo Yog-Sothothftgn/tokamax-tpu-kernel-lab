@@ -34,6 +34,7 @@ To run (real v6e VM only, venv active, from 05_ragged_dot_on_tpu):
   python3 -u sparsecore_gather_scale_and_split.py sweep 2>&1 | tee sparsecore_scale_sweep.log
   python3 -u sparsecore_gather_scale_and_split.py trace 65536 2>&1 | tee sparsecore_scale_trace.log
   python3 -u sparsecore_gather_scale_and_split.py split 2>&1 | tee sparsecore_split.log
+  python3 -u sparsecore_gather_scale_and_split.py sweep2 2>&1 | tee sparsecore_scale2.log
 """
 
 import csv
@@ -52,7 +53,7 @@ sys.path.insert(0, str(_HERE))
 
 import sparsecore_gather_tokamax_comparison as tc  # noqa: E402
 import sparsecore_official_gather_benchmark as ob  # noqa: E402
-from sparsecore_gather_bf16_colhalf import _named  # noqa: E402
+from sparsecore_gather_bf16_colhalf import _named, pack_colhalf  # noqa: E402
 import sparsecore_gather_device_trace as dt  # noqa: E402
 
 RESULTS_DIR = _HERE / "sparsecore_scale_split_results"
@@ -62,6 +63,47 @@ VALID_FRACTION = 0.458  # 2167 / 4736 in the real dispatch
 SWEEP_NS = (4096, 16384, 65536, 262144, 524288)
 DEFAULT_TABLE_ROWS = 2048
 CANDS = ("xla_ref", "ours_unpack_outside", "tokamax_v2")
+
+
+# ----------------------------------------------------------------------------
+# Extra candidates for `sweep2`. Each differs from its parent in ONE thing:
+#   ours_fusedmask:        ours_unpack_outside with the mask applied to the packed
+#                          int32 words BEFORE the unpack (zero words unpack to +0.0
+#                          bf16 in both halves, bit-identical to masking after), so
+#                          XLA can fuse mask + unpack + concatenate into one pass
+#                          (in the first sweep's trace they were two separate passes).
+#   xla_packed_fusedmask:  same wrapper as ours_fusedmask (live column-half packing,
+#                          masked unpack) but the int32 row gather is plain XLA
+#                          instead of the SparseCore kernel.
+# ----------------------------------------------------------------------------
+
+def _unpack_masked(g, mask):
+  g = jnp.where(mask[:, None], g, jnp.zeros_like(g))
+  bits = g.view(jnp.uint32)
+  lo = (bits & 0xFFFF).astype(jnp.uint16).view(jnp.bfloat16)
+  hi = (bits >> 16).astype(jnp.uint16).view(jnp.bfloat16)
+  return jnp.concatenate([lo, hi], axis=-1)
+
+
+def ours_fusedmask(x, idx, mask):
+  from jax.experimental.pallas import tpu as pltpu
+  sc = pltpu.get_tpu_info().sparse_core
+  n = idx.shape[0]
+  quantum = 8 * sc.num_cores * sc.num_subcores
+  pad = (-n) % quantum
+  safe = jnp.where(idx < 0, 0, idx).astype(jnp.int32)
+  safe_k = jnp.pad(safe, (0, pad)) if pad else safe
+  packed = pack_colhalf(x)
+  g = ob.make_sc_gather("sc_1d_w8_core_split", n + pad, packed.shape[1])(packed, safe_k)
+  if pad:
+    g = g[:n]
+  return _unpack_masked(g, mask)
+
+
+def xla_packed_fusedmask(x, idx, mask):
+  packed = pack_colhalf(x)
+  g = jnp.take(packed, jnp.maximum(idx, 0), axis=0, mode="clip")
+  return _unpack_masked(g, mask)
 
 
 def _inflight_for(out_bytes: int) -> int:
@@ -101,7 +143,7 @@ def _sc_offload_ops(fn, args) -> int:
     return -1
 
 
-def run_point(n: int, table_rows: int, rounds: int = 10, repeats: int = 20):
+def run_point(n: int, table_rows: int, extended: bool = False, rounds: int = 10, repeats: int = 20):
   from jax.experimental.pallas import tpu as pltpu
   assert pltpu.get_tpu_info().sparse_core is not None
   x, idx, mask = make_scale_inputs(n, table_rows)
@@ -112,6 +154,11 @@ def run_point(n: int, table_rows: int, rounds: int = 10, repeats: int = 20):
         f"valid={int(mask.sum())} #####")
   fns_all = {"xla_ref": tc.reference_gather, "ours_unpack_outside": tc.ours_unpack_outside,
              "tokamax_v2": tc.tokamax_v2}
+  if extended:
+    fns_all = {"xla_ref": tc.reference_gather, "xla_packed_fusedmask": xla_packed_fusedmask,
+               "ours_unpack_outside": tc.ours_unpack_outside, "ours_fusedmask": ours_fusedmask,
+               "tokamax_v2": tc.tokamax_v2}
+  prefix = "scale2" if extended else "scale"
   expected = jax.jit(tc.reference_gather)(*args)
   jax.block_until_ready(expected)
   fns, status, offload = {}, {}, {}
@@ -162,7 +209,7 @@ def run_point(n: int, table_rows: int, rounds: int = 10, repeats: int = 20):
     for pos, nm in enumerate(names[rot:] + names[:rot]):
       raw.append({"n": n, "table_rows": table_rows, "inflight": k, "round": r, "pos": pos, "candidate": nm,
                   "pipelined_ms": f"{pipelined(jitted[nm]):.5f}", "per_call_ms": f"{blocking(jitted[nm]):.5f}"})
-  _append_csv(RESULTS_DIR / "scale_timing_raw.csv", raw)
+  _append_csv(RESULTS_DIR / f"{prefix}_timing_raw.csv", raw)
 
   def med(nm, key):
     return ob._med([float(r[key]) for r in raw if r["candidate"] == nm])
@@ -176,7 +223,7 @@ def run_point(n: int, table_rows: int, rounds: int = 10, repeats: int = 20):
                     "speedup_vs_xla_per_call": f"{base_b / b:.3f}", "offload_ops": offload.get(nm, "")})
     print(f"  N={n} rows={table_rows} {nm:20s} pipelined {p:.4f}ms (x{base_p / p:.3f}) | "
           f"per-call {b:.4f}ms (x{base_b / b:.3f}) | offload_ops={offload.get(nm)}")
-  _append_csv(RESULTS_DIR / "scale_summary.csv", summary)
+  _append_csv(RESULTS_DIR / f"{prefix}_summary.csv", summary)
 
 
 def run_sweep():
@@ -188,6 +235,21 @@ def run_sweep():
       print(f"!!! point N={n} table_rows={rows} exited with code {r.returncode}")
   print("\nsummary CSV:", RESULTS_DIR / "scale_summary.csv")
   print((RESULTS_DIR / "scale_summary.csv").read_text() if (RESULTS_DIR / "scale_summary.csv").exists() else "(none)")
+
+
+def run_sweep2():
+  """Table-size control (only the number of table rows changes, N fixed) plus
+  production-proportional points (table rows ~ N / 2.31, the ratio of the real
+  dispatch: 4736 slots for 2048 tokens), with the two extra candidates."""
+  RESULTS_DIR.mkdir(exist_ok=True)
+  points = [(65536, r) for r in (2048, 8192, 32768, 131072)] + [(16384, 7168), (65536, 28672), (262144, 114688)]
+  for n, rows in points:
+    r = subprocess.run([sys.executable, __file__, "point", str(n), str(rows), "ext"])
+    if r.returncode != 0:
+      print(f"!!! point N={n} table_rows={rows} exited with code {r.returncode}")
+  f = RESULTS_DIR / "scale2_summary.csv"
+  print("\nsummary CSV:", f)
+  print(f.read_text() if f.exists() else "(none)")
 
 
 def run_trace(n: int):
@@ -246,9 +308,17 @@ SPLIT_VARIANTS = {  # name -> (chunks, window); per-buffer bytes = window * (d/c
     "sc_whole_w16": (1, 16),
     "sc_split2_w16": (2, 16),
     "sc_split2_w32": (2, 32),
-    "sc_split4_w32": (4, 32),
-    "sc_split4_w64": (4, 64),
+    # A 4-way split (448 words) is NOT possible: the column offset must be a multiple of the
+    # 128-word tile ("Offsets along tiled dimensions must be aligned to tiles", measured).
+    # 1792 = 14 x 128, so the legal splits are 2 (896), 7 (256), 14 (128).
+    "sc_split7_w32": (7, 32),
+    "sc_split7_w64": (7, 64),
 }
+
+
+def _grid_ok(name: str, n: int) -> bool:
+  chunks, window = SPLIT_VARIANTS[name]
+  return n % window == 0 and ((n // window) * chunks) % 32 == 0
 
 
 def _probe_split(name: str, n: int) -> bool:
@@ -273,7 +343,7 @@ def run_probe_split(name: str, n: int):
 
 def run_split(rounds: int = 10, repeats: int = 20):
   ns = (5120, 65536)
-  alive = {n: [nm for nm in SPLIT_VARIANTS if _probe_split(nm, n)] for n in ns}  # TPU untouched in this process
+  alive = {n: [nm for nm in SPLIT_VARIANTS if _grid_ok(nm, n) and _probe_split(nm, n)] for n in ns}  # TPU untouched in this process
   RESULTS_DIR.mkdir(exist_ok=True)
   ob.RESULTS_DIR = RESULTS_DIR
   ob.record_environment({"split_experiment": True, "probed_ok": alive})
@@ -316,7 +386,9 @@ if __name__ == "__main__":
   if mode == "sweep":
     run_sweep()
   elif mode == "point":
-    run_point(int(sys.argv[2]), int(sys.argv[3]))
+    run_point(int(sys.argv[2]), int(sys.argv[3]), extended=(len(sys.argv) > 4 and sys.argv[4] == "ext"))
+  elif mode == "sweep2":
+    run_sweep2()
   elif mode == "trace":
     run_trace(int(sys.argv[2]) if len(sys.argv) > 2 else 65536)
   elif mode == "split":
