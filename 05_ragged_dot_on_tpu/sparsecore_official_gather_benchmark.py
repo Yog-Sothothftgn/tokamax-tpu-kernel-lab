@@ -385,6 +385,18 @@ def _grid_point(batch_size, value_dim, num_indices, sc_variants, rows, all_summa
   jax.block_until_ready(expected)
   fns = {"xla_take": _rename(xla_take, "xla_take")}
   status = {}
+  # Second XLA baseline: identical except mode="clip", i.e. without the
+  # out-of-bounds fill handling that jnp.take's default mode adds (the repro
+  # trace showed a separate `broadcast_select_fusion` next to the gather
+  # fusion). Indices here are always in bounds, so outputs are identical.
+  # Speedups below stay relative to `xla_take` (the guide's own baseline).
+  f_clip = _rename(lambda a, i: jnp.take(a, i, axis=0, mode="clip"), "xla_take_clip")
+  out = jax.jit(f_clip)(x, idx)
+  jax.block_until_ready(out)
+  status["xla_take_clip"] = "exact" if bool(jnp.array_equal(out, expected)) else "MISMATCH"
+  if status["xla_take_clip"] == "exact":
+    fns["xla_take_clip"] = f_clip
+  del out
   for v in sc_variants:
     try:
       f = make_sc_gather(v, num_indices, value_dim)
@@ -401,7 +413,7 @@ def _grid_point(batch_size, value_dim, num_indices, sc_variants, rows, all_summa
   print(f"\n[grid point {label}] batch={batch_size} value_dim={value_dim} num_indices={num_indices} "
         f"correctness={status}")
   point = dict(batch_size=batch_size, value_dim=value_dim, num_indices=num_indices)
-  if len(fns) > 1:
+  if any(n.startswith("sc_") for n in fns):
     all_summaries.append({"point": point, "status": status,
                           "summary": time_rotated(fns, (x, idx), label, rows, num_rounds, num_repeats, point)})
   else:
