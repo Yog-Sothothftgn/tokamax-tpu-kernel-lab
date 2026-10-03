@@ -263,6 +263,8 @@ def record_environment() -> dict:
         "for the other version -- review the copied files in "
         f"{dest} before trusting any Tokamax result.\n"
     )
+  elif "tokamax_environment_error" in env:
+    print("\nTokamax could not be inspected (see the error above) -- NOTHING was verified about the installed files.")
   else:
     print("\nInstalled Tokamax ragged_gather files match the upstream version that was read (all hashes equal).")
   return env
