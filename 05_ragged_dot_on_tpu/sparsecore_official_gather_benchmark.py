@@ -52,6 +52,11 @@ To run (real v6e VM only, from 05_ragged_dot_on_tpu, venv active):
       2>&1 | tee sparsecore_official_repro.log
   JAX_TRACEBACK_FILTERING=off python3 -u sparsecore_official_gather_benchmark.py grid \
       2>&1 | tee sparsecore_official_grid.log
+  JAX_TRACEBACK_FILTERING=off python3 -u sparsecore_official_gather_benchmark.py window       2>&1 | tee sparsecore_official_window.log
+`window`: only the window size W (8..128) changes, with int32, value_dim=128,
+4,194,304 indices, 1D ref indices, cross-core split all fixed; the official
+W=128 2D-index version is kept as a reference, so "window size" and "1D vs 2D
+index form at W=128" are separated.
 Run `repro` first and look at it before running `grid`.
 """
 
@@ -60,6 +65,7 @@ import csv
 import datetime
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -117,7 +123,12 @@ def make_sc_gather(variant: str, num_indices: int, value_dim: int):
       "sc_official_verbatim": dict(window=128, index_2d=True, core_axis="subcore"),
       "sc_official_core_split": dict(window=128, index_2d=True, core_axis=("core", "subcore")),
       "sc_w8_1d_core_split": dict(window=8, index_2d=False, core_axis=("core", "subcore")),
-  }[variant]
+  }.get(variant)
+  if cfg is None:
+    # "sc_1d_w<W>_core_split": 1D ref indices, window W, tuple core axes.
+    m = re.fullmatch(r"sc_1d_w(\d+)_core_split", variant)
+    assert m, f"unknown variant {variant}"
+    cfg = dict(window=int(m.group(1)), index_2d=False, core_axis=("core", "subcore"))
   window, index_2d, core_axis = cfg["window"], cfg["index_2d"], cfg["core_axis"]
   assert num_indices % window == 0
   vector_mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
@@ -456,6 +467,51 @@ def run_grid(num_rounds: int = 10, num_repeats: int = 20):
             f"{v['speedup_vs_xla_pipelined']:>9.3f}x {v['speedup_vs_xla_per_call']:>9.3f}x")
 
 
+# ---------------------------------------------------------------------------
+# Step 3: window-size sweep. Fixed: int32, value_dim=128, num_indices=4,194,304,
+# 1D ref indices, cross-core split, same inputs/timing. Only the window W
+# changes (8..128). The official W=128 2D-index version is kept as the
+# reference, which also separates "1D vs 2D at W=128" from "window size".
+# ---------------------------------------------------------------------------
+
+def run_window_sweep(num_rounds: int = 10, num_repeats: int = 20):
+  record_environment({"window_sweep": True})
+  windows = (8, 16, 32, 64, 128)
+  n = num_indices_for(OFFICIAL_NUM_STEPS)
+  sc_variants = ["sc_official_core_split"] + [f"sc_1d_w{w}_core_split" for w in windows]
+
+  small = check_correctness(sc_variants, BATCH_SIZE, VALUE_DIM, num_steps=2, label="small, num_steps=2")
+  full = check_correctness(sc_variants, BATCH_SIZE, VALUE_DIM, num_steps=OFFICIAL_NUM_STEPS,
+                           label=f"full scale, num_steps={OFFICIAL_NUM_STEPS}")
+  (RESULTS_DIR / "window_correctness.json").write_text(json.dumps({"small": small, "full": full}, indent=2))
+  working = [v for v in sc_variants if small.get(v) is True and full.get(v) is True]
+  if not working:
+    print("No SparseCore variant passed correctness -- stopping before timing.")
+    return
+
+  x, idx = make_inputs(BATCH_SIZE, VALUE_DIM, n)
+  fns = {"xla_take": _rename(xla_take, "xla_take"),
+         "xla_take_clip": _rename(lambda a, i: jnp.take(a, i, axis=0, mode="clip"), "xla_take_clip")}
+  for v in working:
+    fns[v] = make_sc_gather(v, n, VALUE_DIM)
+  rows = []
+  summary = time_rotated(fns, (x, idx), "window sweep", rows, num_rounds, num_repeats,
+                         point=dict(batch_size=BATCH_SIZE, value_dim=VALUE_DIM, num_indices=n))
+  write_rows_csv(RESULTS_DIR / "window_timing_raw.csv", rows)
+  (RESULTS_DIR / "window_summary.json").write_text(json.dumps(summary, indent=2))
+
+  clip_ms = summary["xla_take_clip"]["pipelined_median_ms"]
+  print("\n[window sweep table] output bytes = num_indices*value_dim*4; speedup vs xla_take_clip")
+  out_gb = n * VALUE_DIM * 4 / 1e9
+  for v in working:
+    s = summary[v]
+    print(f"  {v:26s} pipelined {s['pipelined_median_ms']:.4f}ms  vs clip x{clip_ms / s['pipelined_median_ms']:.3f}  "
+          f"output GB/s={out_gb / s['pipelined_median_ms'] * 1000:.0f}")
+
+  trace_set = [v for v in ("sc_official_core_split", "sc_1d_w8_core_split", "sc_1d_w128_core_split") if v in working]
+  run_trace({v: fns[v] for v in trace_set}, (x, idx))
+
+
 if __name__ == "__main__":
   mode = sys.argv[1] if len(sys.argv) > 1 else "repro"
   print(f"devices: {jax.devices()}  jax: {jax.__version__}  mode: {mode}")
@@ -463,5 +519,7 @@ if __name__ == "__main__":
     run_repro()
   elif mode == "grid":
     run_grid()
+  elif mode == "window":
+    run_window_sweep()
   else:
-    raise SystemExit("usage: sparsecore_official_gather_benchmark.py [repro|grid]")
+    raise SystemExit("usage: sparsecore_official_gather_benchmark.py [repro|grid|window]")
