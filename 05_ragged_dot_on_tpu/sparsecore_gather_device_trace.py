@@ -142,7 +142,7 @@ def _mean(vals):
   return sum(vals) / len(vals) if vals else float("nan")
 
 
-def analyze_trace(module_names=MODULE_NAMES, trace_dir: str = TRACE_DIR) -> None:
+def analyze_trace(module_names=MODULE_NAMES, trace_dir: str = TRACE_DIR, top_n_ops: int = 8) -> None:
   path = _find_trace_json(trace_dir)
   print(f"Analyzing {path}")
   with gzip.open(path, "rt") as f:
@@ -202,8 +202,8 @@ def analyze_trace(module_names=MODULE_NAMES, trace_dir: str = TRACE_DIR) -> None
       for tk in tc_op_tracks:
         for e in inside(by_track[tk], lo, hi):
           op_totals[e["name"]] += e["dur"]
-    print("TensorCore XLA ops inside the module (mean us per call, top 8):")
-    for name, total in sorted(op_totals.items(), key=lambda kv: -kv[1])[:8]:
+    print(f"TensorCore XLA ops inside the module (mean us per call, top {top_n_ops}):")
+    for name, total in sorted(op_totals.items(), key=lambda kv: -kv[1])[:top_n_ops]:
       print(f"  {name!r:50s} {total / len(instances):9.1f}us")
 
     # SparseCore offload kernels belonging to each instance. A kernel
@@ -224,6 +224,7 @@ def analyze_trace(module_names=MODULE_NAMES, trace_dir: str = TRACE_DIR) -> None
     kernels_per_call = []
     run_events_per_sc_kernel = []   # ep_run_kernel total across ALL 16 TECs of ONE SparseCore, ONE kernel
     run_events_per_call = []        # ep_run_kernel total across BOTH SparseCores and every kernel of ONE call
+    sc_program_names = set()        # names of the enclosing per-kernel span events seen on TEC tracks
     steps_per_tec = []
     busy_fracs, run_durs = [], []
     wait_in_per_tec, wait_out_per_tec = [], []
@@ -246,7 +247,9 @@ def analyze_trace(module_names=MODULE_NAMES, trace_dir: str = TRACE_DIR) -> None
           for tk in tec_tracks:
             if tk[0] != pid:
               continue
-            tevs = [t for t in inside(by_track[tk], a, b + 1) if t["name"].startswith("ep_")]
+            all_tevs = inside(by_track[tk], a, b + 1)
+            sc_program_names.update(t["name"] for t in all_tevs if not t["name"].startswith("ep_"))
+            tevs = [t for t in all_tevs if t["name"].startswith("ep_")]
             if not tevs:
               continue
             runs = [t for t in tevs if t["name"] == "ep_run_kernel"]
@@ -281,6 +284,9 @@ def analyze_trace(module_names=MODULE_NAMES, trace_dir: str = TRACE_DIR) -> None
     print(f"ep_run_kernel TOTAL per call across BOTH SparseCores and all kernels={_mean(run_events_per_call):.1f} "
           f"(= grid steps actually executed; equals the grid size x number of kernels if the work is split, "
           f"2x that if both SparseCores each run everything)")
+    print(f"SparseCore program names seen on TEC tracks inside this module: {sorted(sc_program_names)} "
+          "(confirms WHICH kernel ran on the SparseCores; NOTE for nested emit_pipeline kernels, ep_run_kernel "
+          "counts include BOTH pipeline levels, so they are not a plain grid-step count)")
     print("  -> compare that total with the kernel's grid size (num_indices // window_size = 592): "
           "~592 means this SparseCore alone runs the whole grid (so both SparseCores together do it TWICE); "
           "~296 would mean the grid is split across both SparseCores.")
