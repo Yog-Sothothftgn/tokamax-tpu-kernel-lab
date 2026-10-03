@@ -518,8 +518,9 @@ def run_window_sweep(num_rounds: int = 10, num_repeats: int = 20):
 #   window1792: only the window W changes (4, 8, 16 -- the sizes that can fit
 #               VMEM at this row width), index values fixed per pattern.
 #   pattern:    only the index VALUES change (same count, shape, kernel,
-#               window 8): real production dispatch indices (invalid slots
-#               -> row 0) vs uniform random vs all-zero vs real with the
+#               window 8): the public production indices with the -1 sentinel mapped to row 0
+#               (OUR reconstruction; production's own gather vector differs, see
+#               sparsecore_gather_production_routing.py) vs uniform random vs all-zero vs real with the
 #               invalid slots replaced by random in-range rows.
 # Both always include xla_take_clip on the same indices. Everything is
 # checked exactly against jnp.take(mode="clip") before timing.

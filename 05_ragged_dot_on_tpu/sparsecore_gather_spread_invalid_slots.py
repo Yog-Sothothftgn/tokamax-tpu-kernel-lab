@@ -1,4 +1,11 @@
-"""One-variable end-to-end control: what happens to the full bf16 dispatch
+"""CORRECTION (added after reading filter_and_pad_to_shard_jittable): production
+does not gather with "invalid slots -> row 0". That is how THIS arc's harness
+reconstructs the indices from the public -1 sentinel. Production gathers with
+the internal sorted_token_idx_all, whose invalid tail holds ascending real token
+ids (each repeated up to top_k times). See sparsecore_gather_production_routing.py.
+Everything below describes the harness's "row0" pattern, not production's.
+
+One-variable end-to-end control: what happens to the full bf16 dispatch
 gather (XLA / our latest SparseCore version / Tokamax mosaic_tpu_v2) when ONLY
 the index values stored in the INVALID slots change.
 
