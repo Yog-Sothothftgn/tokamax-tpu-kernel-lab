@@ -63,7 +63,7 @@ def spread_invalid_slots(idx, mask, num_rows):
   return jnp.where(mask, idx, rnd)
 
 
-def main() -> None:
+def main(trace_only: bool = False) -> None:
   from jax.experimental.pallas import tpu as pltpu
   print(f"devices: {jax.devices()}")
   if pltpu.get_tpu_info().sparse_core is None:
@@ -116,6 +116,12 @@ def main() -> None:
     return
 
   names = list(entries)
+  if not trace_only:
+    run_timing(entries, names)
+  run_trace(entries)
+
+
+def run_timing(entries, names) -> None:
   jitted = {nm: jax.jit(fn) for nm, (fn, _a) in entries.items()}
   for nm, f in jitted.items():
     jax.block_until_ready(f(*entries[nm][1]))
@@ -169,9 +175,24 @@ def main() -> None:
     if a and b:
       print(f"  {cname:22s} x{a['pipe'] / b['pipe']:.3f} / x{a['call'] / b['call']:.3f}")
 
+
+def run_trace(entries) -> None:
   # Device trace: module-level spans + confirmation that SparseCore programs ran.
+  # The row0 and spread entries of one candidate are the SAME computation (only
+  # the argument values differ). In the first run the profiler attributed all
+  # calls of both entries to the first-compiled module name (20 instances under
+  # the row0 name, 0 under the spread name), so the module spans there mixed
+  # both index patterns. To get one module per entry, each entry's trace
+  # wrapper clamps the indices with a DIFFERENT constant (indices are always
+  # >= 0 so the clamp never changes a value); that changes the HLO.
   print("\n" + "=" * 78 + "\nDEVICE TRACE (module spans; nested ep_* totals are NOT interpreted)\n" + "=" * 78)
-  tjit = {nm: jax.jit(_named(nm, fn)) for nm, (fn, _a) in entries.items()}
+
+  def wrapped(nm, fn, const):
+    def f(x, idx, mask):
+      return fn(x, jnp.maximum(idx, jnp.int32(const)), mask)
+    return _named(nm, f)
+
+  tjit = {nm: jax.jit(wrapped(nm, fn, -(k + 1))) for k, (nm, (fn, _a)) in enumerate(entries.items())}
   for nm, f in tjit.items():
     jax.block_until_ready(f(*entries[nm][1]))
   with jax.profiler.trace(TRACE_DIR):
@@ -184,4 +205,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-  main()
+  main(trace_only=(len(sys.argv) > 1 and sys.argv[1] == "trace"))
