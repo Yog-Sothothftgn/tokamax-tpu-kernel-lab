@@ -164,6 +164,35 @@ def reference_matmul(x: jax.Array, w_deq_nk: jax.Array) -> jax.Array:
   return jnp.dot(x, w_deq_nk.T, preferred_element_type=jnp.float32).astype(x.dtype)
 
 
+def check_scale_padding(scale: jax.Array, scale_p: jax.Array, kh: int) -> dict:
+  """Valid range of the zero-padded scale and of the in-kernel expansion matrix:
+    * the first G = K/32 columns of the padded scale equal the original scale bytes,
+    * every padded column is zero,
+    * every packed column j in [0, K/2) maps to exactly one REAL group j // 16 < G
+      (E[g, j] = 1 iff j // 16 == g), and no padded group g >= G receives any column,
+    * the original scale has no byte 0 (its in-kernel value would differ from the
+      reference's 2^-127) and no byte 255 (inf / NaN in E8M0)."""
+  g = scale.shape[1]
+  gp = scale_p.shape[1]
+  sc, sp = np.asarray(scale), np.asarray(scale_p)
+  j = np.arange(kh)
+  groups = j // HALF_GROUP
+  covered = np.bincount(groups, minlength=gp)
+  res = {
+      "G_real": int(g), "G_padded": int(gp), "packed_cols": int(kh),
+      "shape_ok": sp.shape == (sc.shape[0], gp) and gp % 128 == 0 and gp >= g,
+      "real_columns_unchanged": bool(np.array_equal(sp[:, :g], sc)),
+      "padded_columns_all_zero": bool(not sp[:, g:].any()),
+      "all_packed_cols_map_to_real_group": bool(groups.max() < g and covered[:g].min() == HALF_GROUP
+                                                 and covered[:g].max() == HALF_GROUP),
+      "padded_groups_receive_no_column": bool(covered[g:].sum() == 0),
+      "scale_byte_min": int(sc.min()), "scale_byte_max": int(sc.max()),
+      "no_zero_or_255_bytes": bool(sc.min() >= 1 and sc.max() <= 254),
+  }
+  res["ok"] = all(v for k, v in res.items() if isinstance(v, bool))
+  return res
+
+
 def inspect_compiled(fn, args, n: int, k: int) -> dict:
   """Compiled-module check that the call's inputs are the compressed arrays and
   that no full-size bf16/f32 weight matrix exists as an XLA-level array."""
