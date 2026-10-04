@@ -53,6 +53,8 @@ Failures are recorded per candidate (A_status.json) and never stop the other
 candidates. If Tokamax shows no improvement, nothing larger is added this round.
 
 Run (v6e VM): python tokamax_narrow_gather_experiment.py 2>&1 | tee tokamax_narrow.log
+  Re-derive the summary CSVs from the saved raw rows:  python tokamax_narrow_gather_experiment.py summarize
+  Device trace only:                                  python tokamax_narrow_gather_experiment.py trace
 """
 
 import inspect
@@ -213,7 +215,7 @@ def run_trace(n: int):
   dt.analyze_trace(module_names=tuple(runs.keys()), trace_dir="/tmp/tokamax_narrow_trace", top_n_ops=10)
 
 
-def _time_group(label, fns, args, expected, raw, rows, n, calibre, ref_name, status):
+def _time_group(label, fns, args, expected, raw, n, calibre, ref_name, status):
   """Correctness for each candidate (shape, dtype, raw bits), then rotated timing of the exact ones."""
   ok_fns = {}
   for name, fn in fns.items():
@@ -236,12 +238,50 @@ def _time_group(label, fns, args, expected, raw, rows, n, calibre, ref_name, sta
     print(f"[{label}] no timing (reference {ref_name} or all other candidates failed)")
     return
   ordered = {ref_name: ok_fns.pop(ref_name), **ok_fns}
-  summ = hc.rotated_timing(ordered, args, f"A {label} N={n}", raw,
-                           point={"experiment": "A", "group": label, "calibre": calibre, "N": n})
-  for nm, s in summ.items():
-    rows.append({"group": label, "N": n, "candidate": nm, "pipelined_ms": f"{s['pipelined_median_ms']:.4f}",
-                 "per_call_ms": f"{s['per_call_median_ms']:.4f}", f"speedup_vs_{ref_name}_pipelined": f"{s['speedup_vs_ref_pipelined']:.3f}",
-                 f"speedup_vs_{ref_name}_per_call": f"{s['speedup_vs_ref_per_call']:.3f}"})
+  hc.rotated_timing(ordered, args, f"A {label} N={n}", raw,
+                    point={"experiment": "A", "group": label, "calibre": calibre, "N": n, "reference": ref_name})
+
+
+GROUP_REFERENCE = {"calibre1_int32": "xla_narrow", "calibre1_f32": "xla_narrow_f32",
+                   "calibre2_int32": "xla_wide", "calibre2_f32": "xla_wide_f32"}
+
+
+def summarize_raw(raw: list[dict]):
+  """Summary rows (one per group / N / candidate) built from the raw per-round rows, so the same function
+  serves the end of `main` and the stand-alone `summarize` mode. Speedup = group reference / candidate."""
+  keys = []
+  for r in raw:
+    k = (r["group"], int(r["N"]), r["candidate"])
+    if k not in keys:
+      keys.append(k)
+  def med(group, n, cand, field):
+    return hc._median([float(r[field]) for r in raw if r["group"] == group and int(r["N"]) == n and r["candidate"] == cand])
+  rows1, rows2 = [], []
+  for group, n, cand in keys:
+    ref = GROUP_REFERENCE[group]
+    if not any(r["group"] == group and int(r["N"]) == n and r["candidate"] == ref for r in raw):
+      continue
+    p, b = med(group, n, cand, "pipelined_ms"), med(group, n, cand, "per_call_ms")
+    p0, b0 = med(group, n, ref, "pipelined_ms"), med(group, n, ref, "per_call_ms")
+    row = {"group": group, "N": n, "candidate": cand, "group_reference": ref, "pipelined_ms": f"{p:.4f}",
+           "per_call_ms": f"{b:.4f}", "speedup_vs_group_reference_pipelined": f"{p0 / p:.3f}",
+           "speedup_vs_group_reference_per_call": f"{b0 / b:.3f}"}
+    (rows1 if group.startswith("calibre1") else rows2).append(row)
+  return rows1, rows2
+
+
+def write_summaries(raw: list[dict]):
+  rows1, rows2 = summarize_raw(raw)
+  hc.write_csv(RESULTS_DIR / "A_calibre1_pure_narrow_read.csv", rows1)
+  hc.write_csv(RESULTS_DIR / "A_calibre2_complete_replacement.csv", rows2)
+
+
+def run_summarize():
+  """Rebuild the two summary CSVs from A_timing_raw.csv (no TPU needed)."""
+  import csv
+  with open(RESULTS_DIR / "A_timing_raw.csv", newline="", encoding="utf-8") as f:
+    raw = list(csv.DictReader(f))
+  write_summaries(raw)
 
 
 def main():
@@ -254,7 +294,7 @@ def main():
   (RESULTS_DIR / "A_probes.json").write_text(json.dumps(probes, indent=2))
   hc.record_session_environment(RESULTS_DIR, "A")
   status["tokamax_config"] = tokamax_config_report()
-  raw, rows1, rows2 = [], [], []
+  raw = []
   for n in NS:
     d = make_inputs(n)
     c1_i32, c1_f32, c2_i32, c2_f32 = build(n)
@@ -269,20 +309,23 @@ def main():
     for nm in skip(PROBE_NAMES):
       print(f"[note] probe failed for {nm} at N={n}; its candidates are expected to fail below (recorded)")
     groups = [
-        ("calibre1_int32", c1_i32, (d["x"], d["idx"], d["xn"], d["ie"]), exp["i32"], 1, "xla_narrow", rows1),
-        ("calibre1_f32", c1_f32, (d["x_f32"], d["idx"], d["xn_f32"], d["ie"]), exp["f32"], 1, "xla_narrow_f32", rows1),
-        ("calibre2_int32", c2_i32, (d["x"], d["idx"]), exp["i32"], 2, "xla_wide", rows2),
-        ("calibre2_f32", c2_f32, (d["x_f32"], d["idx"]), exp["f32"], 2, "xla_wide_f32", rows2),
+        ("calibre1_int32", c1_i32, (d["x"], d["idx"], d["xn"], d["ie"]), exp["i32"], 1, "xla_narrow"),
+        ("calibre1_f32", c1_f32, (d["x_f32"], d["idx"], d["xn_f32"], d["ie"]), exp["f32"], 1, "xla_narrow_f32"),
+        ("calibre2_int32", c2_i32, (d["x"], d["idx"]), exp["i32"], 2, "xla_wide"),
+        ("calibre2_f32", c2_f32, (d["x_f32"], d["idx"]), exp["f32"], 2, "xla_wide_f32"),
     ]
-    for label, fns, args, expected, calibre, ref_name, rows in groups:
+    for label, fns, args, expected, calibre, ref_name in groups:
       try:
-        _time_group(label, fns, args, expected, raw, rows, n, calibre, ref_name, status.setdefault(f"N{n}", {}))
+        _time_group(label, fns, args, expected, raw, n, calibre, ref_name, status.setdefault(f"N{n}", {}))
       except Exception as e:  # noqa: BLE001
         status.setdefault(f"N{n}", {})[label] = f"GROUP ERROR {type(e).__name__}: {str(e)[:600]}"
         print(f"[{label}] group failed:\n" + traceback.format_exc())
   hc.write_csv(RESULTS_DIR / "A_timing_raw.csv", raw)
-  hc.write_csv(RESULTS_DIR / "A_calibre1_pure_narrow_read.csv", rows1)
-  hc.write_csv(RESULTS_DIR / "A_calibre2_complete_replacement.csv", rows2)
+  try:
+    write_summaries(raw)
+  except Exception as e:  # noqa: BLE001 -- the raw rows are already saved; `summarize` can rebuild these
+    status["summary_csv"] = f"ERROR {type(e).__name__}: {str(e)[:300]}"
+    print("[summary csv] failed:\n" + traceback.format_exc())
   if status["probes"][str(NS[-1])].get("tokamax_narrow_f32"):
     try:
       run_trace(NS[-1])
@@ -295,6 +338,12 @@ def main():
 if __name__ == "__main__":
   if len(sys.argv) > 1 and sys.argv[1] == "probe":
     run_probe(sys.argv[2], int(sys.argv[3]))
+  elif len(sys.argv) > 1 and sys.argv[1] == "summarize":
+    run_summarize()
+  elif len(sys.argv) > 1 and sys.argv[1] == "trace":
+    # Stand-alone device trace for the f32 narrow candidates (confirms which ones ran a SparseCore program).
+    RESULTS_DIR.mkdir(exist_ok=True)
+    run_trace(NS[-1])
   else:
     try:
       main()

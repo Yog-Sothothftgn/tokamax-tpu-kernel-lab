@@ -179,7 +179,12 @@ def write_csv(path: pathlib.Path, rows: list[dict]) -> None:
     return
   path.parent.mkdir(parents=True, exist_ok=True)
   with open(path, "w", newline="", encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+    fields = []
+    for r in rows:  # union of keys in first-seen order (rows may come from different groups)
+      for k in r:
+        if k not in fields:
+          fields.append(k)
+    w = csv.DictWriter(f, fieldnames=fields, restval="")
     w.writeheader()
     w.writerows(rows)
   print(f"[csv] wrote {path}")

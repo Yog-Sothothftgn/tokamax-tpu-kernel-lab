@@ -254,7 +254,7 @@ def run_C(cpu_smoke: bool = False) -> None:
                          "expectation is stated or assumed)",
             "precision_conventions": PRECISION_CONVENTIONS,
             "default_matmul_precision_config": str(getattr(jax.config, "jax_default_matmul_precision", "unavailable")),
-            "stage0_scale_padding": None, "stage1_dequant_bit_exact": None, "stage2_matmul_correct": None,
+            "stage0_scale_padding": None, "stage1_dequant_bit_exact": None, "stage1_value_exact": None, "stage2_matmul_correct": None,
             "stage3_reads_compressed": None, "stage4_timed": False}
   print("[C] precision conventions of the three matmuls:\n" + json.dumps(PRECISION_CONVENTIONS, indent=2))
   _, scale_p = om.prepare_weights(packed, scale)
@@ -289,19 +289,40 @@ def run_C(cpu_smoke: bool = False) -> None:
     n_bad_nk = int(jnp.sum(full_nk.view(jnp.uint16) != w_deq_nk.view(jnp.uint16)))
     n_bad_kn = int(jnp.sum(jnp.asarray(full_nk.T).view(jnp.uint16) != w_kn.view(jnp.uint16)))
     exact = exact_halves and n_bad_nk == 0 and n_bad_kn == 0
+    # Classify any bit differences (first hardware run: 634,681 elements differed). Value equality uses
+    # bf16 comparison, under which -0.0 == +0.0; the sign of a zero cannot change a matmul result.
+    bits_k, bits_r = full_nk.view(jnp.uint16), w_deq_nk.view(jnp.uint16)
+    differ = bits_k != bits_r
+    value_equal = full_nk == w_deq_nk
+    n_value_mismatch = int(jnp.sum(~value_equal))
+    n_zero_sign_only = int(jnp.sum(differ & value_equal & (full_nk == 0)))
+    n_kernel_pos0_ref_neg0 = int(jnp.sum((bits_k == 0x0000) & (bits_r == 0x8000)))
+    pk = np.asarray(packed)
+    n_nibble8_in_checkpoint = int(((pk & 0xF) == 8).sum() + (((pk >> 4) & 0xF) == 8).sum())  # FP4 "-0"
     status["stage1_dequant_bit_exact"] = exact
-    status["stage1_detail"] = {"halves_bit_exact": exact_halves, "full_NK_layout_mismatching_elements": n_bad_nk,
-                               "full_KN_layout_mismatching_elements": n_bad_kn, "elements": int(w_deq_nk.size),
-                               "nonfinite_in_dequantized": int(jnp.sum(~jnp.isfinite(w_deq_nk.astype(jnp.float32))))}
+    status["stage1_value_exact"] = n_value_mismatch == 0
+    status["stage1_differences_are_only_zero_sign"] = (n_bad_nk == n_zero_sign_only)
+    status["stage1_detail"] = {
+        "halves_bit_exact": exact_halves, "full_NK_layout_mismatching_elements": n_bad_nk,
+        "full_KN_layout_mismatching_elements": n_bad_kn, "elements": int(w_deq_nk.size),
+        "value_mismatching_elements_(-0.0==+0.0)": n_value_mismatch,
+        "bit_differences_that_are_only_zero_sign": n_zero_sign_only,
+        "kernel_+0.0_where_reference_-0.0": n_kernel_pos0_ref_neg0,
+        "checkpoint_nibbles_equal_to_8_(FP4_negative_zero)": n_nibble8_in_checkpoint,
+        "nonfinite_in_dequantized": int(jnp.sum(~jnp.isfinite(w_deq_nk.astype(jnp.float32))))}
     print(f"[C stage1] in-kernel dequantization vs verified dequantizer, raw bf16 bits: {'EXACT' if exact else 'MISMATCH'} "
-          f"{status['stage1_detail']}")
+          f"| value-exact: {status['stage1_value_exact']} | differences only in the sign of zero: "
+          f"{status['stage1_differences_are_only_zero_sign']} | {status['stage1_detail']}")
   except Exception as ex:  # noqa: BLE001
     status["stage1_dequant_bit_exact"] = f"ERROR {type(ex).__name__}"
     print(f"[C stage1] ERROR (full text follows)\n{ex}")
   (RESULTS_DIR / "C_status.json").write_text(json.dumps(status, indent=2))
-  if status["stage1_dequant_bit_exact"] is not True:
-    print("C STOPS after stage 1 (dequantization not verified); no matmul timing.")
+  if status.get("stage1_value_exact") is not True:
+    print("C STOPS after stage 1 (dequantized VALUES differ from the verified dequantizer); no matmul stage.")
     return
+  if status["stage1_dequant_bit_exact"] is not True:
+    print("[C] stage 1 is NOT bit-exact (reported as such above); the values are equal, so stage 2 proceeds "
+          "(a zero's sign cannot change a matmul result) and stage 1 stays reported as a bit mismatch.")
 
   m_list = (8,) if cpu_smoke else (128, 2048)
   raw_rows, summary_rows, corr_rows = [], [], []

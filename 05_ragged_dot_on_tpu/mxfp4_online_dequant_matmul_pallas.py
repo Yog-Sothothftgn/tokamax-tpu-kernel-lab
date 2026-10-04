@@ -63,13 +63,16 @@ HALF_GROUP = GROUP // 2
 
 
 def _fp4_value(v):
-  """E2M1 nibble (int32 0..15) -> float32."""
-  sign_neg = (v & 8) != 0
+  """E2M1 nibble (int32 0..15) -> float32, sign applied by setting the float's sign BIT so that FP4
+  "-0" (nibble 8) stays -0.0. The first hardware run showed that `jnp.where(sign, -mag, mag)` produced
+  +0.0 for exactly those elements (634,681 of 11,010,048, equal to the number of nibbles equal to 8 in
+  the checkpoint)."""
   e = (v >> 1) & 3
   m = (v & 1).astype(jnp.float32)
   pow2 = jnp.where(e == 1, 1.0, jnp.where(e == 2, 2.0, 4.0))
   mag = jnp.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * pow2)
-  return jnp.where(sign_neg, -mag, mag)
+  sign_bit = (v & 8) << 28  # 0x80000000 when negative (int32 wrap-around)
+  return jax.lax.bitcast_convert_type(jax.lax.bitcast_convert_type(mag, jnp.int32) | sign_bit, jnp.float32)
 
 
 def _dequant_tile(p_ref, s_ref):
