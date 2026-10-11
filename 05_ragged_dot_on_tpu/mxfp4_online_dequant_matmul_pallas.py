@@ -117,14 +117,15 @@ def prepare_weights(weight_packed: jax.Array, weight_scale: jax.Array):
   return weight_packed, scale_p
 
 
-def online_dequant_matmul(x: jax.Array, packed: jax.Array, scale_p: jax.Array, *, bm: int, bn: int) -> jax.Array:
-  """x: (M, K) bf16; packed: (N, K/2) uint8; scale_p: (N, Gp) uint8 (from
-  `prepare_weights`). Returns (M, N) bf16 = x @ dequant(W)^T."""
-  m, k = x.shape
-  n, kh = packed.shape
-  assert k == 2 * kh and m % bm == 0 and n % bn == 0, (x.shape, packed.shape, bm, bn)
+def online_dequant_matmul_presplit(x_even: jax.Array, x_odd: jax.Array, packed: jax.Array, scale_p: jax.Array, *,
+                                   bm: int, bn: int) -> jax.Array:
+  """The kernel call itself, with the activations ALREADY split into even / odd K halves
+  (each (M, K/2)). `online_dequant_matmul` is this plus the split."""
+  m, kh = x_even.shape
+  n, kh2 = packed.shape
+  assert kh == kh2 and x_odd.shape == x_even.shape and m % bm == 0 and n % bn == 0, (
+      x_even.shape, packed.shape, bm, bn)
   gp = scale_p.shape[1]
-  x_even, x_odd = x[:, 0::2], x[:, 1::2]
   return pl.pallas_call(
       _matmul_kernel,
       grid=(m // bm, n // bn),
@@ -135,10 +136,25 @@ def online_dequant_matmul(x: jax.Array, packed: jax.Array, scale_p: jax.Array, *
           pl.BlockSpec((bn, gp), lambda i, j: (j, 0)),
       ],
       out_specs=pl.BlockSpec((bm, bn), lambda i, j: (i, j)),
-      out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
+      out_shape=jax.ShapeDtypeStruct((m, n), x_even.dtype),
       compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")) if _has_tpu() else None,
       interpret=not _has_tpu(),
   )(x_even, x_odd, packed, scale_p)
+
+
+def deinterleave(x: jax.Array):
+  """x (M, K) -> (x[:, 0::2], x[:, 1::2]), the activation split the kernel needs."""
+  return x[:, 0::2], x[:, 1::2]
+
+
+def online_dequant_matmul(x: jax.Array, packed: jax.Array, scale_p: jax.Array, *, bm: int, bn: int) -> jax.Array:
+  """x: (M, K) bf16; packed: (N, K/2) uint8; scale_p: (N, Gp) uint8 (from
+  `prepare_weights`). Returns (M, N) bf16 = x @ dequant(W)^T. The even / odd split of x is done
+  here, inside the call."""
+  m, k = x.shape
+  assert k == 2 * packed.shape[1], (x.shape, packed.shape)
+  x_even, x_odd = deinterleave(x)
+  return online_dequant_matmul_presplit(x_even, x_odd, packed, scale_p, bm=bm, bn=bn)
 
 
 def dequant_only(packed: jax.Array, scale_p: jax.Array, *, bn: int):
